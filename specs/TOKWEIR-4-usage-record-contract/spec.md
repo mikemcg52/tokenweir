@@ -314,8 +314,11 @@ all are accepted identically.
   preserved and readable; deciding whether a consumer should refuse it belongs with the consumer
   (the writer story), not the contract.
 - **`SCHEMA_VERSION` stays at 1.** The scaffold's record already declared version 1 and has no
-  external consumers pinned to it yet, so completing the contract at version 1 is correct;
-  the fields named in the story are the same fields the scaffold declared.
+  external consumers pinned to it yet, so completing the contract at version 1 is correct. Every
+  field the story names was already declared by the scaffold, and no field is added or removed here.
+  The record does carry one field the story's list does not mention — `ts` — but it too came from
+  the scaffold, so this story changes the field *set* not at all; it only makes the contract around
+  it typed, validated and published.
 - **Cache-token granularity is deferred.** ADR-0001 notes Claude Code transcripts also carry
   `ephemeral_5m`/`ephemeral_1h` cache fields. The story's field list does not include them; adding
   them later is a schema addition and a `SCHEMA_VERSION` bump.
@@ -338,5 +341,14 @@ all are accepted identically.
   so `jsonschema` is a `[dev]` extra and those tests `importorskip`. The MADO stream plan installs
   `pip install -e . pytest`, so they skip there. The *substance* of FR-019 and FR-024 — the numeric
   and blank-string agreement between schema and library — is therefore also covered by
-  dependency-free tests that always run. Closing the gap fully means changing the project's registry
-  entry to install dev extras, which is a MADO-side change outside this repository.
+  dependency-free tests that always run: the numeric and blank-string agreement (FR-019, FR-024),
+  and — pinned property by property — the schema's own declared constraints, so an FR-025 regression
+  such as dropping `null` from a nullable type or adding a stray `maxLength` fails under the
+  authoritative install too. What CI cannot do without an engine is validate a real payload
+  end-to-end; that half remains dev-install-only. Closing the gap fully means changing the project's
+  registry entry to install dev extras, which is a MADO-side change outside this repository.
+- **The ECMA-262 cross-engine check is opportunistic.** One test runs the published `pattern`
+  through `node` to confirm a real ECMA engine reads it the same way Python does. It skips where no
+  `node` binary exists, so it is a bonus rather than a guarantee; the dependency-free guards — the
+  pattern pinned to its exact literal, and the assertion that it contains no shorthand character
+  class — are what hold FR-024 everywhere.

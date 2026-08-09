@@ -530,3 +530,97 @@ def test_pattern_means_the_same_thing_under_ecma_262():
         except ValueError:
             library_blank.add(cp)
     assert library_blank == ecma_blank
+
+
+# --- FR-025, without a JSON Schema engine ------------------------------------
+#
+# The tests above that validate real payloads are jsonschema-gated, so they skip
+# under the MADO stream plan's install. These pin the *declaration* itself, so a
+# schema-side regression — dropping "null" from a nullable type, adding a stray
+# maxLength — fails in the environment that actually gates the merge.
+
+
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_REQUIRED_STRING = {
+    "type": "string",
+    "minLength": 1,
+    "pattern": EXPECTED_NON_BLANK_PATTERN,
+}
+_TOKEN_COUNT = {"type": "integer", "minimum": 0, "default": 0}
+
+EXPECTED_CONSTRAINTS = {
+    "schema_version": {"type": "integer", "const": SCHEMA_VERSION},
+    "request_id": _REQUIRED_STRING,
+    "app_id": _REQUIRED_STRING,
+    "endpoint": _REQUIRED_STRING,
+    "model": _REQUIRED_STRING,
+    "status": _REQUIRED_STRING,
+    "workload": _NULLABLE_STRING,
+    "parent_request_id": _NULLABLE_STRING,
+    "queue": _NULLABLE_STRING,
+    "input_tokens": _TOKEN_COUNT,
+    "output_tokens": _TOKEN_COUNT,
+    "cache_creation_input_tokens": _TOKEN_COUNT,
+    "cache_read_input_tokens": _TOKEN_COUNT,
+    "latency_ms": {"type": ["integer", "null"], "minimum": 0},
+    "pricing_mode": {
+        "type": ["string", "null"],
+        "enum": ["api_metered", "subscription", None],
+    },
+    "ts": _NULLABLE_STRING,
+}
+
+
+def test_schema_declares_exactly_the_constraints_the_library_enforces():
+    """Pin every declared constraint, so no engine is needed to catch a drift.
+
+    `description` is excluded — prose may change freely; constraints may not.
+    """
+    props = usage_record_json_schema()["properties"]
+    actual = {
+        name: {k: v for k, v in prop.items() if k != "description"}
+        for name, prop in props.items()
+    }
+    assert actual == EXPECTED_CONSTRAINTS
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_CONSTRAINTS))
+def test_schema_permits_null_exactly_where_the_library_permits_none(name):
+    """The FR-025 rule stated directly, rather than as a literal pin.
+
+    If the library accepts `None` for a field, the schema must allow `null` for
+    it — otherwise a record the library builds fails its own published schema.
+    And the converse: allowing `null` for a field the library requires would let
+    a conforming producer emit a record the library refuses (FR-019).
+    """
+    declared = usage_record_json_schema()["properties"][name]["type"]
+    schema_allows_null = "null" in (
+        declared if isinstance(declared, list) else [declared]
+    )
+
+    fields = {
+        "request_id": "r", "app_id": "a", "endpoint": "/e",
+        "model": "m", "status": "ok",
+    }
+    fields[name] = None
+    try:
+        UsageRecord(**fields)
+        library_allows_none = True
+    except ValueError:
+        library_allows_none = False
+
+    assert schema_allows_null == library_allows_none, (
+        f"{name}: schema null={schema_allows_null} but library None="
+        f"{library_allows_none}"
+    )
+
+
+def test_required_string_properties_carry_no_extra_constraints():
+    # A stray maxLength/format would reject values the library accepts (FR-025)
+    # without any engine-backed test noticing under the authoritative install.
+    props = usage_record_json_schema()["properties"]
+    for name in REQUIRED_FIELDS:
+        keys = set(props[name]) - {"description"}
+        assert keys == {"type", "minLength", "pattern"}, (
+            f"{name} declares unexpected constraint(s): {sorted(keys)}"
+        )

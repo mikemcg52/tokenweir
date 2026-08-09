@@ -204,11 +204,20 @@ Decisions worth stating because a reviewer would otherwise have to reverse-engin
     feature directory or fail their branch check. It is one line, it is per-branch, and it is what
     makes the speckit spine reproducible on this branch — worth the churn.
 
-16. **`jsonschema` is a `[dev]` extra and its tests skip in CI — accepted, with compensation.** See
-    the spec's Assumptions. The dependency-free numeric and blank-rule agreement tests carry the
-    substance of FR-019/FR-024 in the environment that actually gates the merge; the
-    `jsonschema`-backed tests are corroboration on a dev install. Fully closing it needs the MADO
-    registry entry to install dev extras — outside this repository.
+16. **`jsonschema` is a `[dev]` extra and its tests skip in CI — accepted, with compensation on both
+    sides of the agreement.** See the spec's Assumptions. Dependency-free tests carry the substance
+    in the environment that actually gates the merge:
+
+    - schema → library (FR-019, FR-024): the numeric and blank-rule agreement tests, plus the
+      pattern pinned to its exact literal;
+    - library → schema (FR-025): every declared constraint pinned property by property, and a
+      `null`-permitted-exactly-where-`None`-is check. Verified by mutation under the authoritative
+      install — dropping `null` from `latency_ms` or `pricing_mode`, or adding a `maxLength` to the
+      required strings, each fails there even with the artifact regenerated.
+
+    What no dependency-free test can do is validate a real payload end-to-end; that half stays
+    dev-install-only. Fully closing it needs the MADO registry entry to install dev extras — outside
+    this repository.
 
 ## Phasing
 

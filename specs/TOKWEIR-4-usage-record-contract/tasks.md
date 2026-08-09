@@ -212,3 +212,15 @@ Filed after the fact so `tasks.md` reflects what the branch actually contains.
       "optional strings are type-checked but not blank-checked" choice in spec.md's Assumptions.
 - [x] T045 Amend plan.md design decision 8, which still described the superseded `\\S` pattern.
 - [x] T046 Cover `bytearray` as well as `bytes` in the `from_json` acceptance test.
+
+- [x] T047 [US4] Pin every declared schema constraint property by property, and assert `null` is
+      permitted exactly where the library permits `None`, so an FR-025 schema-side regression fails
+      under the authoritative install rather than only on a dev install.
+- [x] T048 [US4] Assert the required-string properties carry no extra constraints (a stray
+      `maxLength`/`format` would reject values the library accepts).
+- [x] T049 Amend the "compensated" claim in spec.md and plan.md to name FR-025 and to say plainly
+      which half of it CI cannot cover; note that the node-gated ECMA check is opportunistic.
+- [x] T050 Soften the spec's claim that the story's field list matches the scaffold's — `ts` is a
+      scaffold field the story does not name.
+- [x] T051 Document in `README.md` that optional strings are not blank-checked, that
+      `schema_version` must be positive, and that strings are never normalized.
