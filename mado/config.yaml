@@ -1,0 +1,40 @@
+project: token-weir
+description: ''
+runtime: python
+python_version: '3.11'
+framework: none
+build_tool: none
+test_commands:
+  unit: pytest
+coverage:
+  tool: pytest-cov
+  format: xml
+git_remote: https://github.com/mikemcg52/tokenweir.git
+slack_channel: '#personal-dev'
+environment:
+  targets: []
+  namespace_deployment:
+    model: python
+    build_command: ''
+    dev_command: python -m app
+    url: http://token-weir-dev.homelab.local
+  production_deployment:
+    method: github-actions
+    workflow: .github/workflows/deploy.yml
+    trigger: push-to-main
+  services:
+  - name: web
+    type: python
+    port: 8080
+    description: python service
+  observability:
+    logs: []
+    health_endpoints: []
+  testing:
+    execution:
+      command: pytest
+      timeout: 60s
+      success_pattern: passed
+    integration: null
+  test_environment: null
+  components: []
