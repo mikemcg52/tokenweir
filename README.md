@@ -61,6 +61,21 @@ catches one type.
 
 This is separate from `Sink.emit`, which must still never raise into the caller.
 
+Records are **immutable** — validation runs once, at construction, so the fields
+cannot afterwards be mutated into a state that breaks the contract, and a record
+handed to a buffering fire-and-forget `Sink` is not shared mutable state. Build a
+variant with `dataclasses.replace`, which re-runs validation:
+
+```python
+import dataclasses
+stamped = dataclasses.replace(rec, ts="2026-08-09T12:00:00Z")
+```
+
+Reading from the wire is slightly more forgiving than the Python constructor, and
+deliberately so: JSON has a single number type, so `{"input_tokens": 100.0}` means
+the integer 100 and `from_dict`/`from_json` normalize it. A genuinely fractional
+value like `100.5` is still rejected rather than truncated.
+
 ### Pricing modes
 
 `pricing_mode` tells a report-time consumer whether a rate card even applies

@@ -14,13 +14,13 @@ from pathlib import Path
 import pytest
 
 from tokenweir import (
-    NON_BLANK_PATTERN,
     REQUIRED_FIELDS,
     SCHEMA_VERSION,
     PricingMode,
     UsageRecord,
     usage_record_json_schema,
 )
+from tokenweir.contract import NON_BLANK_PATTERN, TOKEN_COUNT_FIELDS
 
 SCHEMA_FILE = Path(__file__).resolve().parents[1] / "schema" / "usage-record.v1.json"
 
@@ -43,7 +43,12 @@ def test_schema_describes_exactly_the_records_fields():
 
 
 def test_schema_marks_the_required_fields_required():
-    assert usage_record_json_schema()["required"] == list(REQUIRED_FIELDS)
+    # schema_version is required on the wire even though from_dict defaults it:
+    # the published document may be stricter than the reader, never looser.
+    assert usage_record_json_schema()["required"] == [
+        "schema_version",
+        *REQUIRED_FIELDS,
+    ]
 
 
 def test_schema_states_the_contract_version():
@@ -147,7 +152,7 @@ def test_a_well_formed_record_validates_against_the_published_schema():
 @pytest.mark.parametrize(
     "bad",
     [
-        {"app_id": "   "},          # whitespace-only — the Med-2 divergence
+        {"app_id": "   "},  # whitespace-only is blank in both the schema and the library
         {"app_id": ""},
         {"request_id": None},
         {"input_tokens": -1},
@@ -206,3 +211,84 @@ def test_generated_schema_shares_no_state_between_calls():
     second = usage_record_json_schema()
     assert "description" not in second["properties"]["workload"]
     assert "description" not in first["properties"]["queue"]
+
+
+# --- Numeric agreement: JSON has one number type -----------------------------
+#
+# JSON Schema's "type": "integer" accepts any number with zero fractional part,
+# so a JavaScript producer writing 100.0 is emitting the integer 100. The library
+# must read it, or the schema would accept records this library refuses (FR-019).
+# These are dependency-free on purpose: FR-019's substance stays verified in CI,
+# where the jsonschema-backed tests above are skipped.
+
+
+@pytest.mark.parametrize("name", [*TOKEN_COUNT_FIELDS, "latency_ms", "schema_version"])
+def test_integral_json_floats_are_accepted_and_normalized_to_int(name):
+    value = 1.0 if name == "schema_version" else 12.0
+    rec = UsageRecord.from_dict(_payload(**{name: value}))
+
+    read_back = getattr(rec, name)
+    assert read_back == int(value)
+    assert type(read_back) is int, f"{name} must normalize to int, got {type(read_back)}"
+
+
+@pytest.mark.parametrize("name", [*TOKEN_COUNT_FIELDS, "latency_ms"])
+def test_integral_json_floats_survive_a_json_round_trip(name):
+    payload = json.dumps(_payload(**{name: 7.0}))
+    assert getattr(UsageRecord.from_json(payload), name) == 7
+
+
+@pytest.mark.parametrize("name", [*TOKEN_COUNT_FIELDS, "latency_ms"])
+@pytest.mark.parametrize("bad", [12.5, -0.5, float("nan"), float("inf")])
+def test_non_integral_numbers_are_still_rejected(name, bad):
+    # A genuinely fractional count is a producer bug - normalize the integral
+    # case, never silently truncate the fractional one.
+    with pytest.raises(ValueError):
+        UsageRecord.from_dict(_payload(**{name: bad}))
+
+
+@pytest.mark.parametrize("name", [*TOKEN_COUNT_FIELDS, "latency_ms"])
+def test_direct_construction_still_requires_a_real_int(name):
+    # The wire tolerance is a deserialization concern. In Python, 12.0 where an
+    # int belongs is a caller-side type error and stays loud.
+    with pytest.raises(ValueError):
+        UsageRecord(
+            request_id="r", app_id="a", endpoint="/e", model="m", status="ok",
+            **{name: 12.0},
+        )
+
+
+# --- The blank rule is engine-independent ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "char, is_blank",
+    [
+        ("\u00a0", True),   # NBSP - whitespace in both Python and ECMA-262
+        ("\ufeff", True),   # BOM - ECMA-262 whitespace, but NOT Python's
+        ("\u2028", True),   # LINE SEPARATOR
+        ("\u3000", True),   # IDEOGRAPHIC SPACE
+        ("\u001c", False),  # FILE SEPARATOR - Python whitespace, but NOT ECMA's
+        ("\u0085", False),  # NEL - Python whitespace, but NOT ECMA's
+        ("x", False),
+    ],
+)
+def test_blankness_follows_the_published_pattern_not_python_str_strip(char, is_blank):
+    """The library and the schema must agree even where Python and ECMA-262 differ.
+
+    These are exactly the characters where `str.strip()` would have given a
+    different answer than the published `pattern`, which is why blankness is
+    decided by the pattern and not by str.strip().
+    """
+    schema_says_blank = not re.search(NON_BLANK_PATTERN, char)
+    assert schema_says_blank is is_blank
+
+    try:
+        UsageRecord(
+            request_id="r", app_id=char, endpoint="/e", model="m", status="ok"
+        )
+        library_says_blank = False
+    except ValueError:
+        library_says_blank = True
+
+    assert library_says_blank is is_blank

@@ -219,8 +219,19 @@ all are accepted identically.
 - **FR-020**: Generating the published JSON Schema MUST return an independent document on every
   call, sharing no mutable state with the library or with a previously returned document, so a
   consumer may annotate the result safely.
-- **FR-021**: Deserialization MUST reject a payload that is not a mapping, with a `ValueError`
-  rather than a lower-level attribute error, so a caller at the wire boundary catches one type.
+- **FR-021**: Deserialization MUST reject a payload that is not a mapping (or, for JSON, not a
+  string/bytes), with a `ValueError` rather than a lower-level attribute or type error, so a caller
+  at the wire boundary catches one type.
+- **FR-022**: Deserialization MUST accept an integral JSON number where an integer field is
+  expected — JSON has a single number type, so `100.0` on the wire denotes the integer `100`, which
+  is exactly what the published schema's `"type": "integer"` permits — and MUST normalize it to an
+  integer. A non-integral value (`100.5`, `NaN`, `Infinity`) MUST still be rejected, never
+  truncated. Direct Python construction remains strict, since there `100.0` is a caller type error.
+- **FR-023**: The record MUST be immutable after construction, so a validated record cannot be
+  mutated into one that violates its own contract and then serialized.
+- **FR-024**: The published JSON Schema's notion of a blank string MUST hold under ECMA-262 regular
+  expression semantics (which is what JSON Schema `pattern` specifies), not merely under Python's,
+  so that a JavaScript or Go validator and this library agree on which values are blank.
 - **FR-016**: `model` MUST be stored verbatim as an opaque identifier, with no provider-specific
   validation, normalization, or inference.
 - **FR-017**: The contract module MUST depend only on the Python standard library.
@@ -295,3 +306,14 @@ all are accepted identically.
 - **The project constitution is an unfilled template.** `.specify/memory/constitution.md` still
   contains placeholder principles, so no project-specific constitutional constraints were applied
   beyond ADR-0001's pillars.
+- **The published schema may be stricter than the reader, never looser.** `schema_version` is in the
+  schema's `required` list even though `from_dict` defaults it when absent: every record this
+  library emits carries it, so the published document tells a non-Python producer to stamp it. Only
+  the other direction — the schema accepting what the library refuses — is a defect (FR-019).
+- **Validator-level tests are dev-install-only, a known CI gap.** Validating payloads against the
+  published schema needs a JSON Schema engine, and the core must not grow one (ADR-0001 Pillar 2),
+  so `jsonschema` is a `[dev]` extra and those tests `importorskip`. The MADO stream plan installs
+  `pip install -e . pytest`, so they skip there. The *substance* of FR-019 and FR-024 — the numeric
+  and blank-string agreement between schema and library — is therefore also covered by
+  dependency-free tests that always run. Closing the gap fully means changing the project's registry
+  entry to install dev extras, which is a MADO-side change outside this repository.

@@ -12,7 +12,6 @@ so the core carries no wire dependencies.
 """
 
 from tokenweir.contract import (
-    NON_BLANK_PATTERN,
     REQUIRED_FIELDS,
     SCHEMA_VERSION,
     TOKEN_COUNT_FIELDS,
@@ -27,7 +26,6 @@ __all__ = [
     "SCHEMA_VERSION",
     "REQUIRED_FIELDS",
     "TOKEN_COUNT_FIELDS",
-    "NON_BLANK_PATTERN",
     "UsageRecord",
     "PricingMode",
     "usage_record_json_schema",

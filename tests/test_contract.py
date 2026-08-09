@@ -9,6 +9,7 @@ pricing modes and the published schema have their own files.
 """
 
 import ast
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -253,3 +254,36 @@ def test_from_dict_rejects_a_non_mapping_payload(payload):
     # must not surface as AttributeError.
     with pytest.raises(ValueError):
         UsageRecord.from_dict(payload)
+
+
+# --- TOKWEIR-4 fix round 2: the record is a value, not a mutable buffer -------
+
+
+def test_record_is_immutable():
+    # Validation runs once at construction; if fields could be reassigned, a
+    # validated record could be mutated into one that breaks its own contract
+    # and then serialized.
+    rec = _record()
+    with pytest.raises(Exception) as excinfo:
+        rec.input_tokens = -5
+    assert excinfo.type.__name__ in {"FrozenInstanceError", "AttributeError"}
+    assert rec.input_tokens == 10
+
+
+def test_dataclasses_replace_builds_a_validated_variant():
+    rec = _record()
+    stamped = dataclasses.replace(rec, ts="2026-08-09T12:00:00Z")
+    assert stamped.ts == "2026-08-09T12:00:00Z"
+    assert stamped.request_id == rec.request_id
+    assert rec.ts is None  # the original is untouched
+
+    # replace re-runs validation rather than bypassing it
+    with pytest.raises(ValueError):
+        dataclasses.replace(rec, input_tokens=-1)
+
+
+@pytest.mark.parametrize("payload", [123, None, {"a": 1}, ["a"]])
+def test_from_json_rejects_a_non_string_payload_with_value_error(payload):
+    # Mirrors the from_dict guard so the wire boundary raises exactly one type.
+    with pytest.raises(ValueError):
+        UsageRecord.from_json(payload)

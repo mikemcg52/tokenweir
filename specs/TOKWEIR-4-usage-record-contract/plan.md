@@ -149,11 +149,42 @@ Decisions worth stating because a reviewer would otherwise have to reverse-engin
    `pip install -e . pytest`. The structural and pattern-agreement tests are dependency-free and
    always run, so the alignment is guarded even where the engine is absent.
 
-10. **`REQUIRED_FIELDS`, `TOKEN_COUNT_FIELDS` and `NON_BLANK_PATTERN` are exported** beyond the
-    minimum the task list named. They are the single source of truth that construction validation,
-    deserialization, the published schema and the tests all read from, and downstream TOKWEIR
-    stories (the writer, the emitter) will need the same lists. All are immutable, so exporting
-    them commits to names rather than to mutable state.
+10. **`REQUIRED_FIELDS` and `TOKEN_COUNT_FIELDS` are exported** beyond the minimum the task list
+    named. They are the single source of truth that construction validation, deserialization, the
+    published schema and the tests all read from, and downstream TOKWEIR stories (the writer, the
+    emitter) will need the same lists. Both are tuples, so exporting them commits to names rather
+    than to mutable state. `NON_BLANK_PATTERN` is deliberately **not** exported — it is an
+    implementation detail of the schema generator, and a published library should not commit to a
+    regex as public API.
+
+11. **Integral JSON numbers are normalized on the way in (`100.0` → `100`).** JSON has one number
+    type; JSON Schema defines `"type": "integer"` as any number with zero fractional part, and a
+    JavaScript producer has no other way to write an integer. Without this, a payload that validates
+    against the published schema would be refused by the library — the exact divergence FR-019
+    forbids, and the one the whitespace fix missed because it generalized from an example rather
+    than the rule. Only exactly-integral floats convert; `100.5`, `NaN` and `Infinity` still fail,
+    so nothing is silently truncated. Python construction stays strict, because there `100.0` is a
+    caller-side type error rather than a wire encoding.
+
+12. **The record is frozen.** Validation runs once at construction, so a mutable record could be
+    edited into an invalid state and then serialized (a reviewer demonstrated exactly that). A
+    metering record is a value, and immutability also makes it safe to hand to a buffering,
+    fire-and-forget `Sink` without the caller and the emit path sharing state. Callers build
+    variants with `dataclasses.replace`, which re-runs validation. There are no pinned consumers at
+    version `0.0.0`, so this is the cheapest moment to make the commitment.
+
+13. **Blankness is defined by an explicit character class, not `\S`.** JSON Schema `pattern` is
+    ECMA-262, whose whitespace set differs from Python's: Python treats U+001C–U+001F and U+0085 as
+    whitespace, ECMA-262 does not; ECMA-262 treats U+FEFF as whitespace, Python does not. With `\S`
+    on both sides the two engines disagree, so `str.strip()` was replaced by a shared regex spelling
+    the set out. Every engine then agrees, which is the point of a cross-language contract. This
+    slightly changes behaviour at those code points, and tests pin each one.
+
+14. **`jsonschema` is a `[dev]` extra and its tests skip in CI — accepted, with compensation.** See
+    the spec's Assumptions. The dependency-free numeric and blank-rule agreement tests carry the
+    substance of FR-019/FR-024 in the environment that actually gates the merge; the
+    `jsonschema`-backed tests are corroboration on a dev install. Fully closing it needs the MADO
+    registry entry to install dev extras — outside this repository.
 
 ## Phasing
 

@@ -52,6 +52,7 @@ field, so a consumer parsing untrusted payloads catches one type.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -76,6 +77,42 @@ TOKEN_COUNT_FIELDS: tuple[str, ...] = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
+
+#: Integer-valued fields as they appear on the wire. JSON has a single number
+#: type, so a non-Python producer may legitimately write ``100.0`` where it means
+#: the integer 100 — JSON Schema's ``"type": "integer"`` accepts exactly that.
+#: These are normalized on deserialization; see ``_coerce_wire_integers``.
+_WIRE_INTEGER_FIELDS: tuple[str, ...] = (
+    *TOKEN_COUNT_FIELDS,
+    "latency_ms",
+    "schema_version",
+)
+
+#: The ECMA-262 whitespace set (WhiteSpace + LineTerminator), written out
+#: explicitly rather than relying on a shorthand class.
+#:
+#: JSON Schema ``pattern`` is ECMA-262, whose ``\s`` is *not* the same set as
+#: Python's — Python treats U+001C–U+001F and U+0085 as whitespace and U+FEFF as
+#: not, ECMA-262 the reverse. Using ``\S`` on both sides would therefore let a
+#: JavaScript or Go producer emit a value this library calls blank. Spelling the
+#: class out makes every regex engine agree, which is the whole point of a
+#: published cross-language contract.
+_ECMA_WHITESPACE = (
+    "\t\n\v\f\r "          # TAB, LF, VT, FF, CR, SPACE
+    "\u00a0"                # NO-BREAK SPACE
+    "\u1680"                # OGHAM SPACE MARK
+    "\u2000-\u200a"         # EN QUAD .. HAIR SPACE (range)
+    "\u2028\u2029"          # LINE SEPARATOR, PARAGRAPH SEPARATOR
+    "\u202f\u205f\u3000"    # NARROW NBSP, MEDIUM MATH SPACE, IDEOGRAPHIC SPACE
+    "\ufeff"                # ZERO WIDTH NO-BREAK SPACE (BOM)
+)
+
+#: Matches a value containing at least one non-whitespace character. Shared by
+#: :func:`_validate_required_str` and the published schema, so "blank" means the
+#: same thing to this library and to a consumer validating against the schema.
+NON_BLANK_PATTERN = f"[^{_ECMA_WHITESPACE}]"
+
+_NON_BLANK_RE = re.compile(NON_BLANK_PATTERN)
 
 
 class PricingMode(str, Enum):
@@ -121,13 +158,38 @@ class PricingMode(str, Enum):
 
 
 def _validate_required_str(name: str, value: Any) -> None:
-    """Require a non-blank string. Whitespace-only is blank — '  ' is not an app id."""
+    """Require a non-blank string. Whitespace-only is blank — '  ' is not an app id.
+
+    Blankness is decided by :data:`NON_BLANK_PATTERN`, the same expression the
+    published schema carries, rather than by ``str.strip()`` — Python's notion of
+    whitespace differs from ECMA-262's, and the two must agree or a non-Python
+    producer could emit a value this library refuses.
+    """
     if not isinstance(value, str):
         raise ValueError(
             f"{name} is required and must be a string; got {type(value).__name__} {value!r}"
         )
-    if not value.strip():
+    if not _NON_BLANK_RE.search(value):
         raise ValueError(f"{name} is required and must not be blank")
+
+
+def _coerce_wire_integers(kwargs: dict[str, Any]) -> None:
+    """Normalize integral JSON numbers to ``int``, in place.
+
+    JSON has one number type, so ``100.0`` on the wire *is* the integer 100 —
+    JSON Schema's ``"type": "integer"`` says so explicitly, and a JavaScript
+    producer has no other way to write it. Python's ``int`` and ``float`` are
+    distinct, so without this a payload that validates against the published
+    schema would be refused by the library (the divergence FR-019 forbids).
+
+    Only exactly-integral floats are converted. ``100.5``, ``NaN`` and ``Infinity``
+    are left alone for :meth:`UsageRecord.__post_init__` to reject, so a genuinely
+    fractional count still fails loudly rather than being silently truncated.
+    """
+    for name in _WIRE_INTEGER_FIELDS:
+        value = kwargs.get(name)
+        if isinstance(value, float) and value.is_integer():
+            kwargs[name] = int(value)
 
 
 def _validate_non_negative_int(name: str, value: Any, *, allow_none: bool) -> None:
@@ -149,12 +211,19 @@ def _validate_non_negative_int(name: str, value: Any, *, allow_none: bool) -> No
         raise ValueError(f"{name} must be non-negative; got {value}")
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class UsageRecord:
     """One metered unit of work (one model call / iteration).
 
     Raw token counts are stored; cost is derived at report time and never lives
     on the record.
+
+    **Immutable.** A record is a value, and validation runs once at construction —
+    if the fields could be reassigned afterwards, a validated record could be
+    mutated into one that no longer satisfies its own contract and then serialized.
+    Immutability also makes a record safe to hand to a buffering, fire-and-forget
+    ``Sink`` without the emit path and the caller sharing mutable state. Build a
+    variant with :func:`dataclasses.replace`, which re-runs validation.
     """
 
     request_id: str
@@ -202,7 +271,9 @@ class UsageRecord:
                 f"schema_version must be >= 1; got {self.schema_version}"
             )
 
-        self.pricing_mode = PricingMode.coerce(self.pricing_mode)
+        # object.__setattr__ because the dataclass is frozen; normalizing the
+        # value the caller passed is the one write the contract allows.
+        object.__setattr__(self, "pricing_mode", PricingMode.coerce(self.pricing_mode))
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain, JSON-ready dict.
@@ -248,6 +319,7 @@ class UsageRecord:
                 + ", ".join(missing)
             )
 
+        _coerce_wire_integers(kwargs)
         return cls(**kwargs)
 
     @classmethod
@@ -255,9 +327,15 @@ class UsageRecord:
         """Rebuild from a JSON string or bytes.
 
         Raises:
-            ValueError: if the payload is not a JSON object, or the record is
-                invalid. (:class:`json.JSONDecodeError` is a ``ValueError``.)
+            ValueError: if the payload is not a JSON string/bytes, does not decode
+                to an object, or the record is invalid.
+                (:class:`json.JSONDecodeError` is a ``ValueError``.)
         """
+        if not isinstance(payload, (str, bytes, bytearray)):
+            raise ValueError(
+                "usage record JSON must be a string or bytes; got "
+                f"{type(payload).__name__}"
+            )
         data = json.loads(payload)
         if not isinstance(data, dict):
             raise ValueError(
@@ -273,14 +351,6 @@ class UsageRecord:
 # and for reviewing whether a change breaks the wire contract. Generated from
 # this module so there is one source of truth; the checked-in artifact at
 # ``schema/usage-record.v1.json`` is asserted by the test suite to match.
-
-#: JSON Schema ``pattern`` enforcing "contains a non-whitespace character".
-#: ``pattern`` is an unanchored search, so this is exactly the rule
-#: :func:`_validate_required_str` applies — a whitespace-only value is blank.
-#: Kept in lockstep with that function: a non-Python producer following the
-#: published schema must not be able to emit a record this library refuses.
-NON_BLANK_PATTERN = r"\S"
-
 
 def usage_record_json_schema() -> dict[str, Any]:
     """Return the JSON Schema describing a serialized :class:`UsageRecord`.
@@ -373,6 +443,12 @@ def usage_record_json_schema() -> dict[str, Any]:
                 description="ISO-8601 UTC timestamp, stamped by the producer."
             ),
         },
-        "required": list(REQUIRED_FIELDS),
+        # Strict in what it describes, lenient in what the reader accepts: every
+        # record this library emits carries schema_version, so the published
+        # document requires it and a non-Python producer knows to stamp it.
+        # from_dict still tolerates its absence (defaulting to SCHEMA_VERSION) —
+        # the schema may be stricter than the reader, never looser, which is the
+        # direction FR-019 cares about.
+        "required": ["schema_version", *REQUIRED_FIELDS],
         "additionalProperties": True,
     }
