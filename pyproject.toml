@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenweir"
+version = "0.0.0"
+description = "Provider-neutral, transport-agnostic usage & cost metering (extracted from the AI Gateway per ADR-0001)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mike McGonagle" }]
+keywords = ["usage", "metering", "cost", "observability", "llm"]
+# Core stays dependency-light by contract (ADR-0001 Pillar 2): no transport libs here.
+dependencies = []
+
+[project.optional-dependencies]
+# Transport adapters ship as optional extras so the core never compiles in pika.
+amqp = ["pika>=1.3"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tokenweir*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
