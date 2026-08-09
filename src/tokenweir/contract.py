@@ -78,6 +78,18 @@ TOKEN_COUNT_FIELDS: tuple[str, ...] = (
     "cache_read_input_tokens",
 )
 
+#: Fields that are a string when present and ``None`` when not. The published
+#: schema types them ``["string", "null"]``, so the library must refuse anything
+#: else — otherwise it would emit records that fail its own published schema.
+#: Unlike :data:`REQUIRED_FIELDS` these are *not* checked for blankness: the
+#: schema places no such constraint on them, and the two must agree.
+_OPTIONAL_STR_FIELDS: tuple[str, ...] = (
+    "workload",
+    "parent_request_id",
+    "queue",
+    "ts",
+)
+
 #: Integer-valued fields as they appear on the wire. JSON has a single number
 #: type, so a non-Python producer may legitimately write ``100.0`` where it means
 #: the integer 100 — JSON Schema's ``"type": "integer"`` accepts exactly that.
@@ -88,31 +100,39 @@ _WIRE_INTEGER_FIELDS: tuple[str, ...] = (
     "schema_version",
 )
 
-#: The ECMA-262 whitespace set (WhiteSpace + LineTerminator), written out
-#: explicitly rather than relying on a shorthand class.
+#: The union of Python's and ECMA-262's whitespace sets, written out explicitly
+#: rather than relying on a shorthand class like ``\\s``.
 #:
-#: JSON Schema ``pattern`` is ECMA-262, whose ``\s`` is *not* the same set as
-#: Python's — Python treats U+001C–U+001F and U+0085 as whitespace and U+FEFF as
-#: not, ECMA-262 the reverse. Using ``\S`` on both sides would therefore let a
-#: JavaScript or Go producer emit a value this library calls blank. Spelling the
-#: class out makes every regex engine agree, which is the whole point of a
-#: published cross-language contract.
-_ECMA_WHITESPACE = (
-    "\t\n\v\f\r "          # TAB, LF, VT, FF, CR, SPACE
-    "\u00a0"                # NO-BREAK SPACE
-    "\u1680"                # OGHAM SPACE MARK
-    "\u2000-\u200a"         # EN QUAD .. HAIR SPACE (range)
-    "\u2028\u2029"          # LINE SEPARATOR, PARAGRAPH SEPARATOR
-    "\u202f\u205f\u3000"    # NARROW NBSP, MEDIUM MATH SPACE, IDEOGRAPHIC SPACE
-    "\ufeff"                # ZERO WIDTH NO-BREAK SPACE (BOM)
+#: JSON Schema ``pattern`` is ECMA-262, whose whitespace set is *not* Python's:
+#: Python counts U+001C-U+001F and U+0085, ECMA-262 counts U+FEFF. Using ``\\S`` on
+#: both sides lets the two engines disagree, so a JavaScript or Go producer could
+#: emit a value this library calls blank (or the reverse). Spelling the class out
+#: makes every regex engine agree — that is the point of a cross-language contract.
+#:
+#: The *union* is used rather than ECMA's set alone so that adopting a shared rule
+#: never made the library **less** strict than it was: the five code points Python
+#: alone treats as whitespace stay blank, and U+FEFF becomes blank too.
+_BLANK_CHARACTERS = (
+    "\\t\\n\\v\\f\\r"           # TAB, LF, VT, FF, CR
+    "\\u001c-\\u001f"       # FILE/GROUP/RECORD/UNIT SEPARATOR (Python only)
+    " "                    # SPACE
+    "\\u0085"               # NEXT LINE (Python only)
+    "\\u00a0"               # NO-BREAK SPACE
+    "\\u1680"               # OGHAM SPACE MARK
+    "\\u2000-\\u200a"       # EN QUAD .. HAIR SPACE
+    "\\u2028\\u2029"        # LINE SEPARATOR, PARAGRAPH SEPARATOR
+    "\\u202f\\u205f\\u3000"  # NARROW NBSP, MEDIUM MATH SPACE, IDEOGRAPHIC SPACE
+    "\\ufeff"               # ZERO WIDTH NO-BREAK SPACE / BOM (ECMA-262 only)
 )
 
-#: Matches a value containing at least one non-whitespace character. Shared by
+#: Matches a value containing at least one non-blank character. Shared by
 #: :func:`_validate_required_str` and the published schema, so "blank" means the
 #: same thing to this library and to a consumer validating against the schema.
-NON_BLANK_PATTERN = f"[^{_ECMA_WHITESPACE}]"
+#: Private: a regex is an implementation detail, not something a published library
+#: should commit to as public API.
+_NON_BLANK_PATTERN = f"[^{_BLANK_CHARACTERS}]"
 
-_NON_BLANK_RE = re.compile(NON_BLANK_PATTERN)
+_NON_BLANK_RE = re.compile(_NON_BLANK_PATTERN)
 
 
 class PricingMode(str, Enum):
@@ -160,7 +180,7 @@ class PricingMode(str, Enum):
 def _validate_required_str(name: str, value: Any) -> None:
     """Require a non-blank string. Whitespace-only is blank — '  ' is not an app id.
 
-    Blankness is decided by :data:`NON_BLANK_PATTERN`, the same expression the
+    Blankness is decided by :data:`_NON_BLANK_PATTERN`, the same expression the
     published schema carries, rather than by ``str.strip()`` — Python's notion of
     whitespace differs from ECMA-262's, and the two must agree or a non-Python
     producer could emit a value this library refuses.
@@ -171,6 +191,14 @@ def _validate_required_str(name: str, value: Any) -> None:
         )
     if not _NON_BLANK_RE.search(value):
         raise ValueError(f"{name} is required and must not be blank")
+
+
+def _validate_optional_str(name: str, value: Any) -> None:
+    """Require a string or ``None`` — the shape the published schema declares."""
+    if value is not None and not isinstance(value, str):
+        raise ValueError(
+            f"{name} must be a string or None; got {type(value).__name__} {value!r}"
+        )
 
 
 def _coerce_wire_integers(kwargs: dict[str, Any]) -> None:
@@ -253,6 +281,9 @@ class UsageRecord:
     def __post_init__(self) -> None:
         for name in REQUIRED_FIELDS:
             _validate_required_str(name, getattr(self, name))
+
+        for name in _OPTIONAL_STR_FIELDS:
+            _validate_optional_str(name, getattr(self, name))
 
         for name in TOKEN_COUNT_FIELDS:
             _validate_non_negative_int(name, getattr(self, name), allow_none=False)
@@ -381,7 +412,7 @@ def usage_record_json_schema() -> dict[str, Any]:
         return {
             "type": "string",
             "minLength": 1,
-            "pattern": NON_BLANK_PATTERN,
+            "pattern": _NON_BLANK_PATTERN,
             **extra,
         }
 

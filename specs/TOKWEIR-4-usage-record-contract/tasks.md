@@ -184,3 +184,18 @@ Filed after the fact so `tasks.md` reflects what the branch actually contains.
 - [x] T031 Stop exporting `NON_BLANK_PATTERN` from the package's public surface.
 - [x] T032 Remove the stale duplicate `NON_BLANK_PATTERN = r"\S"` that shadowed the shared pattern
       and made the ECMA-aligned class dead code.
+
+- [x] T033 [US4] Validate `workload`, `parent_request_id`, `queue` and `ts` as optional strings so
+      the library cannot emit a record its own published schema rejects (FR-025), with a test that
+      records the library accepts serialize to schema-valid JSON.
+- [x] T034 [US4] Widen the fresh-document guard to the schema's list-valued members (`required`,
+      `pricing_mode.enum`) and to numeric fragments, which the first version did not cover (FR-020).
+- [x] T035 [US4] Make the jsonschema-backed happy path validate a fully-populated payload as well as
+      a minimal one, so the optional fields are actually exercised.
+- [x] T036 [US1] Switch the shared blank-character class from ECMA-262's whitespace set to the
+      union with Python's, so the shared rule never loosened the library (FR-024).
+- [x] T037 Rename `NON_BLANK_PATTERN` to `_NON_BLANK_PATTERN` — a regex is an implementation
+      detail, not public API for a library others will pin.
+- [x] T038 Add a field-set fingerprint test tying `SCHEMA_VERSION` to the record's fields, so adding
+      a field forces a deliberate version decision (FR-018).
+- [x] T039 Assert the missing field is named in the omitted-required-argument test (US1 scenario 2).

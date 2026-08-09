@@ -169,6 +169,9 @@ all are accepted identically.
   which may then decide what to do. This story does not define a rejection policy for future
   versions — see Assumptions.
 - **Whitespace-only required field**: treated as blank, i.e. rejected. `"  "` is not an app id.
+  "Whitespace" is a single explicit character class shared by the library and the published schema —
+  the union of Python's and ECMA-262's sets — rather than each side using its own shorthand, which
+  would let the two disagree at the handful of code points where those sets differ (FR-024).
 - **`pricing_mode` supplied as the enum vs. as its wire string**: both accepted, both normalize to
   the same stored value.
 - **A very large token count**: accepted; Python integers are unbounded and the contract sets no
@@ -231,7 +234,15 @@ all are accepted identically.
   mutated into one that violates its own contract and then serialized.
 - **FR-024**: The published JSON Schema's notion of a blank string MUST hold under ECMA-262 regular
   expression semantics (which is what JSON Schema `pattern` specifies), not merely under Python's,
-  so that a JavaScript or Go validator and this library agree on which values are blank.
+  so that a JavaScript or Go validator and this library agree on which values are blank. The shared
+  rule MUST NOT make the library less strict than treating any Python-whitespace-only value as
+  blank.
+- **FR-025**: The agreement MUST hold in **both** directions. As well as never refusing a record
+  that conforms to the published schema (FR-019), the library MUST NOT construct a record that
+  serializes to JSON its own published schema rejects — a consumer in another language validating
+  incoming records would otherwise reject what the reference producer emits. In particular
+  `workload`, `parent_request_id`, `queue` and `ts` MUST be a string or absent, matching the
+  `["string", "null"]` the schema declares for them.
 - **FR-016**: `model` MUST be stored verbatim as an opaque identifier, with no provider-specific
   validation, normalization, or inference.
 - **FR-017**: The contract module MUST depend only on the Python standard library.
@@ -306,10 +317,17 @@ all are accepted identically.
 - **The project constitution is an unfilled template.** `.specify/memory/constitution.md` still
   contains placeholder principles, so no project-specific constitutional constraints were applied
   beyond ADR-0001's pillars.
-- **The published schema may be stricter than the reader, never looser.** `schema_version` is in the
-  schema's `required` list even though `from_dict` defaults it when absent: every record this
-  library emits carries it, so the published document tells a non-Python producer to stamp it. Only
-  the other direction — the schema accepting what the library refuses — is a defect (FR-019).
+- **The published schema may require more of a *payload* than the reader insists on.**
+  `schema_version` is in the schema's `required` list even though `from_dict` defaults it when
+  absent: every record this library emits carries it, so the published document tells a non-Python
+  producer to stamp it, while the reader stays tolerant of an older payload that omits it. This is
+  the one deliberate asymmetry, and it does not licence the general case — FR-019 and FR-025
+  together require the schema and the library to agree on *values*, in both directions.
+- **`schema_version` is the one field where the schema is narrower than the library.** The schema
+  pins `const: 1`, while the library will construct a record with any positive version. A record
+  built with `schema_version=2` therefore fails the v1 schema — correctly, since it is not a v1
+  record, and v2 would ship its own schema file. This is the versioning decision above, not an
+  FR-025 breach.
 - **Validator-level tests are dev-install-only, a known CI gap.** Validating payloads against the
   published schema needs a JSON Schema engine, and the core must not grow one (ADR-0001 Pillar 2),
   so `jsonschema` is a `[dev]` extra and those tests `importorskip`. The MADO stream plan installs

@@ -46,7 +46,8 @@ assert UsageRecord.from_json(wire) == rec  # transport is not
 ```
 
 `request_id`, `app_id`, `endpoint`, `model` and `status` are required and must be
-non-blank; token counts default to `0` and must be non-negative integers. An
+non-blank; `workload`, `parent_request_id`, `queue` and `ts` are optional strings;
+token counts default to `0` and must be non-negative integers. An
 unattributable record is a producer-side bug, and failing loudly beats metering
 garbage — so construction validates, and does so with two error types by design:
 

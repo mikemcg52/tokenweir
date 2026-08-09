@@ -173,14 +173,36 @@ Decisions worth stating because a reviewer would otherwise have to reverse-engin
     variants with `dataclasses.replace`, which re-runs validation. There are no pinned consumers at
     version `0.0.0`, so this is the cheapest moment to make the commitment.
 
-13. **Blankness is defined by an explicit character class, not `\S`.** JSON Schema `pattern` is
-    ECMA-262, whose whitespace set differs from Python's: Python treats U+001C–U+001F and U+0085 as
-    whitespace, ECMA-262 does not; ECMA-262 treats U+FEFF as whitespace, Python does not. With `\S`
-    on both sides the two engines disagree, so `str.strip()` was replaced by a shared regex spelling
-    the set out. Every engine then agrees, which is the point of a cross-language contract. This
-    slightly changes behaviour at those code points, and tests pin each one.
+13. **Blankness is defined by an explicit character class, not `\S` — and the class is the *union*
+    of Python's and ECMA-262's whitespace sets.** JSON Schema `pattern` is ECMA-262, whose
+    whitespace set differs from Python's: Python treats U+001C–U+001F and U+0085 as whitespace,
+    ECMA-262 does not; ECMA-262 treats U+FEFF as whitespace, Python does not. With `\S` on both
+    sides the two engines disagree, so `str.strip()` and `\S` were replaced by one class spelled out
+    in escapes both engines parse identically.
 
-14. **`jsonschema` is a `[dev]` extra and its tests skip in CI — accepted, with compensation.** See
+    Three options existed once the class was explicit: ECMA's set, Python's set, or the union.
+    ECMA's set alone was tried first and rejected on review — it *loosened* the library, making
+    `app_id="\x1c"` newly valid. Python's set alone cannot be expressed to an ECMA validator's
+    satisfaction without the same explicit spelling, and would leave U+FEFF disagreeing. The union
+    is the only choice that both makes every engine agree and leaves the library no less strict than
+    it was before the change; U+FEFF additionally becomes blank, which is a tightening. Verified
+    across all 1,114,112 code points and, by a reviewer, against V8. Tests pin each divergent point.
+
+14. **Agreement is guarded in both directions, not just schema → library.** FR-019 stops the schema
+    accepting what the library refuses. The reverse — the library emitting what its own schema
+    rejects — turned out to be the live gap: `workload`, `parent_request_id`, `queue` and `ts` were
+    typed `Optional[str]` but never validated, so `workload=123` constructed happily and serialized
+    to a document a Go consumer would reject. They are now validated (FR-025). A parametrized test
+    asserts records the library accepts serialize to schema-valid JSON; a 4,000-case randomized
+    sweep in each direction found zero disagreements.
+
+15. **`.specify/feature.json` is committed on purpose.** The branch follows MADO's
+    `<STORY-KEY>-<desc>` convention, which speckit's scripts do not recognize (they expect
+    `NNN-name`), so without this file `setup-plan.sh` and `check-prerequisites.sh` resolve the wrong
+    feature directory or fail their branch check. It is one line, it is per-branch, and it is what
+    makes the speckit spine reproducible on this branch — worth the churn.
+
+16. **`jsonschema` is a `[dev]` extra and its tests skip in CI — accepted, with compensation.** See
     the spec's Assumptions. The dependency-free numeric and blank-rule agreement tests carry the
     substance of FR-019/FR-024 in the environment that actually gates the merge; the
     `jsonschema`-backed tests are corroboration on a dev install. Fully closing it needs the MADO

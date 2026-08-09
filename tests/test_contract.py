@@ -239,8 +239,11 @@ def test_omitting_a_required_argument_raises_type_error():
     # Python's own signature check. The required fields deliberately have no
     # sentinel defaults, so type checkers and IDEs catch this before runtime —
     # documented in the contract module docstring and the README.
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as excinfo:
         UsageRecord(request_id="r", app_id="a", endpoint="/e", model="m")
+    # Python's own message names the missing argument, which is the "clear error
+    # naming the offending field" the spec asks for.
+    assert "status" in str(excinfo.value)
 
 
 def test_invalid_value_raises_value_error_not_type_error():

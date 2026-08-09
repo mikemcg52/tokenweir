@@ -20,12 +20,41 @@ from tokenweir import (
     UsageRecord,
     usage_record_json_schema,
 )
-from tokenweir.contract import NON_BLANK_PATTERN, TOKEN_COUNT_FIELDS
+from tokenweir.contract import (
+    _NON_BLANK_PATTERN,
+    _OPTIONAL_STR_FIELDS,
+    TOKEN_COUNT_FIELDS,
+)
 
 SCHEMA_FILE = Path(__file__).resolve().parents[1] / "schema" / "usage-record.v1.json"
 
 
 def _payload(**overrides) -> dict:
+    """A fully-populated payload — every optional field set, so a validation
+    happy-path test actually exercises them rather than only their nulls."""
+    base = UsageRecord(
+        request_id="req-1",
+        app_id="mado",
+        endpoint="/v1/messages",
+        model="claude-sonnet-4",
+        status="ok",
+        workload="review",
+        parent_request_id="req-0",
+        queue="usage",
+        input_tokens=1200,
+        output_tokens=340,
+        cache_creation_input_tokens=90,
+        cache_read_input_tokens=17,
+        latency_ms=1234,
+        pricing_mode=PricingMode.API_METERED,
+        ts="2026-08-09T12:00:00Z",
+    ).to_dict()
+    base.update(overrides)
+    return base
+
+
+def _minimal_payload(**overrides) -> dict:
+    """The other extreme: every optional left unset, so the nulls are covered too."""
     base = UsageRecord(
         request_id="req-1",
         app_id="mado",
@@ -105,7 +134,7 @@ def test_required_string_properties_reject_blank_in_the_schema(name):
     prop = usage_record_json_schema()["properties"][name]
     assert prop["type"] == "string"
     assert prop["minLength"] == 1
-    assert prop["pattern"] == NON_BLANK_PATTERN
+    assert prop["pattern"] == _NON_BLANK_PATTERN
 
 
 @pytest.mark.parametrize("name", REQUIRED_FIELDS)
@@ -204,13 +233,23 @@ def test_v1_schema_is_a_strict_v1_validator_by_design():
 
 def test_generated_schema_shares_no_state_between_calls():
     # Callers may annotate the returned document; doing so must not corrupt the
-    # generator or any sibling property within the same document.
+    # generator or any sibling property within the same document. Covers the
+    # list-valued members too, not just the nested dicts.
     first = usage_record_json_schema()
     first["properties"]["workload"]["description"] = "POISONED"
+    first["required"].append("POISONED")
+    first["properties"]["pricing_mode"]["enum"].append("POISONED")
+    first["properties"]["input_tokens"]["minimum"] = -99
 
     second = usage_record_json_schema()
     assert "description" not in second["properties"]["workload"]
+    assert "POISONED" not in second["required"]
+    assert "POISONED" not in second["properties"]["pricing_mode"]["enum"]
+    assert second["properties"]["input_tokens"]["minimum"] == 0
+
+    # ...and no two properties within one document share a fragment.
     assert "description" not in first["properties"]["queue"]
+    assert first["properties"]["output_tokens"]["minimum"] == 0
 
 
 # --- Numeric agreement: JSON has one number type -----------------------------
@@ -264,23 +303,26 @@ def test_direct_construction_still_requires_a_real_int(name):
 @pytest.mark.parametrize(
     "char, is_blank",
     [
-        ("\u00a0", True),   # NBSP - whitespace in both Python and ECMA-262
-        ("\ufeff", True),   # BOM - ECMA-262 whitespace, but NOT Python's
+        ("\u00a0", True),   # NBSP - whitespace to both Python and ECMA-262
         ("\u2028", True),   # LINE SEPARATOR
         ("\u3000", True),   # IDEOGRAPHIC SPACE
-        ("\u001c", False),  # FILE SEPARATOR - Python whitespace, but NOT ECMA's
-        ("\u0085", False),  # NEL - Python whitespace, but NOT ECMA's
+        ("\ufeff", True),   # BOM - ECMA-262 whitespace, but NOT Python's
+        ("\u001c", True),   # FILE SEPARATOR - Python whitespace, but NOT ECMA's
+        ("\u0085", True),   # NEL - Python whitespace, but NOT ECMA's
         ("x", False),
+        ("\u200b", False),  # ZERO WIDTH SPACE - blank to neither
     ],
 )
-def test_blankness_follows_the_published_pattern_not_python_str_strip(char, is_blank):
-    """The library and the schema must agree even where Python and ECMA-262 differ.
+def test_blankness_is_the_union_of_python_and_ecma_whitespace(char, is_blank):
+    """The library and the published schema must agree, character for character.
 
-    These are exactly the characters where `str.strip()` would have given a
-    different answer than the published `pattern`, which is why blankness is
-    decided by the pattern and not by str.strip().
+    The listed code points are exactly where Python and ECMA-262 disagree about
+    whitespace, which is why blankness is decided by an explicit shared class
+    rather than by `str.strip()` on one side and `\\S` on the other. The class is
+    the *union*, so adopting a shared rule never made the library less strict:
+    U+001C-U+001F and U+0085 stay blank, and U+FEFF becomes blank too.
     """
-    schema_says_blank = not re.search(NON_BLANK_PATTERN, char)
+    schema_says_blank = not re.search(_NON_BLANK_PATTERN, char)
     assert schema_says_blank is is_blank
 
     try:
@@ -292,3 +334,117 @@ def test_blankness_follows_the_published_pattern_not_python_str_strip(char, is_b
         library_says_blank = True
 
     assert library_says_blank is is_blank
+
+
+# --- The other direction: the library must not emit schema-invalid records ----
+#
+# FR-019 guards schema -> library (a conforming producer is never refused).
+# This guards library -> schema: a record this library accepts must serialize to
+# a document its own published schema validates. A Go or JS consumer validating
+# incoming records would otherwise reject what the reference producer emits.
+
+
+@pytest.mark.parametrize("name", _OPTIONAL_STR_FIELDS)
+@pytest.mark.parametrize("bad", [123, 3.5, True, ["x"], {"a": 1}, object()])
+def test_optional_string_fields_reject_non_strings(name, bad):
+    with pytest.raises(ValueError) as excinfo:
+        UsageRecord(
+            request_id="r", app_id="a", endpoint="/e", model="m", status="ok",
+            **{name: bad},
+        )
+    assert name in str(excinfo.value)
+
+
+@pytest.mark.parametrize("name", _OPTIONAL_STR_FIELDS)
+def test_optional_string_fields_accept_a_string_or_none(name):
+    for value in ("x", "", None):
+        rec = UsageRecord(
+            request_id="r", app_id="a", endpoint="/e", model="m", status="ok",
+            **{name: value},
+        )
+        assert getattr(rec, name) == value
+
+
+def test_schema_types_exactly_the_optional_string_fields_as_nullable_strings():
+    props = usage_record_json_schema()["properties"]
+    # pricing_mode is also a nullable string, but an enum-constrained one — it is
+    # validated by PricingMode, not by the plain optional-string rule.
+    nullable = {
+        name
+        for name, prop in props.items()
+        if prop.get("type") == ["string", "null"] and "enum" not in prop
+    }
+    assert nullable == set(_OPTIONAL_STR_FIELDS)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"workload": "review"},
+        {"workload": ""},
+        {"ts": "2026-08-09T12:00:00Z"},
+        {"pricing_mode": PricingMode.API_METERED},
+        {"pricing_mode": PricingMode.SUBSCRIPTION},
+        {"input_tokens": 0, "output_tokens": 10**18},
+        {"latency_ms": 0},
+        {"model": "llama3.1:70b"},
+        {"status": "error"},
+        {"queue": "usage", "parent_request_id": "req-0"},
+    ],
+)
+def test_any_record_the_library_accepts_serializes_to_schema_valid_json(kwargs):
+    jsonschema = _validator()
+    fields = {
+        "request_id": "r", "app_id": "a", "endpoint": "/e",
+        "model": "m", "status": "ok",
+    }
+    fields.update(kwargs)
+    rec = UsageRecord(**fields)
+    jsonschema.validate(
+        instance=json.loads(rec.to_json()), schema=usage_record_json_schema()
+    )
+
+
+def test_minimal_and_full_payloads_both_validate():
+    jsonschema = _validator()
+    schema = usage_record_json_schema()
+    jsonschema.validate(instance=_minimal_payload(), schema=schema)
+    jsonschema.validate(instance=_payload(), schema=schema)
+
+
+# --- FR-018: SCHEMA_VERSION must move when the field set moves ----------------
+
+
+def test_schema_version_is_pinned_to_the_field_set():
+    """Adding or removing a field must force a deliberate SCHEMA_VERSION decision.
+
+    The drift guard already forces the published artifact to be regenerated, but
+    nothing forced the *version* to be reconsidered. This fingerprint does: change
+    the record's fields and this test fails until someone updates it and decides
+    whether the version bumps.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    fingerprint = sorted(f.name for f in dataclass_fields(UsageRecord))
+    assert fingerprint == sorted(
+        [
+            "schema_version",
+            "request_id",
+            "parent_request_id",
+            "app_id",
+            "workload",
+            "endpoint",
+            "model",
+            "queue",
+            "status",
+            "latency_ms",
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "pricing_mode",
+            "ts",
+        ]
+    ), "record fields changed - bump SCHEMA_VERSION (or justify not doing so)"
+    assert SCHEMA_VERSION == 1
