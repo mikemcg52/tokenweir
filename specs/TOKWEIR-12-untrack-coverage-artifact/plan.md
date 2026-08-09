@@ -59,11 +59,17 @@ specs/TOKWEIR-12-untrack-coverage-artifact/
 
 ```text
 .gitignore                  # + coverage artifact rules
+.coverage                   # index entry removed (file stays on disk)
+.specify/feature.json       # repointed to this story's spec directory
 tests/
 └── test_repo_hygiene.py    # NEW — the regression guard
 ```
 
 Nothing else. `src/tokenweir/` and `schema/` are deliberately untouched.
+
+`.specify/feature.json` is speckit bookkeeping, not part of the fix: it pins the feature directory
+for a branch whose name follows MADO's `<STORY-KEY>-<desc>` convention rather than speckit's
+`NNN-name`, and it has to move with each story or the speckit scripts resolve the previous one.
 
 **Structure Decision**: The guard goes in its own `tests/test_repo_hygiene.py` rather than into
 `test_contract.py`, because it asserts a property of *the repository*, not of the library. Mixing it

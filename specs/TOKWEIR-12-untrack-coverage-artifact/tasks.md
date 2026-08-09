@@ -73,3 +73,26 @@ re-stages it.
 ## Parallel opportunities
 
 Essentially none — the change is small and sequential by nature. T003–T005 are one test file.
+
+---
+
+## Phase 5: Review-driven fixes (fix round 1)
+
+- [x] T010 [US3] Harden `_require_git_repo`: skip unless `git rev-parse --show-toplevel` resolves to
+      `REPO_ROOT`. `--is-inside-work-tree` is also true for a tree vendored inside *another*
+      repository, where `git ls-files` returns nothing and the ignore rules consulted are the outer
+      repo's — so the guard failed instead of skipping, breaking FR-006.
+- [x] T011 [US3] Test the detector directly: every `COVERAGE_ARTIFACTS` entry and nested variants
+      are recognized, and real source paths (including `docs/coverage-notes.md` and
+      `coverage_helpers.py`) are not. Without this, stubbing the predicate to `return False` left
+      the whole file green.
+- [x] T012 [US3] Pass `--no-index` to `git check-ignore`. With the index it reports every *tracked*
+      path as not-ignored whatever the rules say, which made the source-not-ignored test unable to
+      fail and the artifact test's failure message wrong for a tracked artifact.
+- [x] T013 [US3] Assert the ignore match comes from the repository's own root `.gitignore`.
+      coverage.py writes `htmlcov/.gitignore` containing `*`, so once that directory exists on disk
+      a weaker assertion would pass on coverage's own file rather than ours.
+- [x] T014 [US3] Add tests for the skip behaviour itself (FR-006): git absent, not a repository, and
+      vendored inside another repository.
+- [x] T015 List `.specify/feature.json` and the `.coverage` index removal in plan.md's file list,
+      which claimed "nothing else" was touched.
