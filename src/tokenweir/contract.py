@@ -213,6 +213,13 @@ def _coerce_wire_integers(kwargs: dict[str, Any]) -> None:
     Only exactly-integral floats are converted. ``100.5``, ``NaN`` and ``Infinity``
     are left alone for :meth:`UsageRecord.__post_init__` to reject, so a genuinely
     fractional count still fails loudly rather than being silently truncated.
+
+    Caveat: a float above 2**53 has already lost precision by the time it reaches
+    here — ``json.loads`` produced it — so ``1e30`` converts to the nearest
+    representable integer, not exactly 10**30. Nothing is truncated, but the value
+    is approximate. No realistic token count or latency comes near that magnitude,
+    and a producer needing exact large integers should write them as JSON integers,
+    which are parsed exactly.
     """
     for name in _WIRE_INTEGER_FIELDS:
         value = kwargs.get(name)
@@ -323,7 +330,7 @@ class UsageRecord:
         return json.dumps(self.to_dict(), **dumps_kwargs)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> UsageRecord:
+    def from_dict(cls, data: Mapping[str, Any]) -> UsageRecord:
         """Rebuild from a dict.
 
         Unknown keys are ignored so a payload from a newer producer still reads

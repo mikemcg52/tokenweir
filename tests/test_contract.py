@@ -10,6 +10,7 @@ pricing modes and the published schema have their own files.
 
 import ast
 import dataclasses
+import json
 import sys
 from pathlib import Path
 
@@ -181,13 +182,46 @@ def test_very_large_token_counts_are_accepted():
         "gpt-4o-mini",
         "mistral-large-latest",
         "qwen2.5-coder:32b",
+        # Mixed case and surrounding whitespace: a lower()/strip() sneaking into
+        # the core would silently rewrite attribution data, and every all-lowercase
+        # identifier above would fail to notice.
+        "Meta-Llama-3.1-70B-Instruct",
+        "ft:gpt-4o-2024-08-06:acme::AbC123",
+        "  spaced-model  ",
+        "MiXeD-CaSe-Model",
+        "Qwen/Qwen2.5-Coder-32B-Instruct",
     ],
 )
 def test_model_is_stored_verbatim_for_any_provider(model):
-    # ADR-0001 Pillar 3: the core is keyed by model, not locked to Anthropic.
+    # ADR-0001 Pillar 3: the core is keyed by model, not locked to Anthropic, and
+    # the identifier is opaque — no normalization, prefixing or inference.
     rec = _record(model=model)
     assert rec.model == model
     assert UsageRecord.from_dict(rec.to_dict()).model == model
+    assert json.loads(rec.to_json())["model"] == model
+
+
+@pytest.mark.parametrize(
+    "name", ["request_id", "app_id", "endpoint", "model", "status", "workload"]
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "MiXeD-CaSe",
+        "  padded  ",
+        "UPPER",
+        "trailing ",
+        " leading",
+        "Has Spaces Inside",
+    ],
+)
+def test_string_fields_are_never_normalized(name, value):
+    # Attribution data is stored as given. A stray .lower()/.strip() anywhere in
+    # __post_init__ would corrupt it silently, and the round trip would hide it.
+    rec = _record(**{name: value})
+    assert getattr(rec, name) == value
+    assert json.loads(rec.to_json())[name] == value
+    assert getattr(UsageRecord.from_json(rec.to_json()), name) == value
 
 
 def _third_party_imports(path: Path) -> set:

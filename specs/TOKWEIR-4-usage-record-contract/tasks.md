@@ -199,3 +199,16 @@ Filed after the fact so `tasks.md` reflects what the branch actually contains.
 - [x] T038 Add a field-set fingerprint test tying `SCHEMA_VERSION` to the record's fields, so adding
       a field forces a deliberate version decision (FR-018).
 - [x] T039 Assert the missing field is named in the omitted-required-argument test (US1 scenario 2).
+
+- [x] T040 [US1] Pin `_NON_BLANK_PATTERN` to its exact literal and assert it contains no regex
+      shorthand class, so swapping the explicit class back to `\\s` cannot pass silently (FR-024).
+- [x] T041 [US1] Add a node-gated test evaluating the published pattern under real ECMA-262
+      semantics and comparing it to Python's and to the library's own accept/reject set (FR-024).
+- [x] T042 [US5] Add mixed-case and whitespace-bearing identifiers to the verbatim-storage tests for
+      `model`, `app_id`, `endpoint`, `status` and `workload`, so a stray `.lower()`/`.strip()` in
+      `__post_init__` fails the suite (FR-016).
+- [x] T043 Annotate `from_dict` as taking a `Mapping[str, Any]`, matching its runtime guard.
+- [x] T044 Document the >2**53 float precision caveat on `_coerce_wire_integers`, and record the
+      "optional strings are type-checked but not blank-checked" choice in spec.md's Assumptions.
+- [x] T045 Amend plan.md design decision 8, which still described the superseded `\\S` pattern.
+- [x] T046 Cover `bytearray` as well as `bytes` in the `from_json` acceptance test.

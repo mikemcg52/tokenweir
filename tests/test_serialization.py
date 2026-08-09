@@ -75,9 +75,13 @@ def test_to_json_emits_a_json_object_with_the_contracted_field_names():
     assert payload["schema_version"] == SCHEMA_VERSION
 
 
-def test_from_json_accepts_bytes():
+@pytest.mark.parametrize("wrap", [lambda b: b, bytearray], ids=["bytes", "bytearray"])
+def test_from_json_accepts_bytes_like_payloads(wrap):
+    # str, bytes and bytearray — exactly what json.loads itself accepts, so the
+    # guard neither narrows nor widens the standard library's contract.
     original = _minimal()
-    assert UsageRecord.from_json(original.to_json().encode("utf-8")) == original
+    encoded = original.to_json().encode("utf-8")
+    assert UsageRecord.from_json(wrap(encoded)) == original
 
 
 def test_unknown_fields_from_a_newer_producer_are_ignored():

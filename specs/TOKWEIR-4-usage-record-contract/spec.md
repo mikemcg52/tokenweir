@@ -299,6 +299,11 @@ all are accepted identically.
   with `const`, so `usage-record.v1.json` accepts only v1 records while the Python type stays
   forward-tolerant per FR-007. This does not contradict the deferral below: the schema states what
   a v1 record *is*; it does not dictate what a consumer should *do* with a v2 one.
+- **Optional strings are type-checked but not blank-checked.** `workload`, `parent_request_id`,
+  `queue` and `ts` must be a string or absent, but `""` and `"   "` are accepted. The published
+  schema places no `minLength` or `pattern` on them, and the two must agree (FR-025); a blank
+  optional is also meaningfully different from a blank *identity* field, since it carries no
+  attribution weight on its own. Tightening this later would be a schema change.
 - **`status` stays free-form.** The story does not enumerate statuses and the gateway's values are
   not settled, so `status` is a required non-blank string rather than an enum. Enumerating it later
   would be a schema change requiring a `SCHEMA_VERSION` bump.

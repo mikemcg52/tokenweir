@@ -138,10 +138,12 @@ Decisions worth stating because a reviewer would otherwise have to reverse-engin
    what to do with a v2 one. Pinned by a test so the divergence stays a decision, not an accident.
 
 8. **The schema's `pattern` mirrors the library's "blank" rule.** `_validate_required_str` treats
-   whitespace-only as blank, so the required string properties carry `pattern: "\S"` alongside
+   whitespace-only as blank, so the required string properties carry a `pattern` alongside
    `minLength: 1`. Without it a non-Python producer could follow the published schema and still emit
    `{"app_id": "  "}` — a record this library refuses. A test asserts the two rules agree value by
-   value, so they cannot drift apart.
+   value, so they cannot drift apart. *(Superseded in part by decision 13: the pattern started as
+   `\S` and is now an explicit shared character class, because `\S` does not mean the same thing to
+   Python and to ECMA-262. The requirement here is unchanged; only the expression is.)*
 
 9. **`jsonschema` is a `[dev]` extra, never a runtime dependency.** Validating payloads against the
    published schema needs an engine; the core must not grow one (Pillar 2). The validation tests

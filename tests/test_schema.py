@@ -8,6 +8,8 @@ code that generates it.
 
 import json
 import re
+import shutil
+import subprocess
 from dataclasses import fields
 from pathlib import Path
 
@@ -448,3 +450,83 @@ def test_schema_version_is_pinned_to_the_field_set():
         ]
     ), "record fields changed - bump SCHEMA_VERSION (or justify not doing so)"
     assert SCHEMA_VERSION == 1
+
+
+# --- FR-024: pin the shared pattern, and check it under a real ECMA engine ----
+
+
+EXPECTED_NON_BLANK_PATTERN = (
+    r"[^\t\n\v\f\r\u001c-\u001f \u0085\u00a0\u1680"
+    r"\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+)
+
+
+def test_non_blank_pattern_is_pinned_to_its_exact_literal():
+    """The published pattern is part of the wire contract — pin it, don't infer it.
+
+    Without this, swapping the explicit class back to a shorthand like `[^\\s]`
+    passes every other test in the suite (both sides would be evaluated by Python's
+    engine) while silently telling JavaScript and Go consumers that U+001C and
+    U+0085 are acceptable values, which this library refuses.
+    """
+    assert _NON_BLANK_PATTERN == EXPECTED_NON_BLANK_PATTERN
+
+
+@pytest.mark.parametrize(
+    "shorthand", [r"\s", r"\S", r"\w", r"\W", r"\d", r"\D", r"\p{", r"\P{", "[:"]
+)
+def test_non_blank_pattern_uses_no_shorthand_character_class(shorthand):
+    # Shorthands are the failure mode: their meaning differs between Python and
+    # ECMA-262, which is the whole reason the class is spelled out.
+    assert shorthand not in _NON_BLANK_PATTERN
+
+
+def test_published_schema_carries_the_pinned_pattern():
+    props = usage_record_json_schema()["properties"]
+    for name in REQUIRED_FIELDS:
+        assert props[name]["pattern"] == EXPECTED_NON_BLANK_PATTERN
+
+
+_NODE = shutil.which("node")
+
+
+@pytest.mark.skipif(_NODE is None, reason="needs a node runtime for ECMA-262 semantics")
+def test_pattern_means_the_same_thing_under_ecma_262():
+    """FR-024's actual claim: a JS/Go validator and this library agree.
+
+    Every other blankness test evaluates the pattern with Python's `re` on both
+    sides, so it cannot detect a Python-vs-ECMA divergence. This one runs the
+    published pattern through V8.
+    """
+    code_points = list(range(0, 0x2100)) + [
+        0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0x3001, 0xFEFE, 0xFEFF, 0xFF00, 0x1F600
+    ]
+
+    script = (
+        "const re = new RegExp(process.argv[1]);"
+        "const cps = JSON.parse(process.argv[2]);"
+        "const blank = cps.filter(cp => !re.test(String.fromCodePoint(cp)));"
+        "console.log(JSON.stringify(blank));"
+    )
+    result = subprocess.run(
+        [_NODE, "-e", script, _NON_BLANK_PATTERN, json.dumps(code_points)],
+        capture_output=True, text=True, check=True,
+    )
+    ecma_blank = set(json.loads(result.stdout))
+    python_blank = {cp for cp in code_points if not re.search(_NON_BLANK_PATTERN, chr(cp))}
+
+    assert ecma_blank == python_blank, (
+        "published pattern means different things to Python and ECMA-262 at: "
+        f"{sorted(hex(cp) for cp in ecma_blank ^ python_blank)}"
+    )
+
+    # And it is the set the library actually enforces.
+    library_blank = set()
+    for cp in code_points:
+        try:
+            UsageRecord(
+                request_id="r", app_id=chr(cp), endpoint="/e", model="m", status="ok"
+            )
+        except ValueError:
+            library_blank.add(cp)
+    assert library_blank == ecma_blank
