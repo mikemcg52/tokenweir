@@ -187,7 +187,8 @@ all are accepted identically.
 - **FR-002**: `request_id`, `app_id`, `endpoint`, `model` and `status` MUST be required and
   non-blank. All other fields MUST be optional, with the four token counts defaulting to `0`.
 - **FR-003**: Every record MUST carry a `schema_version`, stamped automatically from the library's
-  current `SCHEMA_VERSION` when the producer does not supply one.
+  current `SCHEMA_VERSION` when the producer does not supply one. It MUST be a positive integer —
+  a version of `0` or below identifies no contract and MUST be rejected.
 - **FR-004**: The contract MUST serialize to and deserialize from JSON losslessly for every field,
   such that a deserialized record equals the record that was serialized.
 - **FR-005**: The contract MUST also serialize to and deserialize from a plain dictionary, so
@@ -212,6 +213,14 @@ all are accepted identically.
   contract version.
 - **FR-015**: The published JSON Schema MUST also exist as a checked-in file for non-Python
   consumers, and the test suite MUST fail if that file drifts from the code-generated schema.
+- **FR-019**: The published JSON Schema's constraints MUST agree with the library's own validation,
+  so a producer that follows the schema cannot emit a record this library refuses. In particular a
+  whitespace-only required field MUST be invalid in both.
+- **FR-020**: Generating the published JSON Schema MUST return an independent document on every
+  call, sharing no mutable state with the library or with a previously returned document, so a
+  consumer may annotate the result safely.
+- **FR-021**: Deserialization MUST reject a payload that is not a mapping, with a `ValueError`
+  rather than a lower-level attribute error, so a caller at the wire boundary catches one type.
 - **FR-016**: `model` MUST be stored verbatim as an opaque identifier, with no provider-specific
   validation, normalization, or inference.
 - **FR-017**: The contract module MUST depend only on the Python standard library.
@@ -258,6 +267,16 @@ all are accepted identically.
   emitting garbage is worse than failing fast. This does not weaken ADR-0001's off-critical-path
   guarantee, which constrains `Sink.emit` — the emit path — not record construction. The `Sink`
   contract that `emit` must never raise is unchanged by this story.
+- **Two error types at construction, one at the wire boundary.** *Omitting* a required constructor
+  argument raises `TypeError` — Python's own signature check, kept because giving the required
+  fields sentinel defaults would stop type checkers and IDEs from catching the mistake before
+  runtime. Supplying an *invalid value* raises `ValueError`. Deserialization collapses the
+  distinction: `from_dict`/`from_json` raise `ValueError` for missing or invalid alike, since a
+  consumer parsing untrusted payloads should catch one type.
+- **The published schema is a strict validator for its own version.** `schema_version` is pinned
+  with `const`, so `usage-record.v1.json` accepts only v1 records while the Python type stays
+  forward-tolerant per FR-007. This does not contradict the deferral below: the schema states what
+  a v1 record *is*; it does not dictate what a consumer should *do* with a v2 one.
 - **`status` stays free-form.** The story does not enumerate statuses and the gateway's values are
   not settled, so `status` is a required non-blank string rather than an enum. Enumerating it later
   would be a schema change requiring a `SCHEMA_VERSION` bump.

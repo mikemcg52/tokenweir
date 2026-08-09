@@ -127,6 +127,34 @@ Decisions worth stating because a reviewer would otherwise have to reverse-engin
    pinned external consumers; completing the contract at version 1 is correct. Bumping would falsely
    imply a wire-incompatible change that consumers must migrate for.
 
+7. **The published schema pins `schema_version` with `const`, and is therefore deliberately stricter
+   than the Python type.** `from_dict` accepts and preserves a newer version (FR-007) so a Python
+   consumer can decide for itself what to do; `usage-record.v1.json` refuses it. This is not a
+   contradiction — the file *is* the description of version 1 records, and a v2 record is described
+   by `usage-record.v2.json`. Relaxing it to `minimum: 1` was considered and rejected: it would make
+   the v1 document silently accept a v3 record whose fields it does not describe, which is a worse
+   answer to the only question a validator is asked. The spec's deferral of a rejection *policy*
+   (Assumptions) still holds — the schema states what a v1 record is; it does not tell a consumer
+   what to do with a v2 one. Pinned by a test so the divergence stays a decision, not an accident.
+
+8. **The schema's `pattern` mirrors the library's "blank" rule.** `_validate_required_str` treats
+   whitespace-only as blank, so the required string properties carry `pattern: "\S"` alongside
+   `minLength: 1`. Without it a non-Python producer could follow the published schema and still emit
+   `{"app_id": "  "}` — a record this library refuses. A test asserts the two rules agree value by
+   value, so they cannot drift apart.
+
+9. **`jsonschema` is a `[dev]` extra, never a runtime dependency.** Validating payloads against the
+   published schema needs an engine; the core must not grow one (Pillar 2). The validation tests
+   `importorskip` it, so they run on a dev install and skip under the MADO stream plan's
+   `pip install -e . pytest`. The structural and pattern-agreement tests are dependency-free and
+   always run, so the alignment is guarded even where the engine is absent.
+
+10. **`REQUIRED_FIELDS`, `TOKEN_COUNT_FIELDS` and `NON_BLANK_PATTERN` are exported** beyond the
+    minimum the task list named. They are the single source of truth that construction validation,
+    deserialization, the published schema and the tests all read from, and downstream TOKWEIR
+    stories (the writer, the emitter) will need the same lists. All are immutable, so exporting
+    them commits to names rather than to mutable state.
+
 ## Phasing
 
 | Phase | What | Why this order |

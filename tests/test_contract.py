@@ -189,10 +189,8 @@ def test_model_is_stored_verbatim_for_any_provider(model):
     assert UsageRecord.from_dict(rec.to_dict()).model == model
 
 
-def test_contract_module_imports_only_the_standard_library():
-    # ADR-0001 Pillar 2: no transport and no provider SDK may enter the core.
-    source = Path(tokenweir.contract.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
+def _third_party_imports(path: Path) -> set:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
 
     imported_roots = set()
     for node in ast.walk(tree):
@@ -203,9 +201,55 @@ def test_contract_module_imports_only_the_standard_library():
             if node.level == 0 and node.module:
                 imported_roots.add(node.module.split(".")[0])
 
-    third_party = {
+    return {
         name
         for name in imported_roots
         if name not in sys.stdlib_module_names and name != "tokenweir"
     }
-    assert third_party == set(), f"contract.py must stay stdlib-only; found {third_party}"
+
+
+def _core_modules():
+    package_dir = Path(tokenweir.contract.__file__).parent
+    return sorted(package_dir.glob("*.py"))
+
+
+@pytest.mark.parametrize(
+    "module", _core_modules(), ids=lambda p: p.name
+)
+def test_core_modules_import_only_the_standard_library(module):
+    # ADR-0001 Pillar 2: no transport and no provider SDK may enter the core, so
+    # `pip install tokenweir` with no extras pulls in nothing (SC-005). Covers
+    # every module in the package, not just contract.py.
+    third_party = _third_party_imports(module)
+    assert third_party == set(), f"{module.name} must stay stdlib-only; found {third_party}"
+
+
+def test_core_module_sweep_actually_covers_the_package():
+    # Guards the parametrization above: if the glob silently matched nothing, the
+    # dependency-hygiene check would vacuously "pass".
+    names = {p.name for p in _core_modules()}
+    assert {"__init__.py", "contract.py", "sink.py", "source.py"} <= names
+
+
+# --- TOKWEIR-4: the two error types are a documented distinction --------------
+
+
+def test_omitting_a_required_argument_raises_type_error():
+    # Python's own signature check. The required fields deliberately have no
+    # sentinel defaults, so type checkers and IDEs catch this before runtime —
+    # documented in the contract module docstring and the README.
+    with pytest.raises(TypeError):
+        UsageRecord(request_id="r", app_id="a", endpoint="/e", model="m")
+
+
+def test_invalid_value_raises_value_error_not_type_error():
+    with pytest.raises(ValueError):
+        _record(app_id="")
+
+
+@pytest.mark.parametrize("payload", [["a"], "a", 3, None, ("a", "b")])
+def test_from_dict_rejects_a_non_mapping_payload(payload):
+    # At the wire boundary the caller catches one error type, so a non-mapping
+    # must not surface as AttributeError.
+    with pytest.raises(ValueError):
+        UsageRecord.from_dict(payload)

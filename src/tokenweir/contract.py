@@ -21,6 +21,13 @@ Compatibility rules for ``schema_version``:
   producer still reads on an older consumer (forward compatibility).
 - Deserialization **preserves the payload's** ``schema_version`` rather than
   substituting this library's, so a consumer can always tell what it received.
+- The **published JSON Schema is deliberately stricter** than the Python type: it
+  pins ``schema_version`` with ``const``, because ``usage-record.v1.json`` is the
+  document that describes *version 1 records* and a version 2 record is described
+  by its own file. The Python type stays forward-tolerant so a consumer can read a
+  newer record and decide for itself; the schema answers the narrower question
+  "is this a v1 record I fully understand?". Both behaviours are intentional and
+  they are not in conflict — see :func:`usage_record_json_schema`.
 
 Validation is deliberately loud: constructing a record with a blank identity
 field or a negative token count raises :class:`ValueError`, because an
@@ -28,11 +35,24 @@ unattributable record is a producer-side bug and silently metering garbage is
 worse than failing. This does not weaken ADR-0001's off-critical-path guarantee,
 which constrains :meth:`tokenweir.sink.Sink.emit` — the emit path — not record
 construction. ``Sink.emit`` still must never raise.
+
+Two distinct error types, by design:
+
+- **Omitting** a required constructor argument raises :class:`TypeError` — that is
+  Python's own signature check, and keeping the required fields genuinely required
+  (rather than giving them sentinel defaults) is what lets type checkers and IDEs
+  catch the mistake before runtime.
+- Supplying an **invalid value** raises :class:`ValueError`.
+
+At the wire boundary the distinction disappears: :meth:`UsageRecord.from_dict` and
+:meth:`UsageRecord.from_json` raise :class:`ValueError` for a missing *or* invalid
+field, so a consumer parsing untrusted payloads catches one type.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Optional, Union
@@ -209,8 +229,15 @@ class UsageRecord:
         rather than replaced with this library's.
 
         Raises:
-            ValueError: if a required field is absent, or any value is invalid.
+            ValueError: if the payload is not a mapping, a required field is
+                absent, or any value is invalid.
         """
+        if not isinstance(data, Mapping):
+            raise ValueError(
+                "usage record payload must be a mapping; got "
+                f"{type(data).__name__}"
+            )
+
         known = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in data.items() if k in known}
 
@@ -247,22 +274,56 @@ class UsageRecord:
 # this module so there is one source of truth; the checked-in artifact at
 # ``schema/usage-record.v1.json`` is asserted by the test suite to match.
 
-_NULLABLE_STRING = {"type": ["string", "null"]}
-_NULLABLE_INTEGER = {"type": ["integer", "null"], "minimum": 0}
-_TOKEN_COUNT = {"type": "integer", "minimum": 0, "default": 0}
+#: JSON Schema ``pattern`` enforcing "contains a non-whitespace character".
+#: ``pattern`` is an unanchored search, so this is exactly the rule
+#: :func:`_validate_required_str` applies — a whitespace-only value is blank.
+#: Kept in lockstep with that function: a non-Python producer following the
+#: published schema must not be able to emit a record this library refuses.
+NON_BLANK_PATTERN = r"\S"
 
 
 def usage_record_json_schema() -> dict[str, Any]:
     """Return the JSON Schema describing a serialized :class:`UsageRecord`.
 
-    The document describes **this** contract version: ``schema_version`` is
-    pinned with ``const``, and a future version ships its own schema file.
+    A fresh document is built on every call — no nested object is shared between
+    calls or with module state, so a caller may annotate or mutate the result
+    freely.
+
+    The document describes **this** contract version and only this one:
+    ``schema_version`` is pinned with ``const``, and a future version ships its
+    own ``usage-record.vN.json``. That is deliberately stricter than
+    :meth:`UsageRecord.from_dict`, which accepts and preserves a newer version so
+    a Python consumer can decide for itself. The schema answers the narrower
+    question "is this a v1 record I fully understand?"; a consumer that wants the
+    tolerant behaviour should read the version field rather than validate.
+
     ``additionalProperties`` stays open because unknown fields are tolerated by
-    design (forward compatibility).
+    design (forward compatibility) — a v1 record that has picked up a v2 field
+    still validates.
     """
+
+    def nullable_string(**extra: Any) -> dict[str, Any]:
+        return {"type": ["string", "null"], **extra}
+
+    def required_string(**extra: Any) -> dict[str, Any]:
+        # minLength rejects ""; the pattern rejects "   ". Both mirror
+        # _validate_required_str, so the schema and the library agree on "blank".
+        return {
+            "type": "string",
+            "minLength": 1,
+            "pattern": NON_BLANK_PATTERN,
+            **extra,
+        }
+
+    def token_count() -> dict[str, Any]:
+        return {"type": "integer", "minimum": 0, "default": 0}
+
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": f"https://github.com/mikemcg52/tokenweir/schema/usage-record.v{SCHEMA_VERSION}.json",
+        "$id": (
+            "https://raw.githubusercontent.com/mikemcg52/tokenweir/main/schema/"
+            f"usage-record.v{SCHEMA_VERSION}.json"
+        ),
         "title": "tokenweir usage record",
         "description": (
             "One metered unit of work (one model call / iteration). Raw token "
@@ -276,27 +337,30 @@ def usage_record_json_schema() -> dict[str, Any]:
             "schema_version": {
                 "type": "integer",
                 "const": SCHEMA_VERSION,
-                "description": "The contract version this record obeys.",
-            },
-            "request_id": {"type": "string", "minLength": 1},
-            "app_id": {"type": "string", "minLength": 1},
-            "endpoint": {"type": "string", "minLength": 1},
-            "model": {
-                "type": "string",
-                "minLength": 1,
                 "description": (
-                    "Opaque, provider-neutral model identifier, stored verbatim."
+                    "The contract version this record obeys. Pinned: this "
+                    "document validates version "
+                    f"{SCHEMA_VERSION} records only, and a later version ships "
+                    "its own schema file."
                 ),
             },
-            "status": {"type": "string", "minLength": 1},
-            "workload": _NULLABLE_STRING,
-            "parent_request_id": _NULLABLE_STRING,
-            "queue": _NULLABLE_STRING,
-            "input_tokens": _TOKEN_COUNT,
-            "output_tokens": _TOKEN_COUNT,
-            "cache_creation_input_tokens": _TOKEN_COUNT,
-            "cache_read_input_tokens": _TOKEN_COUNT,
-            "latency_ms": _NULLABLE_INTEGER,
+            "request_id": required_string(),
+            "app_id": required_string(),
+            "endpoint": required_string(),
+            "model": required_string(
+                description=(
+                    "Opaque, provider-neutral model identifier, stored verbatim."
+                )
+            ),
+            "status": required_string(),
+            "workload": nullable_string(),
+            "parent_request_id": nullable_string(),
+            "queue": nullable_string(),
+            "input_tokens": token_count(),
+            "output_tokens": token_count(),
+            "cache_creation_input_tokens": token_count(),
+            "cache_read_input_tokens": token_count(),
+            "latency_ms": {"type": ["integer", "null"], "minimum": 0},
             "pricing_mode": {
                 "type": ["string", "null"],
                 "enum": [*(member.value for member in PricingMode), None],
@@ -305,10 +369,9 @@ def usage_record_json_schema() -> dict[str, Any]:
                     "'subscription' is flat-rate, where no per-call cost exists."
                 ),
             },
-            "ts": {
-                **_NULLABLE_STRING,
-                "description": "ISO-8601 UTC timestamp, stamped by the producer.",
-            },
+            "ts": nullable_string(
+                description="ISO-8601 UTC timestamp, stamped by the producer."
+            ),
         },
         "required": list(REQUIRED_FIELDS),
         "additionalProperties": True,

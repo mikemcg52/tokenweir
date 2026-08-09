@@ -46,10 +46,20 @@ assert UsageRecord.from_json(wire) == rec  # transport is not
 ```
 
 `request_id`, `app_id`, `endpoint`, `model` and `status` are required and must be
-non-blank; token counts default to `0` and must be non-negative integers.
-Constructing an invalid record raises `ValueError` — an unattributable record is a
-producer-side bug, and failing loudly beats metering garbage. This is separate from
-`Sink.emit`, which must still never raise into the caller.
+non-blank; token counts default to `0` and must be non-negative integers. An
+unattributable record is a producer-side bug, and failing loudly beats metering
+garbage — so construction validates, and does so with two error types by design:
+
+| Mistake | Raises |
+|---|---|
+| Omitting a required argument | `TypeError` — Python's own signature check. The required fields have no sentinel defaults, so type checkers and IDEs catch it before runtime. |
+| Supplying an invalid value (blank, negative, wrong type) | `ValueError` |
+
+At the wire boundary the distinction disappears: `from_dict` and `from_json` raise
+`ValueError` for a missing *or* invalid field, so code parsing untrusted payloads
+catches one type.
+
+This is separate from `Sink.emit`, which must still never raise into the caller.
 
 ### Pricing modes
 
@@ -74,8 +84,22 @@ always tell what it actually received.
 
 For consumers that are not Python, the contract is published as JSON Schema at
 [`schema/usage-record.v1.json`](schema/usage-record.v1.json), generated from
-`tokenweir.contract.usage_record_json_schema()`. The test suite fails if the
-checked-in file drifts from the code; regenerate it with:
+`tokenweir.contract.usage_record_json_schema()`.
+
+Two things to know about it:
+
+- **It is a strict v1 validator, deliberately stricter than the Python type.**
+  `schema_version` is pinned with `const: 1`, so a v2 record fails validation
+  against the v1 document even though `from_dict` reads it happily. The schema
+  answers "is this a v1 record I fully understand?"; a consumer wanting the
+  tolerant behaviour should read the version field rather than validate. A future
+  version ships its own `usage-record.vN.json`.
+- **It is a repository artifact, not part of the wheel.** `pip install tokenweir`
+  does not carry it — fetch it from the repo, or generate it in-process by calling
+  `usage_record_json_schema()`.
+
+The test suite fails if the checked-in file drifts from the code; regenerate it
+with:
 
 ```bash
 python -c "import json;from tokenweir import usage_record_json_schema as s;\
