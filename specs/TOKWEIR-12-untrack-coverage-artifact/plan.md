@@ -126,5 +126,15 @@ already established the convention of one test file per concern.
   git checkout, which the MADO stream pod does.
 - **`git rm --cached` on a file that other checkouts hold** will delete their copy on pull. Called
   out in the spec's Edge Cases; acceptable for regenerable data.
+- **The blob survives in history, and this run deliberately does not remove it.** Untracking fixes
+  the index, not the past: `caffcbd` still contains the 53 KB file and its absolute developer paths,
+  so a clone still carries them. The story's acceptance is about tracking, which is met — but the
+  motivation quoted in the spec ("a public repo should not ship this") is only fully served by a
+  history rewrite. That rewrite is out of scope for two concrete reasons, not for convenience:
+  `caffcbd` is already pushed to `origin`, so it would mean force-pushing an already-reviewed
+  branch; and the story's own acceptance says nothing about history. Recorded in the spec's Edge
+  Cases and filed as a follow-up so the decision is made explicitly, while it is still cheap —
+  before merge it is an amend or a two-commit rebase, after a public release it is `git
+  filter-repo` plus coordination.
 - **This branch is based on unmerged TOKWEIR-4 work**, at the developer's instruction. A reviewer
   diffing `main...HEAD` sees both stories; the TOKWEIR-12 change is the last commits only.

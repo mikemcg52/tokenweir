@@ -96,3 +96,21 @@ Essentially none — the change is small and sequential by nature. T003–T005 a
       vendored inside another repository.
 - [x] T015 List `.specify/feature.json` and the `.coverage` index removal in plan.md's file list,
       which claimed "nothing else" was touched.
+
+---
+
+## Phase 6: Review-driven fixes (fix round 2)
+
+- [x] T016 Record the history-retention decision explicitly in spec.md's Edge Cases and plan.md's
+      Risks: the blob survives at `caffcbd`, which is already pushed to `origin`, so scrubbing it
+      means force-pushing an already-reviewed branch — the developer's call, filed as a follow-up
+      rather than decided by omission.
+- [x] T017 [US2] Add an end-to-end FR-004 test: create the four artifact shapes and assert
+      `git status --porcelain -uall` reports none of them. Needs no coverage tooling, only creates
+      paths that do not already exist, and removes exactly what it created.
+- [x] T018 [US3] Replace the positional `NON_ARTIFACTS[:3]` slice with a named `REAL_SOURCE_PATHS`
+      constant, so prepending an entry cannot silently change which paths the converse test covers.
+- [x] T019 [US3] Assert `check-ignore` returns exactly 1 (not merely non-zero) in the converse test:
+      128 means git errored, which would otherwise pass for the wrong reason.
+- [x] T020 [US3] Flag a path segment named `htmlcov` anywhere including the last, closing a detector
+      blind spot for a tracked file of that name.

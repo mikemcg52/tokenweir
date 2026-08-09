@@ -98,6 +98,17 @@ property rather than a one-time observation.
   removes the index entry only.
 - **Another checkout pulls this change**: git deletes their copy of `.coverage`. Acceptable — it is
   regenerable data, not source.
+- **The blob remains in history.** Untracking removes the file from the tip, not from the commits
+  that already contain it — `caffcbd` still holds the 53 KB blob, so a `git clone` continues to
+  carry it and the absolute developer paths inside it. This story's acceptance is about the index
+  ("`.coverage` is untracked … no coverage artifact is tracked"), which untracking satisfies, and
+  scrubbing history is a materially different operation: `caffcbd` is **already pushed to
+  `origin/TOKWEIR-4-usage-record-contract`**, so removing it means rewriting published history and
+  force-pushing a branch that has already been through six reviews. That is the developer's call,
+  not this run's, and it is deliberately **not** done here. It is recorded rather than decided by
+  omission, and filed as a follow-up, because the moment it is cheapest is before the branch merges
+  and long before the repository is made public — after a public release it needs `git filter-repo`
+  and coordination with everyone who has cloned.
 - **A parallel-mode data file (`.coverage.hostname.12345.xyz`)**: covered by the `.coverage.*`
   rule, which is a distinct pattern from `.coverage` and needed separately.
 - **A directory literally named `coverage/`**: not covered, and deliberately so — no tool this
