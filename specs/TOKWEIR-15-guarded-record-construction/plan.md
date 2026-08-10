@@ -125,13 +125,45 @@ than leaning on that (spec edge case: return-value ambiguity).
 `emit_usage` returns `None` for *either* a construction drop or an emission failure. A caller that
 needs to tell them apart uses the two halves; the log lines already distinguish them (FR-007).
 
+### Refusing a non-record (FR-018)
+
+`emit_record` type-checks before touching the sink. This is not defensive noise: `build_record`
+returns `None` on a drop, so the *naive* composition of the two halves the library is asking
+consumers to use — build, then emit, without an `is not None` between them — would hand `None` to a
+conforming sink. A conforming sink cannot raise, so it would persist it. That converts a producer
+bug into garbage in the store, which is the one thing this guard must not do. Refusal logs a
+`WARNING` with no `exc_info`, because nothing was caught — there is no traceback, and attaching one
+would render a misleading `NoneType: None`.
+
 ### Logging
 
-One module logger, `logging.getLogger(__name__)` → `tokenweir.sink`. No handler, no level, no
-`basicConfig` — handler policy belongs to the application (FR-008). Messages:
+One module logger, `logging.getLogger(__name__)` → `tokenweir.sink`. No level, no `basicConfig`.
+Messages:
 
 - construction drop: `"tokenweir: dropping usage record — construction failed; no metering for this call"`
-- emission failure: `"tokenweir: usage record not emitted — sink raised; no metering for this call"`
+- emission failure: `"tokenweir: usage record not emitted — the sink failed; no metering for this call"`
+- refusal: `"tokenweir: refusing to emit a non-UsageRecord; no metering for this call"`
+
+"the sink failed" rather than "the sink raised": the same guard catches a sink that is `None` or
+misconfigured, where the truthful cause is an `AttributeError`, not a raising `emit`. `exc_info`
+carries the real cause in both cases, and the message stays trivially distinguishable from a
+construction drop, which is what FR-007 asks for.
+
+**Handler policy — the `NullHandler` decision (FR-008, FR-017).** The package attaches exactly one
+`NullHandler` to the `tokenweir` logger in `__init__.py`. Recorded because the naive reading —
+"a library should attach no handler at all" — is wrong and was the first thing tried: a logger with
+no handler anywhere in its chain falls through to the standard library's `logging.lastResort`, which
+writes `WARNING` and above, traceback included, to `sys.stderr`. An application that configured no
+logging would therefore get one traceback per metered request from a systematically broken producer
+— the library taking an output decision that belongs to whoever embeds it, which is exactly what
+FR-008 forbids. `NullHandler` emits nothing, so attaching it is declining to configure logging
+rather than configuring it.
+
+The cost, stated rather than glossed: an application with no logging configuration now sees nothing
+in its logs. That is the right default — it is the application's choice, reversed by one line of
+`basicConfig` — and it does not make drops unobservable, because the return value reaches the caller
+regardless of logging configuration (FR-017). "Never silent" is discharged by the return value plus
+an available log, not by writing to a stream nobody asked for.
 
 Both at `WARNING` with `exc_info=True`, so the underlying `ValueError`/`TypeError` — which already
 names the offending field, e.g. `app_id is required and must not be blank` — reaches the operator

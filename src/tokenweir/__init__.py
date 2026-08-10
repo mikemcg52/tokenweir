@@ -13,6 +13,8 @@ Transport adapters (e.g. AMQP) live behind optional extras (``tokenweir[amqp]``)
 so the core carries no wire dependencies.
 """
 
+import logging
+
 from tokenweir.contract import (
     REQUIRED_FIELDS,
     SCHEMA_VERSION,
@@ -29,6 +31,20 @@ from tokenweir.sink import (
     emit_usage,
 )
 from tokenweir.source import MemorySource, Source
+
+# The stdlib idiom for a library: attach a NullHandler to the package logger so
+# an application that has configured no logging is not written to. Without it,
+# `logging.lastResort` prints every dropped-record WARNING — traceback and all —
+# to the application's stderr, which on a hot metered path with a systematically
+# broken producer is one traceback per request. That is the library taking an
+# output decision that belongs to whoever embeds it.
+#
+# The trade-off, recorded rather than assumed: an application with no logging
+# configuration now sees nothing. That is the correct default (it is the
+# application's choice to make, and one line of `logging.basicConfig()` reverses
+# it), and drops stay observable regardless of logging configuration through the
+# return value, which is the signal a caller can act on programmatically.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
     "SCHEMA_VERSION",

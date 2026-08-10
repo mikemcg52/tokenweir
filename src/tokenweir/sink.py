@@ -41,6 +41,13 @@ Drops are never silent: each one logs a ``WARNING`` on this module's logger
 carrying the original exception, and the return value distinguishes a drop from a
 success so a caller can count drops without parsing logs. A guard that hid
 producer bugs would undo TOKWEIR-4's decision rather than protect it.
+
+Where that signal *goes* is the application's decision, not this library's: the
+package attaches a ``NullHandler`` to the ``tokenweir`` logger (see
+``tokenweir/__init__.py``) so an application that has configured no logging is not
+given a traceback per metered request on its stderr by ``logging.lastResort``.
+The return value remains the signal that always reaches the caller regardless of
+logging configuration.
 """
 
 from __future__ import annotations
@@ -55,8 +62,16 @@ _logger = logging.getLogger(__name__)
 _CONSTRUCTION_FAILED = (
     "tokenweir: dropping usage record — construction failed; no metering for this call"
 )
+# "the sink failed" rather than "the sink raised": the same guard catches a sink
+# that is missing or misconfigured (an AttributeError from ``None.emit``), and
+# claiming it raised would misdescribe that case. ``exc_info`` carries the real
+# cause either way. Still trivially distinguishable from a construction drop,
+# which is what FR-007 asks for.
 _EMISSION_FAILED = (
-    "tokenweir: usage record not emitted — sink raised; no metering for this call"
+    "tokenweir: usage record not emitted — the sink failed; no metering for this call"
+)
+_NOT_A_RECORD = (
+    "tokenweir: refusing to emit a non-UsageRecord; no metering for this call"
 )
 
 
@@ -84,7 +99,7 @@ class NullSink:
         return None
 
 
-def _warn_dropped(message: str) -> None:
+def _warn_dropped(message: str, *, exc_info: bool = True) -> None:
     """Log a drop at ``WARNING`` with the active exception, and never raise.
 
     The nested ``try`` is deliberate, not sloppiness. An application may install a
@@ -98,9 +113,14 @@ def _warn_dropped(message: str) -> None:
     the contract's own error text, which names the offending field, and formatting
     an arbitrary caller-supplied value is the cheapest way to make the logging
     call throw in the first place.
+
+    ``exc_info`` is a parameter because one drop — refusing a non-record — is a
+    rejection rather than a caught failure, and there is no active exception to
+    attach. Logging ``exc_info=True`` there would render a misleading
+    ``NoneType: None``.
     """
     try:
-        _logger.warning(message, exc_info=True)
+        _logger.warning(message, exc_info=exc_info)
     except Exception:
         pass
 
@@ -138,11 +158,23 @@ def emit_record(sink: Sink, record: UsageRecord) -> bool:
     an implementation that violates it, because the party harmed by a
     non-conforming adapter is the request on the critical path.
 
+    Anything that is not a :class:`~tokenweir.contract.UsageRecord` is refused
+    before the sink sees it, and refusing is the whole point: this function is
+    half of the build-then-emit pair, and :func:`build_record` returns ``None`` on
+    a drop, so the naive composition would otherwise hand ``None`` to a conforming
+    sink — which by contract cannot raise and would dutifully persist it. The
+    guard turns crashes into drops; it must not turn them into garbage in the
+    store.
+
     ``BaseException`` propagates, as in :func:`build_record`.
 
     Returns:
-        ``True`` if ``emit`` returned normally, ``False`` if it raised.
+        ``True`` if ``emit`` returned normally, ``False`` if the record was
+        refused or ``emit`` raised.
     """
+    if not isinstance(record, UsageRecord):
+        _warn_dropped(_NOT_A_RECORD, exc_info=False)
+        return False
     try:
         sink.emit(record)
     except Exception:

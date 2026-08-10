@@ -133,6 +133,40 @@ in parallel.
 
 ---
 
+---
+
+## Phase 9: Fix round 1 (findings from review 1)
+
+- [x] **T031** *(Med-1)* Attach a `NullHandler` to the `tokenweir` package logger in
+      `src/tokenweir/__init__.py`. Without it, `logging.lastResort` writes a traceback per drop to
+      the stderr of an application that configured no logging — the output decision FR-008 forbids
+      the library from taking. Record the trade-off in plan.md and amend FR-008/US3.3, which
+      contradicted each other on stdout vs stderr (FR-008, FR-017).
+- [x] **T032** *(Med-1)* Subprocess tests pinning both directions: an unconfigured interpreter gets
+      nothing on stdout/stderr and still observes the drop via the return value; an interpreter that
+      calls `basicConfig` gets the warning and the cause (SC-009).
+- [x] **T033** *(Med-2)* Parametrize the log assertion over the whole malformed matrix **and** over
+      `REQUIRED_FIELDS`, asserting exactly one `WARNING` with `exc_info` per case, and that the
+      missing-argument cases carry a `TypeError`. Asserting only the return value left the entire
+      `TypeError` half free to go quiet (SC-003).
+- [x] **T034** *(Med-3)* `emit_record` refuses anything that is not a `UsageRecord` — returns
+      `False`, logs without a bogus traceback, and the sink receives nothing. Test the naive
+      build-then-emit composition with no `is not None` check (FR-018, SC-010).
+- [x] **T035** *(Low-1)* Test that `emit_usage` delegates to `build_record` and `emit_record` rather
+      than reimplementing them, so FR-003's structural claim is enforced, not just its behaviour.
+- [x] **T036** *(Low-2)* Reword the emission message to "the sink failed" — the same guard catches a
+      missing sink, where "raised" is untrue — and test that a `None` sink is described honestly.
+- [x] **T037** *(Low-5)* Note in the README that gateway/emitter adoption is still in progress, so a
+      reader does not infer the seam is already wired up.
+- [x] **T038** Re-run the authoritative suite and `ruff check .`.
+
+**Not fixed, and why:** Low-3 (no test for the README) — the reviewer flagged it for completeness
+and documentation tests are not worth the coupling. Low-4 (no throttling on drop logging) — FR-006
+*requires* `exc_info`, so per-drop tracebacks are compliant by design; rate-limiting is an
+operational concern for the consumers, and is carried to TOKWEIR-6/-10 rather than solved here.
+
+---
+
 ## Dependencies
 
 - Phase 2 (T002–T007) blocks Phases 3–7.

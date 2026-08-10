@@ -124,9 +124,18 @@ identifies the cause.
 2. **Given** a dropped record, **When** the log line is read, **Then** it says metering was skipped
    for that call, so the reader is not left guessing whether the request itself failed.
 3. **Given** an application that has configured no logging at all, **When** a record is dropped,
-   **Then** the library does not configure logging on the application's behalf and does not write
-   to stdout — it uses a module logger and leaves handler policy to the application.
-4. **Given** a caller that wants to react programmatically, **When** a record is dropped, **Then**
+   **Then** the library writes nothing to that application's stdout or stderr. It uses a module
+   logger and leaves handler policy to the application — which, for a library, means attaching a
+   `NullHandler` to the package logger, because otherwise the standard library's `lastResort`
+   handler prints the warning and its traceback to stderr and the library has taken an output
+   decision that was not its to take. On a hot metered path with a systematically broken producer
+   that is one traceback per request.
+4. **Given** that same unconfigured application, **When** a record is dropped, **Then** the drop is
+   still observable — through the return value, which reaches the caller regardless of logging
+   configuration. "Never silent" is discharged by the return value plus a logged warning the
+   application can turn on with one line of `basicConfig`, not by writing to a stream the
+   application did not ask for.
+5. **Given** a caller that wants to react programmatically, **When** a record is dropped, **Then**
    the return value distinguishes success from a drop, so the caller can increment its own counter
    without parsing logs.
 
@@ -193,12 +202,22 @@ step; both halves swallow their own failures.
 - **FR-006**: Every drop MUST be logged at `WARNING` on a `tokenweir` module logger, carrying the
   underlying exception and stating that metering was skipped for that call.
 - **FR-007**: Construction drops and emission failures MUST be distinguishable in the logs.
-- **FR-008**: The library MUST NOT configure logging handlers, set levels, or write to
-  stdout/stderr on the application's behalf.
+- **FR-008**: The library MUST NOT call `basicConfig`, set a level, install a logging handler that
+  emits, or otherwise write to stdout/stderr on the application's behalf. It MUST attach a
+  `NullHandler` to the `tokenweir` package logger, which is what makes that true in practice: a
+  library logger with no handler falls through to the standard library's `lastResort` handler,
+  which writes `WARNING` and above — with the traceback — to stderr.
+- **FR-017**: A drop MUST remain observable to a caller that has configured no logging, via the
+  return value. FR-008 concerns where a *log* goes; it must not be satisfied by making the drop
+  undetectable.
 - **FR-009**: The logging call MUST itself be guarded, so a broken logging configuration cannot
   make a guarded call raise.
 - **FR-010**: The guarded path MUST produce a record identical to direct construction for valid
   input — no added normalization, defaulting, or coercion.
+- **FR-018**: Guarded emission MUST refuse anything that is not a `UsageRecord` rather than hand it
+  to the sink. `build_record` returns `None` on a drop, so the naive composition of the two halves
+  would otherwise push `None` into a conforming sink — which by contract cannot raise and would
+  persist it. The guard converts crashes into drops, never into garbage in the store.
 - **FR-011**: `UsageRecord.__init__` MUST keep raising on invalid input; this story adds a guarded
   seam beside it and does not soften the contract.
 - **FR-012**: `Sink.emit`'s "MUST NOT raise" contract MUST be unchanged; the emission guard is
@@ -229,8 +248,13 @@ step; both halves swallow their own failures.
   `schema_version`, missing required argument — the guarded path returns a drop and raises nothing.
 - **SC-002**: A sink that raises from `emit` cannot propagate an exception through the guarded path.
 - **SC-003**: Every drop in SC-001 and SC-002 emits exactly one `WARNING` on a `tokenweir` logger
-  that names the underlying exception.
+  that names the underlying exception — **every** case in the matrix, `TypeError` paths included,
+  not a representative sample.
 - **SC-004**: A guarded call with a logging configuration that raises still does not raise.
+- **SC-009**: A subprocess that imports `tokenweir`, configures no logging, and drops a record
+  writes nothing to stdout or stderr, and still observes the drop via the return value.
+- **SC-010**: `emit_record` handed a non-`UsageRecord` returns `False` and the sink receives
+  nothing.
 - **SC-005**: For valid input, the guarded path's record equals `UsageRecord(**fields)`.
 - **SC-006**: The full suite passes via the authoritative command in `/workspace/.mado/project.yaml`
   (`/workspace/repo/.venv/bin/pytest`, `CI=true`, pass codes `0` and `5`), with the pre-existing

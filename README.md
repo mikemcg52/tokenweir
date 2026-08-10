@@ -180,10 +180,21 @@ if record is not None:
 `emit_usage` is exactly `build_record` followed by `emit_record`, so there is one
 implementation of each guarantee rather than two.
 
+A record is refused before the sink sees it if it is not a `UsageRecord` — so the
+careless composition, without the `is not None` check above, drops rather than
+persisting `None`.
+
 **Drops are never silent.** Each one logs a `WARNING` on the `tokenweir.sink`
 logger carrying the original exception — which already names the offending field —
-and the return value lets a caller count drops without parsing logs. The library
-attaches no handler and sets no level; handler policy stays the application's.
+and the return value lets a caller count drops without parsing logs.
+
+Handler policy stays the application's: the package attaches a `NullHandler` to
+the `tokenweir` logger and sets no level, per the standard library's guidance for
+libraries. The consequence is worth stating plainly — an application that has
+configured no logging at all sees nothing, and gets the warnings with one line of
+`logging.basicConfig()`. The alternative was writing a traceback per dropped
+record to the stderr of an application that never asked for output. The return
+value is the signal that reaches a caller either way.
 
 Two things the guard deliberately does *not* do:
 
@@ -198,6 +209,10 @@ Two things the guard deliberately does *not* do:
 
 `KeyboardInterrupt` and `SystemExit` are not caught. A metering guard that
 swallowed Ctrl-C would be a worse bug than the one it fixes.
+
+> **Adoption is in progress.** `tokenweir` ships the seam; the AI Gateway
+> (TOKWEIR-10) and the emitter client (TOKWEIR-6) are being moved onto it. Until
+> then, a consumer constructing records inline should call `emit_usage` itself.
 
 ## Develop
 
