@@ -9,7 +9,9 @@ The core defines three seams and nothing about the wire:
 - **`tokenweir.contract`** — a versioned, serializable `UsageRecord`. Raw token
   counts are stored; cost is computed at report time.
 - **`tokenweir.sink`** — the emit side (`Sink`). Fire-and-forget, off the
-  critical path; a metering outage never affects the metered system.
+  critical path; a metering outage never affects the metered system. Also home to
+  the [guarded seam](#metering-on-a-request-path) that keeps record *construction*
+  off that critical path too.
 - **`tokenweir.source`** — the write side (`Source`). Persists records to a store.
 
 Transport lives in optional adapters so the core stays dependency-light:
@@ -64,6 +66,9 @@ At the wire boundary the distinction disappears: `from_dict` and `from_json` rai
 catches one type.
 
 This is separate from `Sink.emit`, which must still never raise into the caller.
+Construction raising is safe to do on a request path *because* of the guarded seam
+below — the two decisions are meant to be read together: validation stays loud, and
+the caller on the critical path is given a supported way not to be hurt by it.
 
 Records are **immutable** — validation runs once, at construction, so the fields
 cannot afterwards be mutated into a state that breaks the contract, and a record
@@ -124,6 +129,75 @@ with:
 python -c "import json;from tokenweir import usage_record_json_schema as s;\
 print(json.dumps(s(), indent=2))" > schema/usage-record.v1.json
 ```
+
+## Metering on a request path
+
+ADR-0001 Pillar 2 promises that metering can never affect the availability of the
+metered system. The `Sink.emit` contract discharges that promise for the *emit*
+step — but record **construction** is not `Sink.emit`, and it validates, so a
+producer building a record inline on a request path would take a `ValueError`
+into the request it is metering.
+
+`tokenweir` therefore ships the guard rather than leaving every consumer to
+hand-roll it. A malformed record degrades to **"no metering for this call"**:
+
+```python
+from tokenweir import emit_usage
+
+# On the request path. Never raises; returns None if nothing was metered.
+emit_usage(
+    sink,
+    request_id=req.id,
+    app_id="mado",
+    endpoint="/v1/messages",
+    model=resp.model,
+    status="ok",
+    input_tokens=resp.usage.input_tokens,
+    output_tokens=resp.usage.output_tokens,
+)
+```
+
+The two halves are exposed for callers that must stamp or enrich a record in
+between — a gateway computes `latency_ms` only after the metered call returns,
+and a batching emitter builds now and emits later:
+
+```python
+from tokenweir import build_record, emit_record
+import dataclasses
+
+record = build_record(**fields)          # None if the values were invalid
+if record is not None:
+    record = dataclasses.replace(record, latency_ms=elapsed_ms)
+    emit_record(sink, record)            # False if the sink raised
+```
+
+| Call | On success | On failure |
+|---|---|---|
+| `build_record(**fields)` | the `UsageRecord` | `None` |
+| `emit_record(sink, record)` | `True` | `False` |
+| `emit_usage(sink, **fields)` | the `UsageRecord` | `None` |
+
+`emit_usage` is exactly `build_record` followed by `emit_record`, so there is one
+implementation of each guarantee rather than two.
+
+**Drops are never silent.** Each one logs a `WARNING` on the `tokenweir.sink`
+logger carrying the original exception — which already names the offending field —
+and the return value lets a caller count drops without parsing logs. The library
+attaches no handler and sets no level; handler policy stays the application's.
+
+Two things the guard deliberately does *not* do:
+
+- **It does not soften the contract.** `UsageRecord(...)` still validates and still
+  raises. Off a request path — a batch import, a migration, a test — construct
+  directly and let a producer bug be loud. That is the correct behaviour there, and
+  the guard is the wrong tool.
+- **It does not relax the `Sink` protocol.** Implementations still MUST NOT raise
+  from `emit`. `emit_record` guards emission because the party harmed by a
+  *non-conforming* adapter is the request on the critical path, which should not
+  have to depend on every adapter in the ecosystem being correct.
+
+`KeyboardInterrupt` and `SystemExit` are not caught. A metering guard that
+swallowed Ctrl-C would be a worse bug than the one it fixes.
 
 ## Develop
 
