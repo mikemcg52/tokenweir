@@ -7,6 +7,15 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Coverage artifacts. `.coverage.*` is a separate pattern from `.coverage` — it
+# matches the per-process data files coverage writes in parallel mode. coverage.xml
+# is listed because mado/config.yaml declares `coverage.format: xml` for this
+# project, so a MADO run produces it.
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # Virtualenvs (the MADO stream plan builds .venv at /workspace/repo/.venv)
 .venv/
 venv/
