@@ -715,6 +715,46 @@ def test_the_sink_protocol_is_unchanged():
     assert isinstance(NullSink(), Sink)
 
 
+def test_an_unknown_key_drops_every_record_not_some():
+    # The behaviour FR-022 requires the README to warn about, pinned here so the
+    # warning cannot become false. A wire payload that has gained a field meters
+    # nothing at all — the opposite of from_dict, which ignores unknown keys by
+    # design so a record from a newer producer still reads.
+    sink = RecordingSink()
+    forward_compatible_payload = dict(_fields(), a_field_from_v2="whatever")
+
+    assert emit_usage(sink, forward_compatible_payload) is None
+    assert sink.records == []
+    # ... while the tolerant reader still accepts it, which is the whole reason
+    # the README has to tell the two apart.
+    assert UsageRecord.from_dict(forward_compatible_payload) == UsageRecord(**_fields())
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "from_dict",  # FR-022: the unknown-key contrast is named
+        "positional-only",  # FR-019
+        "dataclasses.replace",  # FR-021: the pattern to avoid on a request path
+        "Adoption is in progress",  # the TOKWEIR-6/-10 scoping note
+    ],
+)
+def test_the_readme_keeps_the_load_bearing_warnings(marker):
+    # FR-016's prose is deliberately untested — coupling tests to wording is not
+    # worth it. FR-022 is different: the spec calls the unknown-key drop "the most
+    # likely real-world failure of the feature", so the warning is a MUST, and a
+    # MUST nobody checks is one refactor away from being gone. Marker strings
+    # only, so the prose stays free to change around them.
+    readme = Path(tokenweir.__file__).resolve().parents[2] / "README.md"
+    if not readme.is_file():
+        # Running against an installed package rather than the source tree. A
+        # documentation check must skip there, not fail — the same rule the
+        # repository-hygiene guard follows.
+        pytest.skip("README.md is not present; not running from the source tree")
+    section = readme.read_text(encoding="utf-8").split("## Metering on a request path")[-1]
+    assert marker in section
+
+
 def test_the_guarded_seam_is_exported_from_the_package():
     import tokenweir
 

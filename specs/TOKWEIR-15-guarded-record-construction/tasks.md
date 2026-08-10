@@ -250,6 +250,32 @@ compliant by design; carried to TOKWEIR-6/-10 as an operational note, unchanged 
 
 ---
 
+## Phase 13: Fix round 5 (findings from review 5 — the cap's last fix round)
+
+- [x] **T062** *(Med-1)* FR-022 is a MUST with no test. Pin the *behaviour* it warns about — an
+      unknown key drops through the seam while `from_dict` reads the same payload happily — and
+      check the README's load-bearing warnings by marker string, skipping where the source tree is
+      absent. Marker strings only, so the prose stays free to change (SC-014).
+- [x] **T063** *(Low-1)* README said every drop carries the original exception; the FR-018 refusal
+      deliberately carries none. `sink.py` and FR-006 were corrected in rounds 2 and 4, the README
+      was not.
+- [x] **T064** *(Low-2)* Update plan.md's Design signature block, which still showed the
+      pre-round-3/4 `(**fields)` API and so contradicted both the code and its own later sections —
+      a reader taking it as the API would reopen the FR-019/FR-020 holes.
+- [x] **T065** Post the close/no-close question on the Jira issue, so the acceptance-clause decision
+      is recorded where the story lives rather than only in this repository.
+- [x] **T066** Re-run the authoritative suite and `ruff check .`.
+
+**Not fixed:** Low-3 (a buffering sink that appends then raises is described as "not emitted") — the
+reviewer raised it as an operational note for TOKWEIR-6/-10 rather than a defect against the spec,
+and the coarse return value is FR-007-faithful and deliberate.
+
+**This is the last fix round the cap allows.** The review that follows it is terminal and
+review-only: whatever it finds is filed, not fixed, so that the branch's final commit is one a
+review has seen.
+
+---
+
 ## Dependencies
 
 - Phase 2 (T002–T007) blocks Phases 3–7.

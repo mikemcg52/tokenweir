@@ -253,6 +253,9 @@ without any validating call outside a guard.
   payload handed straight to a guarded call therefore meters *nothing at all* if it has gained a
   field, and under FR-008 an application with no logging configured sees only the return value. This
   is the most likely real-world failure of the feature and must not be left for a reader to discover.
+  Because it is a MUST rather than ordinary prose, the *behaviour* it warns about MUST have a
+  regression test, and the warning's presence MUST be checked by marker string — not by wording, so
+  the prose stays free to change and the check stays cheap.
 - **FR-021**: Stamping a value learned after the metered call (`latency_ms`, `ts`) MUST NOT require a
   second validating call on the request path. `dataclasses.replace` re-runs validation and raises, so
   it MUST NOT be the documented request-path pattern; building once with the stamp merged (FR-020)
@@ -307,6 +310,10 @@ without any validating call outside a guard.
   positional-only.
 - **SC-013**: A late stamp (`latency_ms` learned after the metered call) is emitted through one
   guarded construction, and a *bad* late stamp is a drop rather than an exception.
+- **SC-014**: A payload carrying an unknown field is a drop through the guarded seam and a
+  *successful* read through `UsageRecord.from_dict`, so the contrast FR-022 documents is pinned in
+  behaviour, not only in prose — and the README's load-bearing warnings are checked by marker
+  string, skipping where the source tree is absent.
 - **SC-005**: For valid input, the guarded path's record equals `UsageRecord(**fields)`.
 - **SC-006**: The full suite passes via the authoritative command in `/workspace/.mado/project.yaml`
   (`/workspace/repo/.venv/bin/pytest`, `CI=true`, pass codes `0` and `5`), with the pre-existing

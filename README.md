@@ -218,7 +218,9 @@ careless composition, without the `is not None` check, drops rather than
 persisting `None`.
 
 **Drops are never silent.** Each one logs a `WARNING` on the `tokenweir.sink`
-logger carrying the original exception — which already names the offending field —
+logger carrying the original exception where one was caught — which already names
+the offending field; refusing a non-record is a rejection with no exception to
+carry —
 and the return value lets a caller count drops without parsing logs.
 
 Handler policy stays the application's: the package attaches a `NullHandler` to

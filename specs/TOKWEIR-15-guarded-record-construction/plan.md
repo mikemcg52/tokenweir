@@ -88,14 +88,23 @@ that is the moment to reconsider — not now.
 
 ### The three functions
 
+The signatures as shipped. They started as the obvious `(**fields)` forms; the positional-only
+markers and the mapping parameter are what rounds 3 and 4 added, for the reasons under *What happens
+before the guard runs* below. Recorded in their final shape rather than their first, so this block
+cannot be read as an API that would reopen those holes:
+
 ```python
-def build_record(**fields: Any) -> Optional[UsageRecord]:
+def build_record(
+    fields: Optional[Mapping[str, Any]] = None, /, **overrides: Any
+) -> Optional[UsageRecord]:
     """Construct a UsageRecord, or return None if the values are invalid."""
 
-def emit_record(sink: Sink, record: UsageRecord) -> bool:
-    """Emit a record; return False if the sink raised."""
+def emit_record(sink: Sink, record: object, /) -> bool:
+    """Emit a record; return False if it was refused or the sink raised."""
 
-def emit_usage(sink: Sink, **fields: Any) -> Optional[UsageRecord]:
+def emit_usage(
+    sink: Sink, fields: Optional[Mapping[str, Any]] = None, /, **overrides: Any
+) -> Optional[UsageRecord]:
     """Build and emit in one call. Returns the record if it was emitted, else None."""
 ```
 
