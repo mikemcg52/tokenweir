@@ -119,6 +119,12 @@ MALFORMED_CASES = [
     ("zero_schema_version", dict(schema_version=0)),
     ("string_schema_version", dict(schema_version="1")),
     ("unknown_keyword", dict(not_a_field=1)),  # TypeError
+    # A field literally named after the fused call's own parameter. Without
+    # `sink` being positional-only this raises during *argument binding*, before
+    # any guard runs — the one route by which a producer's data could still reach
+    # the metered request.
+    ("field_named_sink", dict(sink="oops")),  # TypeError
+    ("field_named_self", dict(self="oops")),  # TypeError
 ]
 
 MALFORMED_IDS = [name for name, _ in MALFORMED_CASES]
@@ -182,11 +188,39 @@ def test_valid_record_survives_a_no_op_sink():
     assert emit_usage(NullSink(), **_fields()) == UsageRecord(**_fields())
 
 
+def test_the_exploding_repr_trigger_actually_fires():
+    # Guards the test below, which is only meaningful if constructing with an
+    # ExplodingRepr really does raise KeyboardInterrupt. That depends on
+    # contract.py interpolating {value!r} into its error text — a detail this
+    # story does not own. If TOKWEIR-4's messages ever stop rendering the value,
+    # this fails loudly instead of letting the FR-004 test pass vacuously.
+    with pytest.raises(KeyboardInterrupt):
+        UsageRecord(**_fields(app_id=ExplodingRepr()))
+
+
 def test_base_exception_from_construction_propagates():
     # `except Exception`, never `except BaseException` — a metering guard that
     # swallows Ctrl-C is a worse bug than the one it fixes.
     with pytest.raises(KeyboardInterrupt):
         emit_usage(RecordingSink(), **_fields(app_id=ExplodingRepr()))
+
+
+def test_a_field_named_sink_cannot_collide_with_the_parameter():
+    # Argument binding happens before the function body, so a non-positional-only
+    # `sink` parameter would raise TypeError outside every guard. This is the
+    # explicit regression test for that escape hatch.
+    sink = RecordingSink()
+    assert emit_usage(sink, **_fields(sink="oops")) is None
+    assert sink.records == []
+
+
+def test_the_fused_call_takes_its_sink_positionally_only():
+    # The mechanism behind the test above, pinned directly: passing the sink by
+    # keyword must not be a supported call shape, or the collision returns.
+    import inspect
+
+    parameters = inspect.signature(emit_usage).parameters
+    assert parameters["sink"].kind is inspect.Parameter.POSITIONAL_ONLY
 
 
 # --- US2: a misbehaving sink cannot fail the request either -------------------

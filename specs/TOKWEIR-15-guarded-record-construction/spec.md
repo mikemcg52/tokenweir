@@ -47,6 +47,19 @@ and TOKWEIR-10 then adopt it by calling it, rather than by each re-deriving it.
 This is therefore scoped as: *the library provides the guard and proves it holds*. The
 consumer-side adoption in `ai-gateway` remains TOKWEIR-10's, and is flagged rather than claimed.
 
+#### Acceptance-clause traceability
+
+The story's acceptance has two clauses. Stated separately so that closing TOKWEIR-15 is a decision
+someone makes on the record, not one that happens by the story scrolling off a board:
+
+| Clause (verbatim from the Jira story) | Status on this branch |
+|---|---|
+| "the emitter and gateway integrations construct records inside a guard" | **Not met here, and cannot be.** The gateway is the `ai-gateway` repository (TOKWEIR-10); the emitter client is TOKWEIR-6 and is not on this branch. What is delivered is the guard those integrations call, so each adopts it by calling rather than by re-deriving it. |
+| "with a test proving a malformed record cannot fail the request being metered" | **Met.** `tests/test_guarded_emit.py` proves it for every invalid-input class the contract rejects, for a missing required argument, for a field named `sink`, for a sink that raises, and for a logging configuration that raises. |
+
+Closing the story on the seam alone is therefore a judgement the developer owns, not one this run
+can make. It is reported as such rather than assumed.
+
 ### Why the guard covers emission too
 
 `Sink.emit` MUST NOT raise — that is the protocol's contract. But a contract is a statement about
@@ -199,8 +212,10 @@ step; both halves swallow their own failures.
 - **FR-004**: The guards MUST catch `Exception` and MUST NOT catch `BaseException`.
 - **FR-005**: The guards MUST cover both `ValueError` (invalid value) and `TypeError` (missing or
   unknown argument) — the two error types TOKWEIR-4 kept deliberately distinct.
-- **FR-006**: Every drop MUST be logged at `WARNING` on a `tokenweir` module logger, carrying the
-  underlying exception and stating that metering was skipped for that call.
+- **FR-006**: Every drop MUST be logged at `WARNING` on a `tokenweir` module logger, stating that
+  metering was skipped for that call, and carrying the underlying exception **where one was
+  caught**. Refusing a non-`UsageRecord` (FR-018) is a rejection rather than a caught failure, so
+  there is no exception to carry, and attaching one would render a misleading `NoneType: None`.
 - **FR-007**: Construction drops and emission failures MUST be distinguishable in the logs.
 - **FR-008**: The library MUST NOT call `basicConfig`, set a level, install a logging handler that
   emits, or otherwise write to stdout/stderr on the application's behalf. It MUST attach a
@@ -214,6 +229,10 @@ step; both halves swallow their own failures.
   make a guarded call raise.
 - **FR-010**: The guarded path MUST produce a record identical to direct construction for valid
   input — no added normalization, defaulting, or coercion.
+- **FR-019**: No field name a producer might use may collide with a guarded call's own parameters.
+  The fused call's `sink` parameter MUST be positional-only: otherwise a `**fields` mapping carrying
+  the key `"sink"` raises `TypeError` during *argument binding*, before any guard runs — the one way
+  a producer's data could still reach the metered request.
 - **FR-018**: Guarded emission MUST refuse anything that is not a `UsageRecord` rather than hand it
   to the sink. `build_record` returns `None` on a drop, so the naive composition of the two halves
   would otherwise push `None` into a conforming sink — which by contract cannot raise and would

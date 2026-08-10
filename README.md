@@ -178,7 +178,10 @@ if record is not None:
 | `emit_usage(sink, **fields)` | the `UsageRecord` | `None` |
 
 `emit_usage` is exactly `build_record` followed by `emit_record`, so there is one
-implementation of each guarantee rather than two.
+implementation of each guarantee rather than two. Its `sink` argument is
+positional-only, so a producer whose field mapping happens to contain the key
+`"sink"` gets an ordinary dropped record rather than an argument-binding
+`TypeError` raised before any guard runs.
 
 A record is refused before the sink sees it if it is not a `UsageRecord` — so the
 careless composition, without the `is not None` check above, drops rather than

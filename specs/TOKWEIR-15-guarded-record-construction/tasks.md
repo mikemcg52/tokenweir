@@ -167,6 +167,29 @@ operational concern for the consumers, and is carried to TOKWEIR-6/-10 rather th
 
 ---
 
+## Phase 10: Fix round 2 (findings from review 2)
+
+- [x] **T039** *(Med-1)* Make `emit_usage`'s `sink` positional-only. A `**fields` mapping carrying
+      the key `"sink"` collided with the parameter and raised `TypeError` during argument binding,
+      before any guard ran — the last route by which a producer's data could reach the metered
+      request. Add `field_named_sink` and `field_named_self` to the malformed matrix, a direct
+      regression test, and a signature test pinning the mechanism (FR-019).
+- [x] **T040** *(Med-2)* Add an acceptance-clause traceability table to spec.md separating the
+      clause this branch meets from the one TOKWEIR-6/-10 carry, so closing the story is a decision
+      made on the record rather than by default. Carried into the run report and a Jira comment.
+- [x] **T041** *(Low-1)* Amend FR-006 to require the underlying exception "where one was caught",
+      so the non-record refusal path — which has no exception to carry — no longer contradicts it.
+- [x] **T042** *(Low-2)* Qualify `emit_usage`'s "Never raises" docstring with the `BaseException`
+      carve-out the two halves already state.
+- [x] **T043** *(Low-3)* Widen `emit_record`'s `record` annotation to `object`, so the naive
+      composition FR-018 exists to make safe also type-checks for an adopter running mypy/pyright.
+- [x] **T044** *(Low-4)* Add a guard test asserting the `ExplodingRepr` trigger genuinely raises
+      `KeyboardInterrupt` through the constructor, so the FR-004 construction test cannot pass
+      vacuously if TOKWEIR-4's error messages ever stop interpolating the value.
+- [x] **T045** Re-run the authoritative suite and `ruff check .`.
+
+---
+
 ## Dependencies
 
 - Phase 2 (T002–T007) blocks Phases 3–7.

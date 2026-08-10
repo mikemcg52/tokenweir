@@ -125,6 +125,17 @@ than leaning on that (spec edge case: return-value ambiguity).
 `emit_usage` returns `None` for *either* a construction drop or an emission failure. A caller that
 needs to tell them apart uses the two halves; the log lines already distinguish them (FR-007).
 
+### The parameter-collision hole (FR-019)
+
+`emit_usage`'s `sink` is positional-only (`def emit_usage(sink, /, **fields)`). Recorded because the
+obvious signature is subtly wrong in a way no amount of `try` can fix: argument binding happens
+*before* the function body, so a producer whose field mapping carries the key `"sink"` gets
+`TypeError: got multiple values for argument 'sink'` raised outside every guard. That was the last
+route by which a producer's own data could reach the metered request. Positional-only takes the name
+out of the keyword namespace, and `sink` becomes an ordinary unknown field — dropped and logged like
+any other. `build_record` and `emit_record` need no equivalent: neither mixes `**kwargs` with a named
+parameter a producer could collide with.
+
 ### Refusing a non-record (FR-018)
 
 `emit_record` type-checks before touching the sink. This is not defensive noise: `build_record`

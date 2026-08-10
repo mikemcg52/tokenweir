@@ -151,8 +151,15 @@ def build_record(**fields: Any) -> Optional[UsageRecord]:
         return None
 
 
-def emit_record(sink: Sink, record: UsageRecord) -> bool:
-    """Emit ``record`` to ``sink``; return ``False`` if the sink raised.
+def emit_record(sink: Sink, record: object) -> bool:
+    """Emit ``record`` to ``sink``; return ``False`` if it was refused or the sink raised.
+
+    ``record`` is annotated ``object`` rather than ``UsageRecord`` deliberately.
+    FR-018 exists so that ``emit_record(sink, build_record(**fields))`` is safe
+    without an intervening ``is not None`` check — but ``build_record`` returns
+    ``Optional[UsageRecord]``, so a narrower annotation would make the very
+    composition this function is designed to absorb a static type error for an
+    adopter running mypy or pyright. The runtime check below is the contract.
 
     ``Sink.emit`` MUST NOT raise — that contract is unchanged. This guards against
     an implementation that violates it, because the party harmed by a
@@ -183,8 +190,11 @@ def emit_record(sink: Sink, record: UsageRecord) -> bool:
     return True
 
 
-def emit_usage(sink: Sink, **fields: Any) -> Optional[UsageRecord]:
-    """Build a record from ``fields`` and emit it to ``sink``. Never raises.
+def emit_usage(sink: Sink, /, **fields: Any) -> Optional[UsageRecord]:
+    """Build a record from ``fields`` and emit it to ``sink``.
+
+    Never raises, except for ``BaseException`` from the record's own construction
+    or from the sink — see :func:`build_record`.
 
     The one call a metered request path makes. It is exactly
     :func:`build_record` followed by :func:`emit_record`, so there is one
@@ -195,6 +205,14 @@ def emit_usage(sink: Sink, **fields: Any) -> Optional[UsageRecord]:
 
     ``**fields`` rather than a ready-made record is the point: construction has to
     happen *inside* the guard, or the caller is back to holding the exception.
+
+    ``sink`` is positional-only for the same reason. A ``**fields`` mapping that
+    happened to carry the key ``"sink"`` would otherwise collide with this
+    parameter and raise ``TypeError`` during argument binding — *before* any guard
+    runs — which is the one way a producer's data could still reach the metered
+    request. Positional-only removes the parameter name from the keyword
+    namespace, so ``sink`` becomes an ordinary unknown field: dropped and logged
+    like any other.
 
     Returns:
         The record if it was built and emitted, otherwise ``None``. ``None`` means
