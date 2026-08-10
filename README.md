@@ -157,34 +157,53 @@ emit_usage(
 )
 ```
 
-The two halves are exposed for callers that must stamp or enrich a record in
-between — a gateway computes `latency_ms` only after the metered call returns,
-and a batching emitter builds now and emits later:
+Fields may be passed as keywords, as a mapping, or as both — the mapping first,
+keyword overrides on top. That is how you stamp a value you only learn after the
+metered call returns, without a second, unguarded validating call:
+
+```python
+elapsed_ms = ...                          # known only once the call returns
+emit_usage(sink, base_fields, latency_ms=elapsed_ms, ts=stamp)
+```
+
+**Pass the mapping, don't splat it.** `emit_usage(sink, **mapping)` unpacks in
+*your* frame, before any tokenweir code runs, so a mapping that came from JSON or
+generic code and picked up a non-string key raises `TypeError: keywords must be
+strings` into the request you were metering. `emit_usage(sink, mapping)` unpacks
+inside the guard, where it is an ordinary drop.
+
+The two halves are exposed for a caller that must hold a record between the
+steps — a batching emitter builds now and emits later:
 
 ```python
 from tokenweir import build_record, emit_record
-import dataclasses
 
-record = build_record(**fields)          # None if the values were invalid
+record = build_record(fields)            # None if the values were invalid
+...
 if record is not None:
-    record = dataclasses.replace(record, latency_ms=elapsed_ms)
     emit_record(sink, record)            # False if the sink raised
 ```
 
 | Call | On success | On failure |
 |---|---|---|
-| `build_record(**fields)` | the `UsageRecord` | `None` |
+| `build_record(fields, **overrides)` | the `UsageRecord` | `None` |
 | `emit_record(sink, record)` | `True` | `False` |
-| `emit_usage(sink, **fields)` | the `UsageRecord` | `None` |
+| `emit_usage(sink, fields, **overrides)` | the `UsageRecord` | `None` |
 
 `emit_usage` is exactly `build_record` followed by `emit_record`, so there is one
-implementation of each guarantee rather than two. Its `sink` argument is
-positional-only, so a producer whose field mapping happens to contain the key
-`"sink"` gets an ordinary dropped record rather than an argument-binding
-`TypeError` raised before any guard runs.
+implementation of each guarantee rather than two.
+
+`sink` and `fields` are **positional-only** — pass them positionally, as above.
+Any parameter reachable by keyword is a name a producer's own field could collide
+with during argument binding, which happens before the function body and so
+outside every guard.
+
+Note that `dataclasses.replace` **re-runs validation and raises**, so it is the
+wrong way to stamp a record on a metered path — build once with the stamp merged,
+as above. Off that path it remains the right tool.
 
 A record is refused before the sink sees it if it is not a `UsageRecord` — so the
-careless composition, without the `is not None` check above, drops rather than
+careless composition, without the `is not None` check, drops rather than
 persisting `None`.
 
 **Drops are never silent.** Each one logs a `WARNING` on the `tokenweir.sink`

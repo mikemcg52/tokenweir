@@ -49,6 +49,9 @@ consumer-side adoption in `ai-gateway` remains TOKWEIR-10's, and is flagged rath
 
 #### Acceptance-clause traceability
 
+The story text above was fetched from Jira with `getJiraIssue` on 2026-08-10 and is quoted verbatim,
+not reconstructed from the branch name — this table's left column is the story's own wording.
+
 The story's acceptance has two clauses. Stated separately so that closing TOKWEIR-15 is a decision
 someone makes on the record, not one that happens by the story scrolling off a board:
 
@@ -165,8 +168,8 @@ after the call returns; a batching emitter builds now and emits later. If those 
 the guarantee from the library, they hand-roll it, which is precisely what this story exists to
 stop. It is deliberately not a third abstraction — it is the fused call's two halves, exposed.
 
-**Independent Test**: Build a record under guard, mutate nothing, emit it under guard as a separate
-step; both halves swallow their own failures.
+**Independent Test**: Meter a call whose `latency_ms` is only known after it returns, and emit it
+without any validating call outside a guard.
 
 **Acceptance Scenarios**:
 
@@ -176,6 +179,12 @@ step; both halves swallow their own failures.
    result reports failure rather than raising.
 3. **Given** the fused call, **When** its behaviour is compared to building-then-emitting, **Then**
    they agree — the fused call is composed of the two halves, not a parallel implementation.
+4. **Given** a caller that learns `latency_ms` only after the metered call returns, **When** it
+   stamps that value, **Then** it does so through one guarded construction — not by re-validating an
+   already-built record, which `dataclasses.replace` would do and which would put a raise site back
+   on the request path.
+5. **Given** a *bad* late stamp (a negative `latency_ms`), **When** it is metered, **Then** it is a
+   drop, not an exception into the request.
 
 ### Edge Cases
 
@@ -230,9 +239,17 @@ step; both halves swallow their own failures.
 - **FR-010**: The guarded path MUST produce a record identical to direct construction for valid
   input — no added normalization, defaulting, or coercion.
 - **FR-019**: No field name a producer might use may collide with a guarded call's own parameters.
-  The fused call's `sink` parameter MUST be positional-only: otherwise a `**fields` mapping carrying
-  the key `"sink"` raises `TypeError` during *argument binding*, before any guard runs — the one way
-  a producer's data could still reach the metered request.
+  Every named parameter of a guarded call MUST be positional-only: otherwise a mapping carrying that
+  key raises `TypeError` during *argument binding*, before any guard runs.
+- **FR-020**: A guarded call MUST accept the field **mapping itself**, not only `**fields`. `**`
+  unpacking happens in the caller's frame, so a mapping from JSON, a header dict, or generic code
+  that carries a non-string key raises `TypeError: keywords must be strings` before any library code
+  runs — a raise site no signature can guard at the splat. Keyword `overrides` MUST compose with the
+  mapping (mapping first, overrides on top).
+- **FR-021**: Stamping a value learned after the metered call (`latency_ms`, `ts`) MUST NOT require a
+  second validating call on the request path. `dataclasses.replace` re-runs validation and raises, so
+  it MUST NOT be the documented request-path pattern; building once with the stamp merged (FR-020)
+  keeps the single validating call inside the guard.
 - **FR-018**: Guarded emission MUST refuse anything that is not a `UsageRecord` rather than hand it
   to the sink. `build_record` returns `None` on a drop, so the naive composition of the two halves
   would otherwise push `None` into a conforming sink — which by contract cannot raise and would
@@ -274,6 +291,12 @@ step; both halves swallow their own failures.
   writes nothing to stdout or stderr, and still observes the drop via the return value.
 - **SC-010**: `emit_record` handed a non-`UsageRecord` returns `False` and the sink receives
   nothing.
+- **SC-011**: A field mapping containing a non-string key, or that is not a mapping at all, is a
+  drop when passed as a mapping — and the splatted form is shown to raise, so the reason the mapping
+  form exists is pinned rather than asserted.
+- **SC-012**: Every named parameter of `build_record` and `emit_usage` is positional-only.
+- **SC-013**: A late stamp (`latency_ms` learned after the metered call) is emitted through one
+  guarded construction, and a *bad* late stamp is a drop rather than an exception.
 - **SC-005**: For valid input, the guarded path's record equals `UsageRecord(**fields)`.
 - **SC-006**: The full suite passes via the authoritative command in `/workspace/.mado/project.yaml`
   (`/workspace/repo/.venv/bin/pytest`, `CI=true`, pass codes `0` and `5`), with the pre-existing

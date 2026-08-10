@@ -125,16 +125,35 @@ than leaning on that (spec edge case: return-value ambiguity).
 `emit_usage` returns `None` for *either* a construction drop or an emission failure. A caller that
 needs to tell them apart uses the two halves; the log lines already distinguish them (FR-007).
 
-### The parameter-collision hole (FR-019)
+### What happens before the guard runs (FR-019, FR-020)
 
-`emit_usage`'s `sink` is positional-only (`def emit_usage(sink, /, **fields)`). Recorded because the
-obvious signature is subtly wrong in a way no amount of `try` can fix: argument binding happens
-*before* the function body, so a producer whose field mapping carries the key `"sink"` gets
-`TypeError: got multiple values for argument 'sink'` raised outside every guard. That was the last
-route by which a producer's own data could reach the metered request. Positional-only takes the name
-out of the keyword namespace, and `sink` becomes an ordinary unknown field — dropped and logged like
-any other. `build_record` and `emit_record` need no equivalent: neither mixes `**kwargs` with a named
-parameter a producer could collide with.
+The subtlest class of bug in this story is not inside the `try` — it is everything Python does
+*before* entering the function, where no `try` can reach. Two instances, found one review apart, and
+worth stating as one idea so a future change does not reintroduce a third:
+
+1. **Parameter collision (FR-019).** A `**fields` mapping carrying the key `"sink"` collides with
+   the parameter of the same name and raises `TypeError: got multiple values for argument 'sink'`
+   during argument binding. Fixed by making every named parameter positional-only — `sink` and
+   `fields` on `emit_usage`, `fields` on `build_record` — which takes those names out of the keyword
+   namespace so each becomes an ordinary unknown field, dropped and logged like any other.
+2. **Non-string keys (FR-020).** `**` unpacking happens in the *caller's* frame, so
+   `emit_usage(sink, **mapping)` raises `TypeError: keywords must be strings` before any tokenweir
+   code runs, if the mapping came from JSON, a header dict, or generic code. No signature change can
+   guard a splat at the call site. Fixed by accepting the **mapping itself** as a positional
+   argument, so the unpacking happens inside the guard.
+
+FR-020 is also what makes late stamping safe (see below), so the two problems have one answer:
+`build_record(fields, **overrides)` and `emit_usage(sink, fields, **overrides)` take a mapping,
+keyword fields, or both — mapping first, keyword overrides applied on top.
+
+### Stamping without a second unguarded call
+
+US4's motivating caller — the gateway, which knows `latency_ms` only once the metered call returns —
+must not be told to reach for `dataclasses.replace`. `replace` re-runs `__post_init__`, so it is a
+validating call, and on a request path that is precisely the unguarded raise site this story exists
+to remove. The `overrides` parameter is the answer: build **once**, after the call, with the stamp
+merged in — `emit_usage(sink, base_fields, latency_ms=elapsed_ms)` — so there is one validating call
+and it is inside the guard. `replace` remains correct off the request path and is unchanged.
 
 ### Refusing a non-record (FR-018)
 

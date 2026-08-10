@@ -125,6 +125,8 @@ MALFORMED_CASES = [
     # the metered request.
     ("field_named_sink", dict(sink="oops")),  # TypeError
     ("field_named_self", dict(self="oops")),  # TypeError
+    ("field_named_fields", dict(fields="oops")),  # TypeError
+    ("field_named_overrides", dict(overrides="oops")),  # TypeError
 ]
 
 MALFORMED_IDS = [name for name, _ in MALFORMED_CASES]
@@ -214,13 +216,93 @@ def test_a_field_named_sink_cannot_collide_with_the_parameter():
     assert sink.records == []
 
 
-def test_the_fused_call_takes_its_sink_positionally_only():
-    # The mechanism behind the test above, pinned directly: passing the sink by
-    # keyword must not be a supported call shape, or the collision returns.
+@pytest.mark.parametrize(
+    ("function", "name"),
+    [(emit_usage, "sink"), (emit_usage, "fields"), (build_record, "fields")],
+    ids=["emit_usage.sink", "emit_usage.fields", "build_record.fields"],
+)
+def test_every_named_parameter_is_positional_only(function, name):
+    # The mechanism behind the tests above, pinned directly. Argument binding runs
+    # before the function body, so any parameter reachable by keyword is a name a
+    # producer's field can collide with on a path no guard covers.
     import inspect
 
-    parameters = inspect.signature(emit_usage).parameters
-    assert parameters["sink"].kind is inspect.Parameter.POSITIONAL_ONLY
+    parameter = inspect.signature(function).parameters[name]
+    assert parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+
+
+# --- Fields supplied as a mapping (the non-string-key hole) -------------------
+
+
+def test_a_mapping_with_a_non_string_key_is_dropped_not_raised():
+    # `**` unpacking happens in the CALLER's frame, so emit_usage(sink, **mapping)
+    # raises "keywords must be strings" before the guard is even entered. A
+    # mapping from JSON, a header dict, or generic code can carry one. Passed as a
+    # mapping the unpacking happens inside the guard, and it becomes a drop.
+    sink = RecordingSink()
+    hostile = {1: "not a string key", **_fields()}
+    assert emit_usage(sink, hostile) is None
+    assert sink.records == []
+
+
+def test_a_mapping_with_a_non_string_key_still_raises_when_splatted():
+    # Pins the reason the mapping form exists: the splatted form cannot be
+    # guarded, because the failure happens before any tokenweir code runs.
+    hostile = {1: "not a string key", **_fields()}
+    with pytest.raises(TypeError):
+        emit_usage(RecordingSink(), **hostile)
+
+
+@pytest.mark.parametrize(
+    "not_a_mapping",
+    [42, "req-1", object(), [("app_id", "mado")]],
+    ids=["int", "str", "object", "list_of_pairs"],
+)
+def test_a_fields_argument_that_is_not_a_mapping_is_dropped(not_a_mapping):
+    sink = RecordingSink()
+    assert emit_usage(sink, not_a_mapping) is None
+    assert sink.records == []
+
+
+def test_a_mapping_and_keywords_produce_the_same_record_as_either_alone():
+    assert build_record(_fields()) == UsageRecord(**_fields())
+    assert build_record(**_fields()) == UsageRecord(**_fields())
+    assert build_record(dict(VALID_FIELDS), **{}) == UsageRecord(**_fields())
+
+
+def test_keyword_overrides_win_over_the_mapping():
+    record = build_record(_fields(), status="error", latency_ms=7)
+    assert record is not None
+    assert record.status == "error"
+    assert record.latency_ms == 7
+    assert record.request_id == VALID_FIELDS["request_id"]
+
+
+def test_a_late_stamp_needs_no_unguarded_revalidation():
+    # The gateway's actual shape: latency_ms is only known once the metered call
+    # returns. Building once with the stamp merged keeps the validating call
+    # inside the guard — unlike dataclasses.replace, which re-runs __post_init__
+    # and raises, and so must not be the documented request-path pattern.
+    sink = RecordingSink()
+    base = _fields()
+
+    assert emit_usage(sink, base, latency_ms=1234, ts="2026-08-10T12:00:00Z") is not None
+    assert sink.records[0].latency_ms == 1234
+
+    # ... and a bad stamp is a drop, not an exception into the request.
+    assert emit_usage(sink, base, latency_ms=-5) is None
+    assert len(sink.records) == 1
+
+
+def test_dataclasses_replace_still_revalidates_and_raises():
+    # Why the README steers the request path away from `replace`: it re-runs
+    # validation, so on a metered path it is an unguarded raise site. Off that
+    # path it remains the right tool, which is why it is not changed.
+    import dataclasses
+
+    record = UsageRecord(**_fields())
+    with pytest.raises(ValueError):
+        dataclasses.replace(record, latency_ms=-5)
 
 
 # --- US2: a misbehaving sink cannot fail the request either -------------------
@@ -395,6 +477,11 @@ def test_the_library_pins_no_level_and_keeps_propagating(name):
     # Handler policy belongs to the application. A library that calls
     # basicConfig or pins a level takes that decision away from whoever embeds it,
     # and breaking propagation would hide drops from the application's own config.
+    #
+    # A tripwire, not evidence: these assertions also hold for a logger nobody has
+    # ever touched, so this test would pass with the feature deleted. The
+    # load-bearing evidence for FR-008 is the NullHandler test below and the two
+    # subprocess tests after it.
     logger = logging.getLogger(name)
     assert logger.level == logging.NOTSET
     assert logger.propagate is True
@@ -496,9 +583,11 @@ def test_emit_usage_delegates_to_the_two_halves(monkeypatch):
     # duplication — a parallel inline reimplementation would pass them all.
     calls = []
 
-    def fake_build(**fields):
-        calls.append(("build", fields))
-        return UsageRecord(**fields)
+    def fake_build(fields=None, /, **overrides):
+        merged = dict(fields or {})
+        merged.update(overrides)
+        calls.append(("build", merged))
+        return UsageRecord(**merged)
 
     def fake_emit(sink, record):
         calls.append(("emit", record))
@@ -515,7 +604,9 @@ def test_emit_usage_delegates_to_the_two_halves(monkeypatch):
 
 
 def test_emit_usage_does_not_emit_when_the_build_half_drops(monkeypatch):
-    monkeypatch.setattr(tokenweir.sink, "build_record", lambda **fields: None)
+    monkeypatch.setattr(
+        tokenweir.sink, "build_record", lambda fields=None, /, **overrides: None
+    )
     monkeypatch.setattr(
         tokenweir.sink,
         "emit_record",

@@ -53,6 +53,7 @@ logging configuration.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from tokenweir.contract import UsageRecord
@@ -125,12 +126,32 @@ def _warn_dropped(message: str, *, exc_info: bool = True) -> None:
         pass
 
 
-def build_record(**fields: Any) -> Optional[UsageRecord]:
+def build_record(
+    fields: Optional[Mapping[str, Any]] = None, /, **overrides: Any
+) -> Optional[UsageRecord]:
     """Construct a :class:`~tokenweir.contract.UsageRecord`, or ``None`` if invalid.
 
     The guarded counterpart to calling ``UsageRecord(**fields)`` directly. Use it
     where a raised exception would reach a request being metered; off that path,
     construct directly and let a producer bug be loud.
+
+    Fields may be given as keywords, as a mapping, or as both — a mapping with
+    keyword ``overrides`` applied on top, which is how a caller stamps a value it
+    only learns after the metered call returns::
+
+        build_record(base_fields, latency_ms=elapsed_ms, ts=stamp)
+
+    Accepting the mapping *itself* rather than only ``**fields`` is not a
+    convenience. ``**`` unpacking happens in the **caller's** frame, before this
+    function is entered, so ``build_record(**mapping)`` raises
+    ``TypeError: keywords must be strings`` into the metered request if the
+    mapping came from JSON, a header dict, or any generic code that could put a
+    non-string key in it. Passed as a mapping, that unpacking happens inside the
+    guard and becomes an ordinary drop.
+
+    ``fields`` is positional-only for the reason given on :func:`emit_usage`: a
+    producer whose record has a field named ``fields`` must not collide with this
+    parameter during argument binding, where no guard can reach.
 
     Both of the contract's error types are absorbed — ``ValueError`` for an
     invalid value and ``TypeError`` for a missing or unknown keyword argument.
@@ -145,7 +166,9 @@ def build_record(**fields: Any) -> Optional[UsageRecord]:
         frozen dataclass and never falsy, but callers should test ``is None``).
     """
     try:
-        return UsageRecord(**fields)
+        merged = dict(fields) if fields is not None else {}
+        merged.update(overrides)
+        return UsageRecord(**merged)
     except Exception:
         _warn_dropped(_CONSTRUCTION_FAILED)
         return None
@@ -190,29 +213,34 @@ def emit_record(sink: Sink, record: object) -> bool:
     return True
 
 
-def emit_usage(sink: Sink, /, **fields: Any) -> Optional[UsageRecord]:
-    """Build a record from ``fields`` and emit it to ``sink``.
+def emit_usage(
+    sink: Sink, fields: Optional[Mapping[str, Any]] = None, /, **overrides: Any
+) -> Optional[UsageRecord]:
+    """Build a record from the given fields and emit it to ``sink``.
 
     Never raises, except for ``BaseException`` from the record's own construction
     or from the sink — see :func:`build_record`.
 
     The one call a metered request path makes. It is exactly
     :func:`build_record` followed by :func:`emit_record`, so there is one
-    implementation of each guarantee rather than two — a caller that must stamp
-    or enrich a record between the two steps (the gateway computes ``latency_ms``
-    after the metered call returns; a batching emitter builds now and emits later)
-    should use the halves directly and gets the same guarantee.
+    implementation of each guarantee rather than two — a caller that must hold a
+    record between the two steps (a batching emitter builds now and emits later)
+    uses the halves directly and gets the same guarantee. A caller that only needs
+    to *stamp* a value it learns late does not need the halves at all::
 
-    ``**fields`` rather than a ready-made record is the point: construction has to
-    happen *inside* the guard, or the caller is back to holding the exception.
+        emit_usage(sink, base_fields, latency_ms=elapsed_ms, ts=stamp)
 
-    ``sink`` is positional-only for the same reason. A ``**fields`` mapping that
-    happened to carry the key ``"sink"`` would otherwise collide with this
-    parameter and raise ``TypeError`` during argument binding — *before* any guard
-    runs — which is the one way a producer's data could still reach the metered
-    request. Positional-only removes the parameter name from the keyword
-    namespace, so ``sink`` becomes an ordinary unknown field: dropped and logged
-    like any other.
+    Field values may be given as keywords, as a mapping, or as both; see
+    :func:`build_record` for why passing the mapping itself matters.
+
+    Both ``sink`` and ``fields`` are positional-only, and that is load-bearing
+    rather than stylistic. Argument binding happens *before* the function body, so
+    a ``**overrides`` mapping carrying the key ``"sink"`` or ``"fields"`` would
+    otherwise collide with a parameter and raise ``TypeError`` outside every
+    guard — a route by which a producer's own data reaches the metered request
+    that no ``try`` inside this function could close. Positional-only takes those
+    names out of the keyword namespace, so each becomes an ordinary unknown field:
+    dropped and logged like any other.
 
     Returns:
         The record if it was built and emitted, otherwise ``None``. ``None`` means
@@ -220,7 +248,7 @@ def emit_usage(sink: Sink, /, **fields: Any) -> Optional[UsageRecord]:
         distinguishable in the logs, and a caller that needs to tell them apart in
         code should use the two halves.
     """
-    record = build_record(**fields)
+    record = build_record(fields, **overrides)
     if record is None:
         return None
     if not emit_record(sink, record):

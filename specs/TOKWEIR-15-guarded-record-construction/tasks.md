@@ -190,6 +190,40 @@ operational concern for the consumers, and is carried to TOKWEIR-6/-10 rather th
 
 ---
 
+## Phase 11: Fix round 3 (findings from review 3)
+
+Both Med findings were instances of the same idea — **a raise site outside the guard** — so they get
+one answer: the guarded calls accept the field *mapping*, with keyword `overrides` on top.
+
+- [x] **T046** *(Med-1)* `build_record` and `emit_usage` accept the field mapping positionally.
+      `emit_usage(sink, **mapping)` unpacks in the *caller's* frame, so a mapping from JSON or
+      generic code carrying a non-string key raised `TypeError: keywords must be strings` before any
+      library code ran — a raise site no signature could guard at the splat (FR-020, SC-011).
+- [x] **T047** *(Med-1)* Make `fields` positional-only too, and generalize FR-019 from "the fused
+      call's `sink`" to every named parameter of a guarded call. Add `field_named_fields` and
+      `field_named_overrides` to the matrix and a parametrized signature test (SC-012).
+- [x] **T048** *(Med-2)* Replace the README's `dataclasses.replace` stamping example. `replace`
+      re-runs `__post_init__`, so the documented request-path pattern contained an unguarded
+      validating call — the exact defect the story exists to remove. Build once with the stamp
+      merged instead. Add FR-021, two US4 scenarios, and tests for both the good and the bad late
+      stamp (SC-013).
+- [x] **T049** *(Med-2)* Fix US4's Independent Test, which said "mutate nothing" and so dodged the
+      one scenario that would have caught this.
+- [x] **T050** *(Low-1)* Document the positional-only parameters in the README.
+- [x] **T051** *(Low-3)* Comment `test_the_library_pins_no_level_and_keeps_propagating` as a
+      tripwire rather than evidence, naming the tests that actually carry FR-008.
+- [x] **T052** Correct the "last route by which a producer's data could reach the metered request"
+      claim in `sink.py` and `plan.md` — it was false when written, since the non-string-key hole
+      was still open.
+- [x] **T053** Record in spec.md that the story text was fetched with `getJiraIssue` and is quoted
+      verbatim, so the acceptance-clause table's left column is verifiable.
+- [x] **T054** Re-run the authoritative suite and `ruff check .`.
+
+**Not fixed:** Low-2 (per-drop tracebacks on a hot path) — FR-006 requires `exc_info`, so this is
+compliant by design; carried to TOKWEIR-6/-10 as an operational note, unchanged from round 1.
+
+---
+
 ## Dependencies
 
 - Phase 2 (T002–T007) blocks Phases 3–7.
