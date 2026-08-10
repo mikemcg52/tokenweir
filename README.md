@@ -172,6 +172,15 @@ generic code and picked up a non-string key raises `TypeError: keywords must be
 strings` into the request you were metering. `emit_usage(sink, mapping)` unpacks
 inside the guard, where it is an ordinary drop.
 
+**The mapping must contain only record fields.** These calls construct a
+`UsageRecord`, so an unrecognized key is a drop — every time, not occasionally.
+That is the opposite of `UsageRecord.from_dict`, which ignores unknown fields on
+purpose so a record from a newer producer still reads. The distinction matters
+most for a payload you did not build yourself: if a wire payload gains a field,
+handing it straight to `emit_usage` meters *nothing at all*, and with no logging
+configured the return value is the only thing that says so. Use `from_dict` to
+read a wire payload; use these calls with a mapping of fields you assembled.
+
 The two halves are exposed for a caller that must hold a record between the
 steps — a batching emitter builds now and emits later:
 
@@ -193,10 +202,12 @@ if record is not None:
 `emit_usage` is exactly `build_record` followed by `emit_record`, so there is one
 implementation of each guarantee rather than two.
 
-`sink` and `fields` are **positional-only** — pass them positionally, as above.
-Any parameter reachable by keyword is a name a producer's own field could collide
-with during argument binding, which happens before the function body and so
-outside every guard.
+Every named parameter of these calls is **positional-only** — pass them
+positionally, as above. Any parameter reachable by keyword is a name a producer's
+own field could collide with during argument binding, which happens before the
+function body and so outside every guard. The cost is that `emit_usage(sink=…)`
+raises `TypeError` at binding rather than being a supported call shape; it fails
+on the first call, so it cannot survive to production.
 
 Note that `dataclasses.replace` **re-runs validation and raises**, so it is the
 wrong way to stamp a record on a metered path — build once with the stamp merged,
@@ -234,7 +245,9 @@ swallowed Ctrl-C would be a worse bug than the one it fixes.
 
 > **Adoption is in progress.** `tokenweir` ships the seam; the AI Gateway
 > (TOKWEIR-10) and the emitter client (TOKWEIR-6) are being moved onto it. Until
-> then, a consumer constructing records inline should call `emit_usage` itself.
+> then, a consumer constructing records inline should call `emit_usage` itself —
+> and should watch the return value, since a producer that gets a field name
+> wrong drops *every* record, not some of them.
 
 ## Develop
 

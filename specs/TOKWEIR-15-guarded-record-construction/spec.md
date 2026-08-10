@@ -245,7 +245,14 @@ without any validating call outside a guard.
   unpacking happens in the caller's frame, so a mapping from JSON, a header dict, or generic code
   that carries a non-string key raises `TypeError: keywords must be strings` before any library code
   runs — a raise site no signature can guard at the splat. Keyword `overrides` MUST compose with the
-  mapping (mapping first, overrides on top).
+  mapping (mapping first, overrides on top). A `fields` argument that is not a `Mapping` MUST be a
+  drop: `dict()` duck-types any iterable of pairs, which would make the annotation a lie and
+  silently consume a generator.
+- **FR-022**: `README.md` MUST warn that these calls construct a record, so an unrecognized key is a
+  drop — the opposite of `UsageRecord.from_dict`, which ignores unknown fields by design. A wire
+  payload handed straight to a guarded call therefore meters *nothing at all* if it has gained a
+  field, and under FR-008 an application with no logging configured sees only the return value. This
+  is the most likely real-world failure of the feature and must not be left for a reader to discover.
 - **FR-021**: Stamping a value learned after the metered call (`latency_ms`, `ts`) MUST NOT require a
   second validating call on the request path. `dataclasses.replace` re-runs validation and raises, so
   it MUST NOT be the documented request-path pattern; building once with the stamp merged (FR-020)
@@ -291,10 +298,13 @@ without any validating call outside a guard.
   writes nothing to stdout or stderr, and still observes the drop via the return value.
 - **SC-010**: `emit_record` handed a non-`UsageRecord` returns `False` and the sink receives
   nothing.
-- **SC-011**: A field mapping containing a non-string key, or that is not a mapping at all, is a
+- **SC-011**: A field mapping containing a non-string key, or that is not a `Mapping` at all, is a
   drop when passed as a mapping — and the splatted form is shown to raise, so the reason the mapping
-  form exists is pinned rather than asserted.
-- **SC-012**: Every named parameter of `build_record` and `emit_usage` is positional-only.
+  form exists is pinned rather than asserted. The non-mapping cases include a **complete** list of
+  pairs and a generator, which `dict()` would consume happily, so the case cannot pass merely for
+  being incomplete.
+- **SC-012**: Every named parameter of `build_record`, `emit_record` and `emit_usage` is
+  positional-only.
 - **SC-013**: A late stamp (`latency_ms` learned after the metered call) is emitted through one
   guarded construction, and a *bad* late stamp is a drop rather than an exception.
 - **SC-005**: For valid input, the guarded path's record equals `UsageRecord(**fields)`.

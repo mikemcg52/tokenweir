@@ -218,8 +218,20 @@ def test_a_field_named_sink_cannot_collide_with_the_parameter():
 
 @pytest.mark.parametrize(
     ("function", "name"),
-    [(emit_usage, "sink"), (emit_usage, "fields"), (build_record, "fields")],
-    ids=["emit_usage.sink", "emit_usage.fields", "build_record.fields"],
+    [
+        (emit_usage, "sink"),
+        (emit_usage, "fields"),
+        (build_record, "fields"),
+        (emit_record, "sink"),
+        (emit_record, "record"),
+    ],
+    ids=[
+        "emit_usage.sink",
+        "emit_usage.fields",
+        "build_record.fields",
+        "emit_record.sink",
+        "emit_record.record",
+    ],
 )
 def test_every_named_parameter_is_positional_only(function, name):
     # The mechanism behind the tests above, pinned directly. Argument binding runs
@@ -255,13 +267,30 @@ def test_a_mapping_with_a_non_string_key_still_raises_when_splatted():
 
 @pytest.mark.parametrize(
     "not_a_mapping",
-    [42, "req-1", object(), [("app_id", "mado")]],
-    ids=["int", "str", "object", "list_of_pairs"],
+    [
+        42,
+        "req-1",
+        object(),
+        # A *complete* pair-list: `dict()` would happily consume it, so this case
+        # is only a drop if the mapping type is genuinely enforced. The earlier
+        # incomplete version of this case passed for the wrong reason — it was
+        # missing required fields — and would have gone on passing with the type
+        # check removed.
+        list(VALID_FIELDS.items()),
+        iter(VALID_FIELDS.items()),
+    ],
+    ids=["int", "str", "object", "complete_pair_list", "generator"],
 )
 def test_a_fields_argument_that_is_not_a_mapping_is_dropped(not_a_mapping):
     sink = RecordingSink()
     assert emit_usage(sink, not_a_mapping) is None
     assert sink.records == []
+
+
+def test_a_non_mapping_fields_argument_says_so_in_the_log(caplog):
+    caplog.set_level(logging.WARNING, logger="tokenweir")
+    assert build_record(list(VALID_FIELDS.items())) is None
+    assert "fields must be a mapping" in caplog.text
 
 
 def test_a_mapping_and_keywords_produce_the_same_record_as_either_alone():
@@ -647,18 +676,20 @@ def test_build_then_emit_matches_the_fused_call_when_the_sink_raises():
     assert emit_usage(RaisingSink(), **_fields()) is None
 
 
-def test_a_caller_can_stamp_a_record_between_the_halves():
-    # The shape the gateway actually has: it computes latency_ms only after the
-    # call it is metering returns. If the library did not expose the halves, this
-    # caller would hand-roll try/except — the duplication this story prevents.
-    import dataclasses
-
+def test_a_caller_can_hold_a_record_between_the_halves():
+    # The batching shape: build now, emit later. This is what the halves are for
+    # — a caller holding a record across a boundary, not one *mutating* it. The
+    # stamping case is `build_record(base, latency_ms=...)`, covered above;
+    # `dataclasses.replace` re-validates and so must never model the request path
+    # (FR-021).
     sink = RecordingSink()
-    record = build_record(**_fields())
-    stamped = dataclasses.replace(record, latency_ms=1234, ts="2026-08-10T12:00:00Z")
 
-    assert emit_record(sink, stamped) is True
-    assert sink.records == [stamped]
+    pending = [build_record(_fields(request_id=f"req-{n}")) for n in range(3)]
+    assert all(record is not None for record in pending)
+
+    for record in pending:
+        assert emit_record(sink, record) is True
+    assert sink.records == pending
 
 
 # --- Contract non-regression --------------------------------------------------

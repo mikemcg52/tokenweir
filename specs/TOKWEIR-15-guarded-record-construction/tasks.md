@@ -224,6 +224,32 @@ compliant by design; carried to TOKWEIR-6/-10 as an operational note, unchanged 
 
 ---
 
+## Phase 12: Fix round 4 (findings from review 4)
+
+- [x] **T055** *(Med-1)* Make `emit_record`'s parameters positional-only too, and extend the
+      signature parametrization to all five. FR-019 was generalized to "every named parameter of a
+      guarded call" in round 3 but only applied to two of the three functions (FR-019, SC-012).
+- [x] **T056** *(Med-2)* Reject a non-`Mapping` `fields` inside the guard. `dict()` duck-types any
+      iterable of pairs, so the `Mapping` annotation was unenforced and a generator would have been
+      silently consumed. The `list_of_pairs` test case passed only because it was *incomplete* —
+      replaced with a complete pair-list and a generator, either of which `dict()` would accept
+      (FR-020, SC-011).
+- [x] **T057** *(Med-3)* Warn in the README that an unrecognized key is a drop — every time — which
+      is the opposite of `UsageRecord.from_dict`'s deliberate forward-tolerance. A wire payload that
+      has gained a field meters *nothing at all*, and under the `NullHandler` default only the
+      return value says so. Most likely real-world failure of the feature; now documented, and the
+      adoption note tells consumers to watch the return value (FR-022).
+- [x] **T058** *(Low-1)* Rewrite the test that modelled the request path with `dataclasses.replace`
+      — the pattern FR-021 removed from the README — as the batching (build-now-emit-later) case it
+      should always have been.
+- [x] **T059** *(Low-2)* Name the positional-only failure mode in the README rather than only the
+      rule.
+- [x] **T060** *(Low-3)* Amend `sink.py`'s module docstring to FR-006's "where one was caught"; the
+      `_warn_dropped` docstring had been corrected in round 2 but the module docstring had not.
+- [x] **T061** Re-run the authoritative suite and `ruff check .`.
+
+---
+
 ## Dependencies
 
 - Phase 2 (T002–T007) blocks Phases 3–7.

@@ -133,9 +133,11 @@ worth stating as one idea so a future change does not reintroduce a third:
 
 1. **Parameter collision (FR-019).** A `**fields` mapping carrying the key `"sink"` collides with
    the parameter of the same name and raises `TypeError: got multiple values for argument 'sink'`
-   during argument binding. Fixed by making every named parameter positional-only — `sink` and
-   `fields` on `emit_usage`, `fields` on `build_record` — which takes those names out of the keyword
-   namespace so each becomes an ordinary unknown field, dropped and logged like any other.
+   during argument binding. Fixed by making every named parameter of every guarded call
+   positional-only, which takes those names out of the keyword namespace so each becomes an ordinary
+   unknown field, dropped and logged like any other. `emit_record` takes no `**overrides` and so
+   cannot be collided with today; it is positional-only anyway, because one rule for the whole seam
+   is what stops the next parameter added to it from quietly reopening the hole.
 2. **Non-string keys (FR-020).** `**` unpacking happens in the *caller's* frame, so
    `emit_usage(sink, **mapping)` raises `TypeError: keywords must be strings` before any tokenweir
    code runs, if the mapping came from JSON, a header dict, or generic code. No signature change can

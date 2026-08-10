@@ -37,9 +37,11 @@ Two things this does **not** do:
   a *non-conforming* adapter is the request on the critical path, and that
   request should not depend on every adapter in the ecosystem being correct.
 
-Drops are never silent: each one logs a ``WARNING`` on this module's logger
-carrying the original exception, and the return value distinguishes a drop from a
-success so a caller can count drops without parsing logs. A guard that hid
+Drops are never silent: each one logs a ``WARNING`` on this module's logger,
+carrying the original exception where one was caught (refusing a non-record is a
+rejection rather than a caught failure, so it has none), and the return value
+distinguishes a drop from a success so a caller can count drops without parsing
+logs. A guard that hid
 producer bugs would undo TOKWEIR-4's decision rather than protect it.
 
 Where that signal *goes* is the application's decision, not this library's: the
@@ -166,6 +168,14 @@ def build_record(
         frozen dataclass and never falsy, but callers should test ``is None``).
     """
     try:
+        if fields is not None and not isinstance(fields, Mapping):
+            # `dict()` duck-types any iterable of pairs, which would quietly make
+            # the annotation a lie and silently consume a generator. A mapping is
+            # what the signature promises, so anything else is a producer bug and
+            # takes the ordinary drop path.
+            raise TypeError(
+                f"fields must be a mapping; got {type(fields).__name__}"
+            )
         merged = dict(fields) if fields is not None else {}
         merged.update(overrides)
         return UsageRecord(**merged)
@@ -174,8 +184,13 @@ def build_record(
         return None
 
 
-def emit_record(sink: Sink, record: object) -> bool:
+def emit_record(sink: Sink, record: object, /) -> bool:
     """Emit ``record`` to ``sink``; return ``False`` if it was refused or the sink raised.
+
+    Both parameters are positional-only, as on the other guarded calls (FR-019).
+    No producer data can bind to them here — this function takes no ``**overrides``
+    — but keeping one rule for the whole seam is what stops the next parameter
+    added to it from quietly reopening the collision hole.
 
     ``record`` is annotated ``object`` rather than ``UsageRecord`` deliberately.
     FR-018 exists so that ``emit_record(sink, build_record(**fields))`` is safe
