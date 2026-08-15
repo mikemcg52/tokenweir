@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikemcg52/tokenweir/main/schema/usage-record.v1.json",
+  "title": "tokenweir usage record",
+  "description": "One metered unit of work (one model call / iteration). Raw token counts are stored; cost is derived at report time. Provider-neutral: 'model' is an opaque identifier. This document describes contract version 1; unknown properties are permitted so that a record written by a newer producer still reads on an older consumer.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "The contract version this record obeys. Pinned: this document validates version 1 records only, and a later version ships its own schema file."
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\t\\n\\v\\f\\r\\u001c-\\u001f \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+    },
+    "app_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\t\\n\\v\\f\\r\\u001c-\\u001f \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+    },
+    "endpoint": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\t\\n\\v\\f\\r\\u001c-\\u001f \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\t\\n\\v\\f\\r\\u001c-\\u001f \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+      "description": "Opaque, provider-neutral model identifier, stored verbatim."
+    },
+    "status": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\t\\n\\v\\f\\r\\u001c-\\u001f \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+    },
+    "workload": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "queue": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "input_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "output_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "cache_creation_input_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "cache_read_input_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "latency_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "pricing_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "api_metered",
+        "subscription",
+        null
+      ],
+      "description": "'api_metered' is costable against a rate card; 'subscription' is flat-rate, where no per-call cost exists."
+    },
+    "ts": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "ISO-8601 UTC timestamp, stamped by the producer."
+    }
+  },
+  "required": [
+    "schema_version",
+    "request_id",
+    "app_id",
+    "endpoint",
+    "model",
+    "status"
+  ],
+  "additionalProperties": true
+}

@@ -17,7 +17,9 @@ dependencies = []
 [project.optional-dependencies]
 # Transport adapters ship as optional extras so the core never compiles in pika.
 amqp = ["pika>=1.3"]
-dev = ["pytest>=8", "ruff>=0.6"]
+# `jsonschema` is test-only: it validates payloads against the published schema.
+# It must never become a runtime dependency — the core stays dependency-light.
+dev = ["pytest>=8", "ruff>=0.6", "jsonschema>=4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
