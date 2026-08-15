@@ -17,13 +17,36 @@ dependencies = []
 [project.optional-dependencies]
 # Transport adapters ship as optional extras so the core never compiles in pika.
 amqp = ["pika>=1.3"]
+# Likewise the store: `tokenweir.postgres` and `tokenweir.migrations` import no
+# driver at module level, so the core installs and imports without this.
+postgres = ["psycopg[binary]>=3"]
 # `jsonschema` is test-only: it validates payloads against the published schema.
 # It must never become a runtime dependency — the core stays dependency-light.
-dev = ["pytest>=8", "ruff>=0.6", "jsonschema>=4"]
+# `psycopg` is here so a developer with a Postgres can run the real-store tests;
+# without it (and without TOKENWEIR_TEST_DSN) those tests skip.
+# `pglast` wraps libpg_query, the server's own parser, so the migrations can be
+# syntax-checked with no server running. Test-only and skipped when absent — a
+# compiled parser is too heavy to require of someone who only imports the
+# contract, and it never becomes a runtime dependency.
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "jsonschema>=4",
+    "psycopg[binary]>=3",
+    "pglast>=6",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["tokenweir*"]
+
+# The migrations are package data, not repository artifacts: tokenweir owns the
+# schema (ADR-0001 Pillar 5) and has to be able to *apply* it from a wheel
+# install. This is deliberately the opposite treatment from
+# `schema/usage-record.v1.json`, which a consumer reads for itself and which the
+# README documents as repo-only.
+[tool.setuptools.package-data]
+"tokenweir.migrations" = ["sql/*.sql"]
 
 [tool.ruff]
 line-length = 100
