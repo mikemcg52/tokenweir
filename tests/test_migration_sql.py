@@ -281,16 +281,63 @@ def _declared_columns(create_table_sql: str, table: str) -> set[str]:
     return columns
 
 
+def _gateway_usage_columns(code_by_filename):
+    """`gateway_usage`'s column set as of the last shipped migration.
+
+    Walks **every** migration in version order rather than naming 001 and 002.
+    That distinction is the whole point: the two assertions below — no stored cost
+    (FR-028) and no drift from the contract — are designated by FR-034 as guards
+    that hold with no database present, and a guard that reads a hardcoded pair of
+    files silently stops guarding the day someone adds `007_add_est_cost.sql`.
+
+    `DROP COLUMN` is not handled, and deliberately: a destructive migration cannot
+    ship without `allow_destructive`, so a column that appears here can only leave
+    by a route this project already refuses by default.
+    """
+    columns: set[str] = set()
+    for filename in sorted(code_by_filename):
+        sql = code_by_filename[filename]
+        # `\b` keeps `gateway_usage_daily` out of this: the character after the
+        # table name there is `_`, which is a word character, so it does not match.
+        if re.search(
+            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?gateway_usage\b",
+            sql,
+            re.IGNORECASE,
+        ):
+            columns |= _declared_columns(sql, "gateway_usage")
+        for match in re.finditer(
+            r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?gateway_usage\s+"
+            r"ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)",
+            sql,
+            re.IGNORECASE,
+        ):
+            columns.add(match.group(1))
+    assert columns, "no shipped migration creates gateway_usage"
+    return columns
+
+
 @pytest.fixture(scope="module")
 def gateway_usage_columns(code_by_filename):
-    columns = _declared_columns(code_by_filename["001_gateway_usage.sql"], "gateway_usage")
-    for match in re.finditer(
-        r"ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)",
-        code_by_filename["002_parent_request_id.sql"],
-        re.IGNORECASE,
-    ):
-        columns.add(match.group(1))
-    return columns
+    return _gateway_usage_columns(code_by_filename)
+
+
+def test_the_column_scan_reaches_migrations_beyond_the_ones_shipped_today(
+    code_by_filename,
+):
+    """Anti-vacuity guard for the two assertions that follow.
+
+    If the column set were still read off 001 and 002 by name, a later migration
+    adding a cost column to `gateway_usage` would leave both of them green while
+    FR-028 and the contract-drift invariant were broken. This pins that the scan
+    follows the migration set rather than a hardcoded pair of filenames.
+    """
+    hypothetical = dict(code_by_filename)
+    hypothetical["007_add_est_cost.sql"] = (
+        "ALTER TABLE gateway_usage ADD COLUMN IF NOT EXISTS est_cost_usd NUMERIC;"
+    )
+
+    assert "est_cost_usd" in _gateway_usage_columns(hypothetical)
+    assert "est_cost_usd" not in _gateway_usage_columns(code_by_filename)
 
 
 def test_the_usage_table_stores_no_cost(gateway_usage_columns):

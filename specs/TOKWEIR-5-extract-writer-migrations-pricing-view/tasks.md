@@ -95,3 +95,32 @@
       the `dev` extra, skipped when absent (FR-040, SC-025).
 - [x] **T042** `build/` and `dist/` added to `.gitignore` with a `git check-ignore` guard — building a
       wheel to verify T034 left an uncommittable-but-untracked `build/` in the tree (FR-041, SC-024).
+
+## Fix round 1 (review findings)
+
+- [x] **T043** **High** — the advisory lock was acquired *after* `pending()`, so
+      `CREATE TABLE IF NOT EXISTS schema_migrations` ran outside it. `CREATE TABLE IF NOT EXISTS` is
+      not atomic against a concurrent creation, so two migrators against a fresh database collided on
+      the system catalog (reproduced 5/5). Lock now precedes every read or creation of the state
+      table; pinned with no database (statement order) and against a real server (FR-012, SC-006).
+- [x] **T044** **High** — `apply` and `status` both died with `UndefinedColumn` against a
+      `schema_migrations` that predates the `checksum` column, i.e. the AI Gateway's own — the first
+      database TOKWEIR-10 points this at. The runner now adopts such a table: `ADD COLUMN IF NOT
+      EXISTS`, pre-existing rows recorded as applied, their absent checksums reported as unverifiable
+      rather than as drift (FR-042, SC-026).
+- [x] **T045** **Med** — `gateway_usage_columns` read 001 and 002 by name, so a `007` adding a cost
+      column would leave the FR-028 and contract-drift guards green. It now scans every shipped
+      migration, with an anti-vacuity test that proves the scan reaches a hypothetical 007.
+- [x] **T046** **Med** — `reader_role` only takes effect on the run that applies 004/005; configuring
+      one later grants nothing, silently. Documented in README with the one-statement remedy, and in
+      `apply`'s docstring.
+- [x] **T047** **Med** — the spec's "no usable Postgres" premise was false (`pgserver` ships the
+      binaries in its wheel; no root, apt or Docker needed), and it is what let T043 ship. Corrected
+      in `spec.md` and `plan.md`; `pgserver` added to the `dev` extra and `conftest.py` now starts a
+      throwaway server when `TOKENWEIR_TEST_DSN` is unset, still skipping for a core-only install.
+- [x] **T048** **Low** — CLI option-position coverage extended to `--reader-role` and `--verbose` on
+      both sides of the subcommand, plus `--dsn A status --dsn B` (SC-022).
+- [x] **T049** **Low** — the two undocumented pricing rules written down: cache tokens with no cache
+      rate ⇒ unpriced, and NULL `pricing_mode` ⇒ priceable (spec US3, README).
+- [x] **T050** **Low** — the `verify_checksums=False` escape hatch documented in README; `status()`
+      no longer reads `schema_migrations` twice, so both halves of its answer come from one snapshot.

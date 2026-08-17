@@ -216,10 +216,26 @@ def destructive_statements(sql: str) -> tuple[str, ...]:
 
 
 def _ensure_state_table(cursor: Any) -> None:
-    """Create ``schema_migrations`` if it is absent.
+    """Create ``schema_migrations`` if it is absent, and adopt one that predates us.
 
     Not itself a migration: the runner cannot record that it created the table it
     records things in. ``IF NOT EXISTS`` makes it safe on every run.
+
+    **Adoption.** The database this package is pointed at first is, by design, one
+    the AI Gateway already migrated — that is what Pillar 5's ownership move
+    *means*. Its ``schema_migrations`` predates this runner and has no ``checksum``
+    column (FR-038 is ours, not the gateway's), so a bare ``CREATE TABLE IF NOT
+    EXISTS`` would no-op and the very next ``SELECT version, checksum`` would fail
+    with ``UndefinedColumn`` — an error that is neither actionable nor recoverable,
+    and that would break ``status`` exactly when an operator needs it to describe
+    the database. The ``ADD COLUMN IF NOT EXISTS`` statements below make taking
+    over an existing table the ordinary path rather than a wall.
+
+    The adopted columns are **nullable**, because existing rows have no value to
+    give them and inventing one would be a lie about what was applied. A NULL
+    ``checksum`` means "applied before this runner recorded checksums"; :func:`pending`
+    reports those as unverifiable rather than as drift. A table this runner creates
+    itself keeps ``NOT NULL``, since every row it inserts carries both.
     """
     cursor.execute(
         f"""
@@ -231,13 +247,23 @@ def _ensure_state_table(cursor: Any) -> None:
         )
         """
     )
+    for column, definition in (
+        ("name", "TEXT"),
+        ("checksum", "TEXT"),
+        ("applied_at", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
+    ):
+        cursor.execute(
+            f"ALTER TABLE {SCHEMA_MIGRATIONS_TABLE} "
+            f"ADD COLUMN IF NOT EXISTS {column} {definition}"
+        )
 
 
-def applied_versions(connection: Any) -> dict[int, str]:
+def applied_versions(connection: Any) -> dict[int, Optional[str]]:
     """Return ``{version: checksum}`` for everything the database has applied.
 
     Creates ``schema_migrations`` if it does not exist, so a fresh database
-    answers ``{}`` rather than raising.
+    answers ``{}`` rather than raising. A version whose checksum is ``None`` was
+    applied by something that did not record one — see :func:`_ensure_state_table`.
     """
     with connection.cursor() as cursor:
         _ensure_state_table(cursor)
@@ -247,6 +273,52 @@ def applied_versions(connection: Any) -> dict[int, str]:
         rows = cursor.fetchall()
     connection.commit()
     return {int(row[0]): row[1] for row in rows}
+
+
+def _check_applied(
+    applied: dict[int, Optional[str]],
+    by_version: dict[int, Migration],
+    *,
+    verify_checksums: bool,
+) -> None:
+    """Refuse a database this library cannot honestly migrate.
+
+    Shared by :func:`pending` and :func:`status` so the two cannot drift apart on
+    what counts as a database worth refusing.
+    """
+    unknown = sorted(set(applied) - set(by_version))
+    if unknown:
+        raise UnknownAppliedVersionError(
+            f"database has applied migration version(s) {unknown} that this "
+            f"tokenweir does not ship (it ships 1..{max(by_version)}) — the "
+            "database is ahead of the library; upgrade tokenweir rather than "
+            "migrating on top of a schema it cannot describe"
+        )
+
+    if not verify_checksums:
+        return
+
+    adopted = sorted(v for v, checksum in applied.items() if checksum is None)
+    if adopted:
+        _logger.warning(
+            "tokenweir: migration version(s) %s were applied without a recorded "
+            "checksum and cannot be verified against the shipped files; they are "
+            "treated as applied. This is expected the first time tokenweir takes "
+            "over a schema the AI Gateway migrated.",
+            adopted,
+        )
+
+    changed = [
+        by_version[version].filename
+        for version, checksum in sorted(applied.items())
+        if checksum is not None and checksum != by_version[version].checksum
+    ]
+    if changed:
+        raise MigrationChecksumError(
+            "already-applied migration(s) have been edited since they were "
+            f"applied: {', '.join(changed)} — migrations are forward-only, so "
+            "the fix is a new version, not an edit to a released one"
+        )
 
 
 def pending(
@@ -267,29 +339,7 @@ def pending(
     shipped = discover()
     by_version = {m.version: m for m in shipped}
     applied = applied_versions(connection)
-
-    unknown = sorted(set(applied) - set(by_version))
-    if unknown:
-        raise UnknownAppliedVersionError(
-            f"database has applied migration version(s) {unknown} that this "
-            f"tokenweir does not ship (it ships 1..{max(by_version)}) — the "
-            "database is ahead of the library; upgrade tokenweir rather than "
-            "migrating on top of a schema it cannot describe"
-        )
-
-    if verify_checksums:
-        changed = [
-            by_version[version].filename
-            for version, checksum in sorted(applied.items())
-            if checksum != by_version[version].checksum
-        ]
-        if changed:
-            raise MigrationChecksumError(
-                "already-applied migration(s) have been edited since they were "
-                f"applied: {', '.join(changed)} — migrations are forward-only, so "
-                "the fix is a new version, not an edit to a released one"
-            )
-
+    _check_applied(applied, by_version, verify_checksums=verify_checksums)
     return tuple(m for m in shipped if m.version not in applied)
 
 
@@ -321,7 +371,12 @@ def apply(
             library cannot know a deployment's role names — the homelab's
             ``ai_gateway_metrics_reader`` means nothing in a customer tenant — so
             this is configuration. Left unset, the grant migrations no-op with a
-            notice and nothing else changes.
+            notice and nothing else changes. Note that it takes effect only on the
+            run that *applies* migrations 004 and 005: they are the migrations that
+            issue the grants, and a migration already recorded as applied is never
+            re-run. Configuring a reader role against an already-migrated database
+            therefore grants nothing — see README ("Granting a reader role later")
+            for the remedy.
         allow_destructive: permit a migration containing ``DROP``, ``TRUNCATE`` or
             ``DELETE FROM``. Per-call on purpose: the operator's review should be
             visible where the call is, not in a config file somebody set last year.
@@ -339,27 +394,6 @@ def apply(
             ones half-applied.
         UnknownAppliedVersionError, MigrationChecksumError: see :func:`pending`.
     """
-    outstanding = pending(connection, verify_checksums=verify_checksums)
-    if not outstanding:
-        return ()
-
-    if not allow_destructive:
-        offenders = {
-            migration.filename: found
-            for migration in outstanding
-            if (found := destructive_statements(migration.sql))
-        }
-        if offenders:
-            detail = "; ".join(
-                f"{name} ({', '.join(sorted(set(w.upper() for w in words)))})"
-                for name, words in sorted(offenders.items())
-            )
-            raise DestructiveMigrationError(
-                f"refusing to apply destructive migration(s): {detail} — pass "
-                "allow_destructive=True to proceed, and say in the review why "
-                "the data loss is intended"
-            )
-
     if not advisory_lock:
         _logger.warning(
             "tokenweir: applying migrations without an advisory lock; two "
@@ -370,14 +404,46 @@ def apply(
     locked = False
     try:
         if advisory_lock:
+            # The lock is taken before *anything* touches `schema_migrations`,
+            # because creating that table is itself part of the race this lock
+            # exists to settle: Postgres's `CREATE TABLE IF NOT EXISTS` is not
+            # atomic against a concurrent creation, so two migrators meeting a
+            # fresh database both observe "absent" and one of them dies on a
+            # duplicate-key error from the system catalog. Reading pending state
+            # first — which is what this used to do — put the one statement that
+            # must be serialized outside the serialization.
+            #
+            # `pg_advisory_lock` needs no table of its own, so nothing stops it
+            # from going first.
             with connection.cursor() as cursor:
                 _acquire_lock(cursor)
             locked = True
             connection.commit()
 
-            # Another process may have applied everything while we waited for the
-            # lock. Re-reading is the point of taking it.
-            outstanding = pending(connection, verify_checksums=verify_checksums)
+        # Inside the lock: on a fresh database this is the call that creates
+        # `schema_migrations`, and on a contended one it is the re-read that makes
+        # waiting for the lock worthwhile — whoever went first may have applied
+        # everything already.
+        outstanding = pending(connection, verify_checksums=verify_checksums)
+        if not outstanding:
+            return ()
+
+        if not allow_destructive:
+            offenders = {
+                migration.filename: found
+                for migration in outstanding
+                if (found := destructive_statements(migration.sql))
+            }
+            if offenders:
+                detail = "; ".join(
+                    f"{name} ({', '.join(sorted(set(w.upper() for w in words)))})"
+                    for name, words in sorted(offenders.items())
+                )
+                raise DestructiveMigrationError(
+                    f"refusing to apply destructive migration(s): {detail} — pass "
+                    "allow_destructive=True to proceed, and say in the review why "
+                    "the data loss is intended"
+                )
 
         for migration in outstanding:
             try:
@@ -431,12 +497,17 @@ def status(
     ``verify_checksums`` defaults to **False** here and True on :func:`apply`:
     reporting state is exactly when you want to see a database that has drifted,
     rather than be refused a description of it.
+
+    One read of ``schema_migrations``, not two: both halves of the answer come from
+    the same snapshot, so a concurrent migration cannot land between them and make
+    the pair describe a database that never existed.
     """
     shipped = discover()
     by_version = {m.version: m for m in shipped}
     known = applied_versions(connection)
-    outstanding = pending(connection, verify_checksums=verify_checksums)
+    _check_applied(known, by_version, verify_checksums=verify_checksums)
     done = tuple(by_version[v] for v in sorted(known) if v in by_version)
+    outstanding = tuple(m for m in shipped if m.version not in known)
     return done, outstanding
 
 

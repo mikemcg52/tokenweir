@@ -35,6 +35,7 @@ from tokenweir.migrations import (
     apply,
     discover,
     pending,
+    status,
 )
 from tokenweir.postgres import PostgresSource
 
@@ -178,6 +179,87 @@ def test_an_edited_released_migration_is_refused(migrated):
 
     with pytest.raises(MigrationChecksumError, match="001_gateway_usage.sql"):
         pending(migrated)
+
+
+def gateway_shaped_state_table(connection):
+    """Reduce `schema_migrations` to the shape the AI Gateway's runner left it in.
+
+    The gateway recorded a version and a timestamp; `name` and `checksum` are this
+    runner's additions (FR-038). Dropping them here is how a test in a pod with no
+    gateway checkout gets a genuinely pre-existing state table rather than a
+    hand-written approximation of one — the rows above it were applied for real.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("ALTER TABLE schema_migrations DROP COLUMN checksum")
+        cursor.execute("ALTER TABLE schema_migrations DROP COLUMN name")
+    connection.commit()
+
+
+def test_a_state_table_that_predates_the_checksum_column_is_adopted(
+    scratch_schema, monkeypatch
+):
+    """Pillar 5's ownership move points this runner at a database the gateway
+    already migrated. Its `schema_migrations` has no `checksum` column, so
+    `CREATE TABLE IF NOT EXISTS` no-ops and the next read used to die on
+    `UndefinedColumn` — the first thing TOKWEIR-10 would have hit."""
+    connect, _ = scratch_schema
+    connection = connect()
+
+    monkeypatch.setattr("tokenweir.migrations.discover", lambda: SHIPPED[:3])
+    apply(connection)
+    monkeypatch.undo()
+    gateway_shaped_state_table(connection)
+
+    applied = apply(connection)
+
+    assert [m.version for m in applied] == [4, 5, 6]
+    assert set(applied_versions(connection)) == {1, 2, 3, 4, 5, 6}
+
+
+def test_adopted_rows_keep_a_null_checksum_and_are_not_drift(scratch_schema, monkeypatch):
+    """A checksum invented for a row somebody else applied would be a lie about
+    what ran. NULL says "applied before this runner recorded checksums", and
+    `pending` must read that as unverifiable rather than as an edited migration."""
+    connect, _ = scratch_schema
+    connection = connect()
+
+    monkeypatch.setattr("tokenweir.migrations.discover", lambda: SHIPPED[:3])
+    apply(connection)
+    monkeypatch.undo()
+    gateway_shaped_state_table(connection)
+    apply(connection)
+
+    recorded = dict(fetch(connection, "SELECT version, checksum FROM schema_migrations"))
+    assert [version for version, checksum in sorted(recorded.items()) if checksum is None] == [
+        1,
+        2,
+        3,
+    ]
+    assert recorded[4] == SHIPPED[3].checksum
+
+    # And the adopted rows do not make the next run refuse the database.
+    assert pending(connection) == ()
+    assert apply(connection) == ()
+
+
+def test_status_can_still_describe_a_state_table_that_predates_us(
+    scratch_schema, monkeypatch
+):
+    """FR-038's stated intent is that reporting never gets refused. A `status`
+    that cannot describe the one database an operator is most likely to point it
+    at fails that intent in the case it was written for."""
+    connect, _ = scratch_schema
+    connection = connect()
+
+    monkeypatch.setattr("tokenweir.migrations.discover", lambda: SHIPPED[:3])
+    apply(connection)
+    monkeypatch.undo()
+    gateway_shaped_state_table(connection)
+
+    done, outstanding = status(connection)
+
+    assert [m.version for m in done] == [1, 2, 3]
+    assert [m.version for m in outstanding] == [4, 5, 6]
 
 
 def test_the_functional_index_exists_and_is_buildable(migrated):

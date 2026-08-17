@@ -248,6 +248,60 @@ def test_an_edited_released_migration_is_refused():
     assert migration_sql_applied(conn) == []
 
 
+def test_the_state_table_is_brought_up_to_shape_for_a_database_that_predates_us():
+    """`CREATE TABLE IF NOT EXISTS` no-ops against the AI Gateway's own
+    `schema_migrations`, which has no `checksum` column — so the create alone
+    leaves the very next read to fail. The `ADD COLUMN IF NOT EXISTS` statements
+    are what make adopting an existing table the ordinary path.
+
+    Pinned here, with no database, because the pod this suite runs in has none and
+    the adoption path is the one TOKWEIR-10 walks first.
+    """
+    conn = FakeConnection()
+    applied_versions(conn)
+    issued = [" ".join(sql.split()) for sql in statements(conn)]
+
+    for column in ("name", "checksum", "applied_at"):
+        assert any(
+            statement.startswith(
+                f"ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS {column} "
+            )
+            for statement in issued
+        ), f"nothing brings a pre-existing state table up to shape for {column!r}"
+
+    create = next(i for i, s in enumerate(issued) if s.startswith("CREATE TABLE"))
+    alters = [i for i, s in enumerate(issued) if s.startswith("ALTER TABLE")]
+    assert all(i > create for i in alters), "the table must exist before it is altered"
+
+
+def test_a_version_applied_without_a_checksum_is_adopted_not_refused(caplog):
+    """A row the gateway's runner wrote has no checksum to compare against.
+    Treating that absence as a mismatch would refuse every database this package
+    exists to take over; inventing a checksum for it would be worse."""
+    adopted = {version: (name, None) for version, (name, _) in applied_state(SHIPPED[:3]).items()}
+    conn = FakeConnection(applied=adopted)
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.migrations"):
+        applied = apply(conn)
+
+    assert [m.version for m in applied] == [4, 5, 6]
+    assert any(
+        "without a recorded checksum" in record.message for record in caplog.records
+    ), "adopting rows silently would hide that they were never verified"
+
+
+def test_an_adopted_row_does_not_excuse_a_genuinely_edited_one():
+    """The NULL-checksum skip is narrow: it must not become a way for real drift
+    to ride along beside an adopted row."""
+    mixed = {version: (name, None) for version, (name, _) in applied_state(SHIPPED[:2]).items()}
+    mixed[3] = (SHIPPED[2].name, "not-the-shipped-checksum")
+    conn = FakeConnection(applied=mixed)
+
+    with pytest.raises(MigrationChecksumError, match=SHIPPED[2].filename):
+        apply(conn)
+    assert migration_sql_applied(conn) == []
+
+
 def test_checksum_verification_can_be_turned_off_to_inspect_a_drifted_database():
     """`status` defaults to not verifying for exactly this reason: being refused a
     *description* of a database that has drifted is the opposite of helpful."""
@@ -341,6 +395,25 @@ def test_the_lock_is_taken_before_the_first_migration():
     apply(conn)
     order = [sql for sql in statements(conn)]
     assert order.index("SELECT pg_advisory_lock(%s)") < order.index(SHIPPED[0].sql)
+
+
+def test_the_lock_is_taken_before_the_state_table_is_created():
+    """Creating `schema_migrations` is itself the race the lock exists to settle:
+    `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent creation, so
+    two migrators meeting a fresh database both see "absent" and one dies on a
+    duplicate-key error from the catalog. Reading pending state before locking —
+    which is what this used to do — put that statement outside the lock."""
+    conn = FakeConnection()
+    apply(conn)
+    order = [" ".join(sql.split()) for sql in statements(conn)]
+
+    lock = order.index("SELECT pg_advisory_lock(%s)")
+    create = next(
+        i
+        for i, sql in enumerate(order)
+        if sql.startswith("CREATE TABLE IF NOT EXISTS schema_migrations")
+    )
+    assert lock < create, "the state table is created outside the advisory lock"
 
 
 def test_skipping_the_lock_is_possible_but_says_so(caplog):

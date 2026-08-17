@@ -144,13 +144,19 @@ that the SQL is reachable through `importlib.resources`.
 | Runner semantics (fake connection) | Yes | ordering, idempotence, one-transaction-per-migration, unknown-version detection, the destructive guard |
 | Writer mapping and statement | Yes | row mapping, `ts` handling, empty batch, pre-flight validation |
 | Import hygiene (subprocess) | Yes | no driver imported at module import |
-| **Real-Postgres correctness** | **No — skipped** | the rollup's arithmetic, `BOOL_AND`, effective-dating, transactional rollback, concurrent apply |
+| **Real-Postgres correctness** | **Yes — via `pgserver`** | the rollup's arithmetic, `BOOL_AND`, effective-dating, transactional rollback, concurrent apply, adoption of a pre-existing state table |
 
 The fake connection is a **protocol** double: it pins the order and grouping of statements, never the
 behaviour of Postgres. Database *correctness* is asserted only against a real server, which is the
 project's established pattern and is why the last row exists at all rather than being replaced with a
-mock. The consequence — that the last row is unproven until the developer runs it — is stated in the
-spec's acceptance-clause table and in the run report, not buried here.
+mock.
+
+That last row read **"No — skipped"** in the first draft, on the strength of an environment claim
+nobody tested. It was wrong: `pgserver` ships the server binaries in its wheel and needs no root, no
+apt and no Docker. The cost of the mistake was concrete — the FR-012 concurrency test was written
+correctly, never ran, and would have failed; a High-severity defect shipped beneath it. The suite now
+starts its own server when `TOKENWEIR_TEST_DSN` is unset and `pgserver` is importable, and still skips
+for an install without the `dev` extra. **Assume a limit is real only after trying to defeat it.**
 
 ## Risks
 
@@ -158,5 +164,7 @@ spec's acceptance-clause table and in the run report, not buried here.
 |---|---|
 | Reconstructed DDL differs from the live gateway schema | Column set pinned to the contract by test; TOKWEIR-10 gets an explicit "diff against live before pointing the gateway at it" step; called out in the report |
 | The rollup's shape change breaks gateway queries | Documented as a deliberate divergence with its reason; flagged for TOKWEIR-10 |
-| Real-Postgres suite never actually run | Skip message names the variable; README carries the command; the run report says plainly that the clause is unverified |
+| Real-Postgres suite never actually run | **Was realized, and cost a High defect.** Now closed at the source: the suite starts its own `pgserver` when no DSN is set, so running it is the default rather than an errand. The skip message still names the variable for a core-only install |
 | A future edit reintroduces a fixed bug | That is exactly what Phase 2 prevents, in an environment with no database |
+| The first live database is the gateway's, whose `schema_migrations` predates this runner | FR-042: the runner adopts such a table — brings it up to shape, records the existing rows as applied, and reports their absent checksums as unverifiable rather than as drift. Asserted against a real server (SC-026) and pinned with no database. Without it, `apply` **and** `status` both died on `UndefinedColumn`, which is what TOKWEIR-10 would have hit first |
+| `reader_role` configured after the schema is already migrated grants nothing | Migrations 004/005 are the only grants and are never re-run. Documented in README ("Granting a reader role later") with the one-statement remedy, and in `apply`'s docstring, rather than left for an operator to discover by missing permission |

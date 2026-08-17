@@ -95,6 +95,65 @@ def test_the_dsn_is_accepted_on_either_side_of_the_subcommand(argv, stub_connect
     assert "pending:" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["apply", "--dsn", "postgresql:///s", "--reader-role", "rdr"],
+        ["--reader-role", "rdr", "apply", "--dsn", "postgresql:///s"],
+        ["--dsn", "postgresql:///s", "--reader-role", "rdr", "apply"],
+    ],
+)
+def test_the_reader_role_is_accepted_on_either_side_of_the_subcommand(
+    argv, stub_connect, monkeypatch
+):
+    """FR-013 says connection options work on either side, not just `--dsn`. The
+    three options share one parent parser, so this is coverage rather than a
+    separate mechanism — but the parent parser is exactly the kind of thing a
+    later edit breaks for one option while leaving the tested one green."""
+    seen = {}
+    monkeypatch.setattr(cli, "apply", lambda connection, **kwargs: seen.update(kwargs) or ())
+
+    assert cli.main(argv) == 0
+    assert seen["reader_role"] == "rdr"
+    assert stub_connect == ["postgresql:///s"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["status", "--dsn", "postgresql:///s", "--verbose"],
+        ["--verbose", "status", "--dsn", "postgresql:///s"],
+    ],
+)
+def test_verbose_is_accepted_on_either_side_of_the_subcommand(argv):
+    """`--verbose` is `store_true` with a suppressed default — the combination
+    most likely to come out as "always false" if the parent parser is reworked.
+
+    Asserted against the parsed namespace rather than the logging it turns on:
+    `logging.basicConfig` is a no-op once pytest has installed a root handler, so
+    an assertion on the log level would pass whatever the parser did.
+    """
+    assert getattr(cli._build_parser().parse_args(argv), "verbose", False) is True
+
+
+def test_verbose_is_absent_rather_than_false_when_not_given():
+    """The suppressed default is load-bearing: if it were a real `False`, the
+    subparser would write it over a `--verbose` given before the subcommand."""
+    args = cli._build_parser().parse_args(["status", "--dsn", "postgresql:///s"])
+    assert not hasattr(args, "verbose")
+
+
+def test_the_later_dsn_wins_and_neither_position_is_discarded(stub_connect):
+    """SC-022's remaining case: given on *both* sides, one of them has to lose,
+    and it must lose to the other's value rather than to a default that silently
+    replaces both."""
+    assert (
+        cli.main(["--dsn", "postgresql:///first", "status", "--dsn", "postgresql:///second"])
+        == 0
+    )
+    assert stub_connect == ["postgresql:///second"]
+
+
 def test_the_dsn_falls_back_to_the_environment(stub_connect, monkeypatch):
     monkeypatch.setenv(cli.DSN_ENV_VAR, "postgresql:///from-env")
     assert cli.main(["status"]) == 0

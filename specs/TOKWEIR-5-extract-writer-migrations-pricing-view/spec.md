@@ -39,7 +39,15 @@ by a reader halfway down.
 | Thing the story implies | Reality in this pod | Consequence |
 |---|---|---|
 | An `ai-gateway` checkout whose files are *moved* | **Absent.** The gateway lives in a separate repository on the developer's workstation; this pod has only `tokenweir` (`git remote -v` → `mikemcg52/tokenweir`). | The DDL and writer are **reconstructed from the authoritative written descriptions** — ADR-0001 (which names the pipeline, the ownership move and the two fixes by name) and the v1 record contract in `tokenweir.contract`, which is the in-repo definition of what a record *is*. See Assumptions. |
-| A Postgres to test against | **None reachable that may be used.** No server is installed, `postgresql` is not in the pod's apt sources, the account is not root, and there is no Docker. Port 5432 on the data VM answers, but that is the **production** `ai_gateway_metrics` database and this run has neither credentials for it nor any business writing to it. | Real-Postgres tests are **DSN-gated and skip** when no DSN is configured. The acceptance clause "existing correctness tests pass against real Postgres" is therefore *deliverable but not verifiable here*; see Acceptance-clause traceability. |
+| A Postgres to test against | **Obtainable, and obtained.** No server is installed, `postgresql` is not in the pod's apt sources, the account is not root, and there is no Docker — but none of that was the constraint it looked like. PyPI is reachable, and `pgserver` ships the PostgreSQL binaries in its wheel, so `pip install pgserver` yields a working PostgreSQL 16 needing none of the three. Port 5432 on the data VM is still off-limits: it is the **production** `ai_gateway_metrics` database and this run has neither credentials for it nor any business writing to it. | The real-Postgres suite **runs here**. It stays DSN-gated and still skips for someone who installs only the core (`pgserver` is in the `dev` extra alone), so an ordinary install does not go red — but "no usable Postgres" is not a fact about this pod and must not be recorded as one. |
+
+> **This row was wrong in the first draft of this spec**, and the cost of it is on the record. It
+> claimed no Postgres could be had, which retired the third acceptance clause as unverifiable; the
+> integration test for FR-012 was written, was correct, and was never executed. It would have failed.
+> A High-severity concurrency defect — `schema_migrations` created *outside* the advisory lock, so two
+> migrators against a fresh database deterministically collide — shipped underneath it. An environment
+> limit asserted rather than tested is a place for defects to hide, and this one hid a real defect for
+> the length of a story.
 
 Neither fact is a reason to skip the story. What it changes is which claims this run may make, and
 those are stated as claims rather than assumed.
@@ -52,8 +60,8 @@ someone makes on the record rather than one that happens by the story scrolling 
 | Clause (verbatim from the Jira story) | Status on this branch |
 |---|---|
 | "tokenweir owns and applies the migrations" | **Met.** The six migrations ship *inside the package* (`tokenweir/migrations/sql/`, wheel-installed, not repo-only), and `tokenweir.migrations.apply()` plus `python -m tokenweir.migrations` apply them and record them in `schema_migrations`. |
-| "writer persists records to Postgres" | **Met in code; proven against a real Postgres only where a DSN is configured.** `tokenweir.postgres.PostgresSource` implements `Source` and INSERTs a batch in one transaction. Its SQL and row mapping are pure and fully tested here; the round-trip through a live server is the DSN-gated suite. |
-| "existing correctness tests pass against real Postgres" | **Not verifiable in this pod, and not claimed.** There is no usable Postgres (see the table above). The correctness tests are written, are real-Postgres tests with no database mocking, and skip with a message naming the environment variable that turns them on. The developer runs them once against a scratch database; that step is documented in `README.md` and is the story's remaining verification. |
+| "writer persists records to Postgres" | **Met, and proven against a real server.** `tokenweir.postgres.PostgresSource` implements `Source` and INSERTs a batch in one transaction. Its SQL and row mapping are pure and fully tested with no database; the round-trip, the `ts` default and the batch-failure rollback are asserted against a live PostgreSQL 16. |
+| "existing correctness tests pass against real Postgres" | **Met.** The correctness tests are real-Postgres tests with no database mocking, and they were run: PostgreSQL 16 via `pgserver`, whole suite green. They remain DSN-gated and skip for an install without the `dev` extra, so this claim is reproducible (`pip install -e '.[dev]' && pytest`) rather than a one-off. Running them is what surfaced the FR-012 concurrency defect that the first draft of this story shipped. |
 
 The two named fixes — `DATE_TRUNC` STABLE-vs-IMMUTABLE and `is_priced`/`BOOL_AND` — are a separate
 matter, and they are **not** left to the unrunnable suite. Each is pinned by a test that reads the
@@ -129,8 +137,17 @@ read the view.
 
 **Acceptance Scenarios**:
 
-1. **Given** a group whose every call has a rate-card entry, **When** the view is read, **Then**
-   `is_priced` is true and `est_cost_usd` is the summed cost.
+1. **Given** a group whose every call has a rate-card entry **covering every token kind the call
+   used**, **When** the view is read, **Then** `is_priced` is true and `est_cost_usd` is the summed
+   cost. The qualifier is load-bearing and was left implicit in the first draft: the cache-rate
+   columns are nullable because not every model prices cache reads and writes, so a call that used
+   cache tokens against a rate card with no cache rate is **not** fully priced. Treating the missing
+   rate as zero would report cached usage as free — an error in the one direction an estimate must
+   never make.
+1. **Given** a row whose `pricing_mode` is NULL, **When** the view is read, **Then** it is priced as
+   ordinary API usage. Only `subscription` is excluded, and the comparison is `IS DISTINCT FROM`, so a
+   row written before the column meant anything is counted rather than silently dropped out of every
+   cost figure.
 2. **Given** a group where **any** call lacks a rate, **When** the view is read, **Then** `is_priced`
    is false and `est_cost_usd` is NULL for the whole group — `BOOL_AND`, not `BOOL_OR`. A partial
    number would be indistinguishable from a complete one and would be silently too low.
@@ -257,7 +274,12 @@ observe that only the call that actually connects fails.
   on an identifier that merely contains the word (`drop_reason` is not a `DROP`).
 - **FR-011**: The runner MUST take a **DB-API connection**, not a DSN, so it works with any driver and
   is testable without one. A DSN-based convenience MUST exist separately.
-- **FR-012**: The runner MUST serialize concurrent runs with an advisory lock.
+- **FR-012**: The runner MUST serialize concurrent runs with an advisory lock. The lock MUST be
+  acquired **before any statement that reads or creates `schema_migrations`**. Creating that table is
+  itself part of the race: Postgres's `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent
+  creation, so a runner that reads pending state first leaves the one statement that must be
+  serialized outside the serialization, and two deploys against a fresh database collide on the system
+  catalog. `pg_advisory_lock` requires no table, so nothing forces the other order.
 - **FR-013**: The runner MUST be usable as a command (`python -m tokenweir.migrations`) with at least
   `apply` and `status`, mirroring the `scripts/migrate.py` it replaces. Its connection options MUST be
   accepted on **either side of the subcommand** — `... status --dsn X` is the form anyone writes
@@ -272,6 +294,16 @@ observe that only the call that actually connects fails.
   database and the library disagree about what version N *is*, and re-running cannot resolve that.
   Reporting state (`status`) MUST be able to opt out, since being refused a *description* of a drifted
   database is the opposite of helpful.
+- **FR-042**: The runner MUST **adopt** a `schema_migrations` table that predates it rather than fail
+  against one. This is the ownership move's own first step, not an edge case: the database
+  `tokenweir` is pointed at first is the one the AI Gateway has been migrating, and its state table
+  has no `checksum` column, because FR-038 is this library's addition. A bare
+  `CREATE TABLE IF NOT EXISTS` no-ops against it and the next read fails on an undefined column —
+  unactionable, and it takes `status` down with it, defeating FR-038's own guarantee that describing a
+  database is never refused. Adoption MUST bring the table up to shape without re-running or dropping
+  anything, MUST record the pre-existing rows as applied, and MUST treat their absent checksums as
+  **unverifiable rather than as drift**, saying so. Inventing a checksum for a migration another tool
+  ran would be a claim this library has no basis for.
 
 **The writer**
 
@@ -372,6 +404,13 @@ observe that only the call that actually connects fails.
 - **SC-005**: A database carrying an applied version the library does not ship raises, naming the
   version.
 - **SC-006**: Two migrators run concurrently against one database and produce one set of applied rows.
+  Asserted against a **real server** against an **empty** database, which is the case that fails when
+  the lock is taken too late — with `schema_migrations` already present the race closes on its own and
+  a test that starts from a migrated database reports success either way.
+- **SC-026**: A database whose `schema_migrations` has no `checksum` column is adopted: `apply`
+  applies only what is genuinely missing, `status` describes it rather than raising, the pre-existing
+  rows keep a NULL checksum, and a later run does not read those NULLs as drift. Asserted against a
+  real server, and the statements that make it possible are pinned with no database.
 - **SC-007**: A written batch reads back field-for-field equal to the records, including `NULL`s and
   zeroes.
 - **SC-008**: A batch that fails partway leaves zero rows visible.

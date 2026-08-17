@@ -303,6 +303,45 @@ The rules the extraction preserved, as behaviour rather than convention:
   neither; concurrent runs are serialized by an advisory lock.
 - **A database ahead of the library is refused** rather than migrated on top of.
 
+#### Taking over a database the gateway already migrated
+
+That is the ordinary case, not an exotic one: the first database `tokenweir` is
+pointed at is the one the AI Gateway has been migrating all along. Its
+`schema_migrations` predates this runner and records a version without a checksum,
+so the runner **adopts** it — it brings the table up to shape and treats the rows
+already there as applied, rather than re-running migrations against objects that
+exist. Those adopted rows keep a NULL checksum and are reported as unverifiable
+(a warning names the versions), because inventing a checksum for a migration
+somebody else ran would be a claim this library cannot make.
+
+Nothing is re-applied and nothing is dropped. What the runner does from then on is
+ordinary: new migrations get real checksums, and drift detection applies to those.
+
+#### Granting a reader role later
+
+`reader_role` only takes effect on the run that **applies** migrations 004 and
+005 — they are the migrations that issue the grants, and a migration already
+recorded as applied is never re-run. Passing `reader_role` to an
+already-migrated database therefore grants nothing and says nothing, which is
+worth knowing before you go looking for the permission you thought you set.
+
+To add a reader after the fact, grant it directly — it is one statement, and it is
+not a schema change:
+
+```sql
+GRANT SELECT ON gateway_usage, model_pricing_rates, gateway_usage_daily
+    TO metrics_reader;
+```
+
+#### When a released migration really was edited
+
+The checksum covers the whole file, comments included, so editing even a comment
+in a released migration makes every deployed database refuse to migrate. That is
+the intended strictness — but if you need to *look* at such a database, `status()`
+does not verify checksums by default, and `pending()`/`apply()` take
+`verify_checksums=False`. The fix remains a new migration; the escape hatch is for
+diagnosis, not for making the disagreement go away.
+
 ### Writing records
 
 `PostgresSource` is the writer — a `Source`, so it is the mirror of a `Sink`:
@@ -343,6 +382,15 @@ day, and which answers "I cannot tell you" rather than guessing:
   manufacture a figure nobody is billed. `pricing_mode` is one of the grouping
   columns, so flat-rate usage does not blank out API-metered usage that genuinely
   has a cost.
+- **A call that used cache tokens the rate card does not price is unpriced**, even
+  though its input and output rates are present. The cache rate columns are
+  nullable because not every model has cache pricing; treating a missing one as
+  zero would quietly report cached usage as free, which is the one direction an
+  estimate must never err in.
+- **A row with no `pricing_mode` is priced.** Only `subscription` is excluded, and
+  the comparison is `IS DISTINCT FROM`, so a NULL — a row written before the column
+  meant anything — is treated as ordinary API usage rather than silently dropped
+  from every cost figure.
 - Rate columns are named `*_usd_per_mtok`. The unit is in the name because a rate
   card loaded against the wrong one is a thousand-fold error with nothing in the
   data to reveal it.
@@ -351,17 +399,28 @@ day, and which answers "I cannot tell you" rather than guessing:
 
 The correctness tests for all of the above run against a **real Postgres** — this
 project does not mock a database, because a mocked one only proves the code calls
-the mock. They skip when no database is configured:
+the mock. There are two ways to give them one, and installing the dev extra is
+enough for the second:
 
 ```bash
-createdb tokenweir_scratch
+pip install -e '.[dev]'          # brings pgserver: the suite starts its own server
+pytest
+
+createdb tokenweir_scratch       # or point it at a database you chose
 TOKENWEIR_TEST_DSN=postgresql:///tokenweir_scratch pytest
 ```
+
+`pgserver` ships the PostgreSQL binaries in its wheel, so the embedded path needs
+no root, no `apt` and no Docker. `TOKENWEIR_TEST_DSN` wins when set — a developer
+who names a particular server means it. With neither, the suite **skips** with a
+message naming the variable, so installing only the core never turns red.
 
 Each test creates and drops its own schema, so the DSN may point at any scratch
 database without the suite colliding with an existing `gateway_usage`. What runs
 without a database — the migration set's shape, the two preserved fixes, the
 writer's mapping, and a syntax check against Postgres's own parser — runs always.
+Run the real-Postgres suite before believing a change to the runner or the SQL:
+the concurrency and adoption behaviours are only observable against a server.
 
 ## Develop
 

@@ -28,12 +28,17 @@ postgres = ["psycopg[binary]>=3"]
 # syntax-checked with no server running. Test-only and skipped when absent — a
 # compiled parser is too heavy to require of someone who only imports the
 # contract, and it never becomes a runtime dependency.
+# `pgserver` ships the PostgreSQL binaries in its wheel, so `tests/conftest.py`
+# can start a throwaway server with no root, no apt and no Docker when
+# TOKENWEIR_TEST_DSN is unset. It is here and nowhere else on purpose: the
+# real-Postgres suite must still skip for someone who installs only the core.
 dev = [
     "pytest>=8",
     "ruff>=0.6",
     "jsonschema>=4",
     "psycopg[binary]>=3",
     "pglast>=6",
+    "pgserver>=0.1.4; sys_platform != 'win32'",
 ]
 
 [tool.setuptools.packages.find]
