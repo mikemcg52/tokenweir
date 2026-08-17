@@ -296,6 +296,22 @@ def test_a_version_applied_without_a_checksum_is_adopted_not_refused(caplog):
     ), "adopting rows silently would hide that they were never verified"
 
 
+def test_status_says_which_rows_it_could_not_verify(caplog):
+    """FR-042 requires unverifiable rows be reported "saying so", and `status` is
+    the command an operator runs *to have an adopted database described to them*
+    — yet it defaults to not verifying. Warning only on the verifying path left
+    the one caller that most needs to hear it guaranteed not to."""
+    adopted = {version: (name, None) for version, (name, _) in applied_state(SHIPPED[:3]).items()}
+    conn = FakeConnection(applied=adopted)
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.migrations"):
+        done, outstanding = status(conn)
+
+    assert [m.version for m in done] == [1, 2, 3]
+    assert [m.version for m in outstanding] == [4, 5, 6]
+    assert any("without a recorded checksum" in r.message for r in caplog.records)
+
+
 def test_an_adopted_row_does_not_excuse_a_genuinely_edited_one():
     """The NULL-checksum skip is narrow: it must not become a way for real drift
     to ride along beside an adopted row."""
@@ -420,6 +436,47 @@ def test_the_lock_is_taken_before_the_state_table_is_created():
         if sql.startswith("CREATE TABLE IF NOT EXISTS schema_migrations")
     )
     assert lock < create, "the state table is created outside the advisory lock"
+
+
+def test_status_takes_the_lock_before_creating_the_state_table_too():
+    """The reader path is the one that shipped unlocked. `status` creates
+    `schema_migrations` on a fresh database exactly as `apply` does, so pinning
+    the ordering for the writer alone is what let a health check kill a deploy —
+    and the no-database suite stayed green throughout."""
+    conn = FakeConnection()
+    status(conn)
+    order = [" ".join(sql.split()) for sql in statements(conn)]
+
+    lock = order.index("SELECT pg_advisory_lock(%s)")
+    create = next(
+        i
+        for i, sql in enumerate(order)
+        if sql.startswith("CREATE TABLE IF NOT EXISTS schema_migrations")
+    )
+    assert lock < create, "status creates the state table outside the advisory lock"
+    assert any("pg_advisory_unlock" in sql for sql in order), "status never unlocks"
+
+
+def test_an_autocommit_connection_is_refused_by_apply():
+    """Two silent failures, not one. The DDL would stop committing with its
+    `schema_migrations` row (FR-009), and `set_config(..., is_local => true)`
+    would scope the reader role to the `set_config` statement itself — so 004 and
+    005 would take their no-op branch, be recorded as applied, and never run
+    again. The grant is not delayed by that; it is gone (FR-030)."""
+    conn = FakeConnection()
+    conn.autocommit = True
+
+    with pytest.raises(ValueError, match="autocommit"):
+        apply(conn)
+    assert conn.events == [], "nothing may be issued against a connection we refuse"
+
+
+def test_a_connection_with_no_notion_of_autocommit_is_accepted_by_apply():
+    """`autocommit` is psycopg's attribute, not DB-API's; a connection without one
+    is not in autocommit mode and must not be refused for lacking it."""
+    conn = FakeConnection()
+    assert not hasattr(conn, "autocommit")
+    assert [m.version for m in apply(conn)] == [1, 2, 3, 4, 5, 6]
 
 
 def test_skipping_the_lock_is_possible_but_says_so(caplog):

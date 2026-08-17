@@ -262,8 +262,21 @@ existing rows and rollups do not change.
 
 ```bash
 pip install 'tokenweir[postgres]'
-python -m tokenweir.migrations apply --dsn "$TOKENWEIR_DSN"
+python -m tokenweir.migrations apply --dsn postgresql:///gateway
+python -m tokenweir.migrations status --verify-checksums
 ```
+
+Connection options are accepted on **either side** of the subcommand, and each
+falls back to an environment variable, so a deploy script can set them once:
+
+| Option | Environment variable | |
+|---|---|---|
+| `--dsn` | `TOKENWEIR_DSN` | the connection string |
+| `--reader-role` | `TOKENWEIR_READER_ROLE` | role the grant migrations give `SELECT` to; unset, they no-op with a notice |
+| `--verbose` | — | log each migration as it is applied |
+
+An explicit flag beats the environment. `status` also takes `--verify-checksums`,
+which is the only way to be *told* about a drifted database rather than shown one.
 
 Six forward-only migrations ship **inside the package** — unlike
 [`schema/usage-record.v1.json`](#versioning), which is a repository artifact, these

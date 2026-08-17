@@ -158,3 +158,29 @@
       told (FR-016).
 - [x] **T058** **Low** — `status` gained `--verify-checksums`: FR-038 only requires the opt-*out*, but
       the command line was the one place an operator could never see drift.
+
+## Fix round 3 (review findings)
+
+- [x] **T059** **Med** — round 2 made `PostgresSource` refuse an autocommit connection and left the
+      runner accepting one, where the consequence is worse. `set_config(..., is_local => true)` scopes
+      the reader role to the applying transaction, so under autocommit migrations 004/005 saw no role,
+      took their no-op branch, and were recorded as applied — the grant lost permanently, not delayed
+      (demonstrated against a real server: `granted=[]` with autocommit, three relations without it).
+      It also breaks FR-009's one-transaction-per-migration. `apply` now refuses, and says which two
+      guarantees it is protecting (FR-009, FR-016, FR-030).
+- [x] **T060** **Low** — the adopted-rows "unverifiable checksum" warning sat *after* the
+      `verify_checksums` early return, and `status` defaults to not verifying. The one caller that
+      exists to describe an adopted database was the one guaranteed never to mention it. Warning moved
+      above the return (FR-042).
+- [x] **T061** **Low** — added the no-database counterpart of the reader-path lock test: `status` must
+      take the advisory lock before creating `schema_migrations`, mirroring the one `apply` has. The
+      unlocked reader shipped past a green no-DB suite once already.
+- [x] **T062** **Low** — `TOKENWEIR_DSN` and `TOKENWEIR_READER_ROLE` documented in README with the
+      option/environment table; `--verify-checksums` documented alongside.
+- [x] **T063** **Low** — SC-020 names `python -m tokenweir.migrations`, and every test called `main()`
+      in-process. Added a `subprocess` test of the real entry point, which is the only thing that can
+      catch a broken `__main__` guard.
+- [x] **T064** **Low** — the reviewer flagged as unverified whether a password-bearing DSN can reach
+      stderr through the connect-failure message. Checked five adversarial forms against psycopg:
+      libpq quotes the offending *keyword*, never the value. No leak — and now pinned by a test, since
+      the message interpolates a driver exception this project does not control.

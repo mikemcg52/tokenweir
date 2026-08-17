@@ -422,6 +422,14 @@ observe that only the call that actually connects fails.
   that distinguishes `BOOL_AND` from `BOOL_OR` — the rate and `pricing_mode` are constant within a
   group, so every uniform group agrees under either — and without it the story's named fix is pinned
   by a string search alone.
+- **SC-028**: `apply` raises on an autocommit connection, and the same migrations applied on an
+  ordinary one grant the configured reader role `SELECT` on all three relations. Asserted together:
+  the refusal only means something beside proof that the grant otherwise lands.
+- **SC-029**: `python -m tokenweir.migrations status` run as a **subprocess** exits 0 against a
+  migrated database and prints no traceback. In-process `main()` calls cannot catch a broken
+  `__main__` guard, which is the entry point SC-020 actually names.
+- **SC-030**: A connect failure whose DSN carries a password prints the failure without the password,
+  for a URL DSN, a keyword DSN and a malformed one alike.
 - **SC-026**: A database whose `schema_migrations` has no `checksum` column is adopted: `apply`
   applies only what is genuinely missing, `status` describes it rather than raising, the pre-existing
   rows keep a NULL checksum, and a later run does not read those NULLs as drift. Asserted against a

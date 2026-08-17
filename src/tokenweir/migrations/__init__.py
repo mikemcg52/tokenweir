@@ -37,6 +37,13 @@ rather than a single statement:
 
 Both are true of the drivers this project targets; a connection that does neither
 belongs behind an adapter of its own.
+
+And one thing it must **not** do: be in **autocommit** mode. :func:`apply` refuses
+one. Each migration has to commit together with its ``schema_migrations`` row, and
+the reader-role grant is scoped to the applying transaction — under autocommit
+the first guarantee is lost and the second grant is lost *permanently*, since the
+migration that would have issued it is recorded as applied. Both failures are
+silent, which is why this is a refusal rather than a line in this docstring.
 """
 
 from __future__ import annotations
@@ -319,9 +326,11 @@ def _check_applied(
             "migrating on top of a schema it cannot describe"
         )
 
-    if not verify_checksums:
-        return
-
+    # Announced before the `verify_checksums` early return, not after it. FR-042
+    # requires unverifiable rows be reported as such, and `status` — the command
+    # an operator runs precisely to have an adopted database described to them —
+    # defaults to not verifying. Warning only on the verifying path meant the one
+    # caller that most needs to hear it was the one guaranteed not to.
     adopted = sorted(v for v, checksum in applied.items() if checksum is None)
     if adopted:
         _logger.warning(
@@ -331,6 +340,9 @@ def _check_applied(
             "over a schema the AI Gateway migrated.",
             adopted,
         )
+
+    if not verify_checksums:
+        return
 
     changed = [
         by_version[version].filename
@@ -461,6 +473,30 @@ def apply(
             ones half-applied.
         UnknownAppliedVersionError, MigrationChecksumError: see :func:`pending`.
     """
+    # An autocommit connection breaks this function in two distinct ways, both
+    # silent, so it is refused rather than documented.
+    #
+    # FR-009: each migration's DDL and its `schema_migrations` row are supposed to
+    # commit together. Under autocommit they commit separately, so a failure
+    # between them leaves a migration applied and unrecorded — or recorded and not
+    # applied — which is the precise disagreement the one-transaction rule exists
+    # to make impossible.
+    #
+    # FR-030: `reader_role` is published with `set_config(..., is_local => true)`,
+    # which scopes it to the current transaction. Under autocommit that
+    # transaction is the `set_config` statement itself, so migrations 004 and 005
+    # see no role, take their no-op branch, and are then recorded as applied and
+    # never re-run. The grant is not delayed, it is lost permanently, and the only
+    # recovery is the manual GRANT in the README.
+    if getattr(connection, "autocommit", False):
+        raise ValueError(
+            "tokenweir.migrations.apply needs a connection that is not in "
+            "autocommit mode: each migration must commit together with its "
+            "schema_migrations row, and the reader-role grant is scoped to the "
+            "applying transaction, so autocommit would silently lose it for good. "
+            "Set connection.autocommit = False."
+        )
+
     if not advisory_lock:
         _logger.warning(
             "tokenweir: applying migrations without an advisory lock; two "

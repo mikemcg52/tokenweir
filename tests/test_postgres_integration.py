@@ -27,6 +27,9 @@ To run them:
     TOKENWEIR_TEST_DSN=postgresql:///tokenweir_scratch pytest tests/test_postgres_integration.py
 """
 
+import os
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -481,6 +484,135 @@ def test_the_cli_reports_a_drifted_database_without_a_traceback(
     assert "Traceback" not in captured.err
 
 
+def test_apply_refuses_an_autocommit_connection_rather_than_lose_the_grant(
+    scratch_schema, reader_role
+):
+    """The refusal is not fastidiousness — this is what it prevents.
+
+    `set_config('tokenweir.reader_role', %s, true)` is transaction-scoped. Under
+    autocommit that transaction is the `set_config` statement, so 004 and 005 see
+    no role, take their no-op branch, and are recorded as applied. The grant is
+    not deferred; it is gone, and only the manual GRANT in the README recovers it.
+    """
+    connect, _ = scratch_schema
+    connection = connect()
+    connection.autocommit = True
+
+    with pytest.raises(ValueError, match="autocommit"):
+        apply(connection, reader_role=reader_role)
+
+    # And the ordinary connection does grant, so the test above is about
+    # autocommit rather than about the role never working here.
+    connection.autocommit = False
+    apply(connection, reader_role=reader_role)
+    assert granted_relations(connection, reader_role) == {
+        "gateway_usage",
+        "gateway_usage_daily",
+        "model_pricing_rates",
+    }
+
+
+def test_the_module_entry_point_runs_as_a_command(postgres_dsn, scratch_schema, monkeypatch):
+    """SC-020 names `python -m tokenweir.migrations`, and every other CLI test
+    calls `main()` in-process — which cannot catch a broken `__main__` guard, a
+    bad module name or an import that only fails outside pytest."""
+    _, schema = scratch_schema
+    env = {**os.environ, "PGOPTIONS": f"-c search_path={schema}"}
+
+    result = subprocess.run(
+        [sys.executable, "-m", "tokenweir.migrations", "status", "--dsn", postgres_dsn],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "pending:" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://u:{pw}@localhost:1/db",
+        "postgresql://u:{pw}@localhost:1/db?bogus=1",
+        "password={pw} bogus_key=1",
+        "not a dsn {pw}",
+        "host=localhost password={pw} dbname=x sslmode=bogusvalue",
+    ],
+)
+def test_a_failing_connection_does_not_echo_the_password(dsn, psycopg_module, capsys):
+    """A DSN carries a password and a connect failure is printed to stderr, which
+    on a deploy goes to a log somebody else can read. libpq quotes the offending
+    *keyword* rather than the value, but that is a property worth pinning rather
+    than assuming — the message is built by string interpolation of a driver
+    exception this project does not control."""
+    from tokenweir.migrations import __main__ as cli
+
+    password = "s3cr3t-do-not-log"
+
+    assert cli.main(["status", "--dsn", dsn.format(pw=password)]) == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert password not in captured.err
+    assert password not in captured.out
+
+
+# --- Grants: the fixtures the reader-role tests share -------------------------
+
+
+@pytest.fixture
+def reader_role(scratch_schema, psycopg_module):
+    """A real Postgres role, dropped afterwards, or a skip.
+
+    Shared rather than inlined because two tests need it now: one asserting the
+    grant lands, one asserting it is *not* silently lost. The second is only
+    meaningful next to the first.
+    """
+    connect, _ = scratch_schema
+    connection = connect()
+    role = "tokenweir_test_reader"
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        exists = cursor.fetchone() is not None
+    if not exists:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f'CREATE ROLE "{role}" NOLOGIN')
+            connection.commit()
+        except psycopg_module.errors.InsufficientPrivilege:
+            connection.rollback()
+            pytest.skip("the test role cannot be created; CREATEROLE is not held")
+
+    try:
+        yield role
+    finally:
+        if not exists:
+            with connection.cursor() as cursor:
+                cursor.execute(f'REASSIGN OWNED BY "{role}" TO CURRENT_USER')
+                cursor.execute(f'DROP OWNED BY "{role}"')
+                cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
+            connection.commit()
+
+
+def granted_relations(connection, role):
+    """The relations ``role`` may SELECT from, in the connection's own schema."""
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT current_schema()")
+        schema = cursor.fetchone()[0]
+    return {
+        row[0]
+        for row in fetch(
+            connection,
+            "SELECT table_name FROM information_schema.role_table_grants "
+            "WHERE grantee = %s AND privilege_type = 'SELECT' AND table_schema = %s",
+            (role, schema),
+        )
+    }
+
+
 # --- The rollup (US3) ---------------------------------------------------------
 
 
@@ -691,44 +823,17 @@ def test_the_grant_migrations_no_op_without_a_configured_role(scratch_schema):
     assert len(apply(connection)) == 6
 
 
-def test_a_configured_role_is_granted_select(scratch_schema, psycopg_module):
-    connect, schema = scratch_schema
+def test_a_configured_role_is_granted_select(scratch_schema, reader_role):
+    connect, _ = scratch_schema
     connection = connect()
-    role = "tokenweir_test_reader"
 
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
-        exists = cursor.fetchone() is not None
-    if not exists:
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(f'CREATE ROLE "{role}" NOLOGIN')
-            connection.commit()
-        except psycopg_module.errors.InsufficientPrivilege:
-            connection.rollback()
-            pytest.skip("the test role cannot be created; CREATEROLE is not held")
-    created_here = not exists
+    apply(connection, reader_role=reader_role)
 
-    try:
-        apply(connection, reader_role=role)
-        granted = fetch(
-            connection,
-            "SELECT table_name FROM information_schema.role_table_grants "
-            "WHERE grantee = %s AND privilege_type = 'SELECT' AND table_schema = %s",
-            (role, schema),
-        )
-        assert {row[0] for row in granted} >= {
-            "gateway_usage",
-            "model_pricing_rates",
-            "gateway_usage_daily",
-        }
-    finally:
-        if created_here:
-            with connection.cursor() as cursor:
-                cursor.execute(f'REASSIGN OWNED BY "{role}" TO CURRENT_USER')
-                cursor.execute(f'DROP OWNED BY "{role}"')
-                cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
-            connection.commit()
+    assert granted_relations(connection, reader_role) >= {
+        "gateway_usage",
+        "model_pricing_rates",
+        "gateway_usage_daily",
+    }
 
 
 def test_a_role_that_does_not_exist_is_a_notice_not_a_failure(scratch_schema):
