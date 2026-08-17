@@ -251,6 +251,192 @@ swallowed Ctrl-C would be a worse bug than the one it fixes.
 > and should watch the return value, since a producer that gets a field name
 > wrong drops *every* record, not some of them.
 
+## The store — schema, migrations and the writer
+
+`tokenweir` **owns** the usage schema. That ownership moved here from the AI
+Gateway (ADR-0001 Pillar 5): the gateway pins a `tokenweir` version and no longer
+carries DDL, and anything else that reads or writes `gateway_usage` gets its
+schema from the same place. The table keeps its name — renaming it would force a
+data migration on a live database, and the consumers' contract is that their
+existing rows and rollups do not change.
+
+```bash
+pip install 'tokenweir[postgres]'
+python -m tokenweir.migrations apply --dsn postgresql:///gateway
+python -m tokenweir.migrations status --verify-checksums
+```
+
+Connection options are accepted on **either side** of the subcommand, and each
+falls back to an environment variable, so a deploy script can set them once:
+
+| Option | Environment variable | |
+|---|---|---|
+| `--dsn` | `TOKENWEIR_DSN` | the connection string |
+| `--reader-role` | `TOKENWEIR_READER_ROLE` | role the grant migrations give `SELECT` to; unset, they no-op with a notice |
+| `--verbose` | — | log each migration as it is applied |
+
+An explicit flag beats the environment. `status` also takes `--verify-checksums`,
+which is the only way to be *told* about a drifted database rather than shown one.
+
+Six forward-only migrations ship **inside the package** — unlike
+[`schema/usage-record.v1.json`](#versioning), which is a repository artifact, these
+travel in the wheel, because the library has to be able to apply them:
+
+| | |
+|---|---|
+| `001_gateway_usage` | the append-only usage log; one row per metered unit of work |
+| `002_parent_request_id` | attribution for fan-out calls |
+| `003_model_pricing_rates` | the effective-dated rate card |
+| `004_reader_grant` | `SELECT` for a reporting role |
+| `005_gateway_usage_daily` | the daily rollup, and the only place a dollar is produced |
+| `006_gateway_usage_app_day_index` | the functional index the rollup needs |
+
+Everything in `tokenweir.migrations` takes a **DB-API connection**, not a DSN, so
+a deployment keeps its own pooling, credentials and driver — `connect()` is a
+convenience, not a requirement:
+
+```python
+from tokenweir.migrations import apply, status
+
+apply(connection, reader_role="metrics_reader")   # returns what it applied
+applied, outstanding = status(connection)
+```
+
+The rules the extraction preserved, as behaviour rather than convention:
+
+- **Forward-only.** No down-migrations, and a released migration is immutable — a
+  change is a new version. The runner records each migration's checksum and
+  refuses to run against a database whose applied migrations no longer match the
+  shipped files, so an edit is a loud failure rather than a silent disagreement.
+- **No `DROP` without operator review.** SQL containing `DROP`, `TRUNCATE` or
+  `DELETE FROM` is refused unless the call passes `allow_destructive=True`. It is
+  a per-call argument on purpose: the decision belongs where a reviewer reads it.
+- **Idempotent and atomic.** Applying an up-to-date database does nothing; each
+  migration commits together with its `schema_migrations` row, so a failure leaves
+  neither; concurrent runs are serialized by an advisory lock, which every entry
+  point takes — `status` and `apply` racing on a fresh database is the ordinary
+  case, since whichever arrives first is the one that creates `schema_migrations`.
+- **A database ahead of the library is refused** rather than migrated on top of.
+
+#### Taking over a database the gateway already migrated
+
+That is the ordinary case, not an exotic one: the first database `tokenweir` is
+pointed at is the one the AI Gateway has been migrating all along. Its
+`schema_migrations` predates this runner and records a version without a checksum,
+so the runner **adopts** it — it brings the table up to shape and treats the rows
+already there as applied, rather than re-running migrations against objects that
+exist. Those adopted rows keep a NULL checksum and are reported as unverifiable
+(a warning names the versions), because inventing a checksum for a migration
+somebody else ran would be a claim this library cannot make.
+
+Nothing is re-applied and nothing is dropped. What the runner does from then on is
+ordinary: new migrations get real checksums, and drift detection applies to those.
+
+#### Granting a reader role later
+
+`reader_role` only takes effect on the run that **applies** migrations 004 and
+005 — they are the migrations that issue the grants, and a migration already
+recorded as applied is never re-run. Passing `reader_role` to an
+already-migrated database therefore grants nothing and says nothing, which is
+worth knowing before you go looking for the permission you thought you set.
+
+To add a reader after the fact, grant it directly — it is one statement, and it is
+not a schema change:
+
+```sql
+GRANT SELECT ON gateway_usage, model_pricing_rates, gateway_usage_daily
+    TO metrics_reader;
+```
+
+#### When a released migration really was edited
+
+The checksum covers the whole file, comments included, so editing even a comment
+in a released migration makes every deployed database refuse to migrate. That is
+the intended strictness — but if you need to *look* at such a database, `status()`
+does not verify checksums by default, and `pending()`/`apply()` take
+`verify_checksums=False`. The fix remains a new migration; the escape hatch is for
+diagnosis, not for making the disagreement go away.
+
+### Writing records
+
+`PostgresSource` is the writer — a `Source`, so it is the mirror of a `Sink`:
+
+```python
+from tokenweir.postgres import PostgresSource
+
+source = PostgresSource(connection)    # refuses an autocommit connection
+written = source.write(batch)          # one transaction; returns the row count
+```
+
+**`Source.write` may raise, and that is the point.** `Sink.emit` must never raise
+because it sits on the metered request's critical path; `write` runs in a consumer,
+off that path, where a swallowed failure is silent data loss and a caller that can
+retry needs to know it must. The two halves of the pipeline have opposite failure
+rules on purpose, and each rule is wrong on the other side.
+
+A batch is validated **whole, before any statement is sent**, so one unwritable
+record cannot half-write the batch around it — and because the batch is one
+transaction, a consumer can ack after `write` returns knowing that either all of
+it is durable or none of it is. Batching *policy* (how many, how long to wait, what
+to do with a redelivery) belongs to the consumer that owns the broker, not here.
+
+A record with no `ts` is stamped by the **database**, not the client, so records
+written from different hosts share one clock.
+
+### Reading cost
+
+`gateway_usage` stores raw counts and **no cost column, ever**. Dollars are derived
+at report time by `gateway_usage_daily`, which joins the rate in force on the usage
+day, and which answers "I cannot tell you" rather than guessing:
+
+- `est_cost_usd` is **NULL for the whole group** unless *every* call in it priced
+  (`BOOL_AND`). A partial sum is always too low and, read on its own, looks exactly
+  like a complete one.
+- **Subscription usage is never priced.** Under a flat-rate Max subscription there
+  is no per-call dollar, so multiplying those tokens by an API rate card would
+  manufacture a figure nobody is billed. `pricing_mode` is one of the grouping
+  columns, so flat-rate usage does not blank out API-metered usage that genuinely
+  has a cost.
+- **A call that used cache tokens the rate card does not price is unpriced**, even
+  though its input and output rates are present. The cache rate columns are
+  nullable because not every model has cache pricing; treating a missing one as
+  zero would quietly report cached usage as free, which is the one direction an
+  estimate must never err in.
+- **A row with no `pricing_mode` is priced.** Only `subscription` is excluded, and
+  the comparison is `IS DISTINCT FROM`, so a NULL — a row written before the column
+  meant anything — is treated as ordinary API usage rather than silently dropped
+  from every cost figure.
+- Rate columns are named `*_usd_per_mtok`. The unit is in the name because a rate
+  card loaded against the wrong one is a thousand-fold error with nothing in the
+  data to reveal it.
+
+### Running the store tests
+
+The correctness tests for all of the above run against a **real Postgres** — this
+project does not mock a database, because a mocked one only proves the code calls
+the mock. There are two ways to give them one, and installing the dev extra is
+enough for the second:
+
+```bash
+pip install -e '.[dev]'          # brings pgserver: the suite starts its own server
+pytest
+
+createdb tokenweir_scratch       # or point it at a database you chose
+TOKENWEIR_TEST_DSN=postgresql:///tokenweir_scratch pytest
+```
+
+`pgserver` ships the PostgreSQL binaries in its wheel, so the embedded path needs
+no root, no `apt` and no Docker. `TOKENWEIR_TEST_DSN` wins when set — a developer
+who names a particular server means it. With neither, the suite **skips** with a
+message naming the variable, so installing only the core never turns red.
+
+Each test creates and drops its own schema, so the DSN may point at any scratch
+database without the suite colliding with an existing `gateway_usage`. What runs
+without a database — the migration set's shape, the two preserved fixes, the
+writer's mapping, and a syntax check against Postgres's own parser — runs always.
+Run the real-Postgres suite before believing a change to the runner or the SQL:
+the concurrency and adoption behaviours are only observable against a server.
+
 ## Develop
 
 ```bash

@@ -16,6 +16,15 @@ __pycache__/
 htmlcov/
 coverage.xml
 
+# Distribution output. Added by TOKWEIR-5, which builds a wheel to confirm the
+# migrations travel in it as package data — setuptools leaves a `build/` behind
+# when it does. Same reasoning as the coverage rules above: `tokenweir` is the
+# intended first open-source release (ADR-0001 Pillar 1), and regenerable build
+# output carrying absolute developer paths must not be one `git add -A` away from
+# the tree.
+build/
+dist/
+
 # Virtualenvs (the MADO stream plan builds .venv at /workspace/repo/.venv)
 .venv/
 venv/

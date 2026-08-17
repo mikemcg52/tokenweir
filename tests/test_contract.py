@@ -11,7 +11,9 @@ pricing modes and the published schema have their own files.
 import ast
 import dataclasses
 import json
+import re
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -224,46 +226,142 @@ def test_string_fields_are_never_normalized(name, value):
     assert getattr(UsageRecord.from_json(rec.to_json()), name) == value
 
 
-def _third_party_imports(path: Path) -> set:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-
-    imported_roots = set()
-    for node in ast.walk(tree):
+def _imported_roots(nodes) -> set:
+    roots = set()
+    for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                imported_roots.add(alias.name.split(".")[0])
+                roots.add(alias.name.split(".")[0])
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0 and node.module:
-                imported_roots.add(node.module.split(".")[0])
-
+                roots.add(node.module.split(".")[0])
     return {
-        name
-        for name in imported_roots
-        if name not in sys.stdlib_module_names and name != "tokenweir"
+        name for name in roots if name not in sys.stdlib_module_names and name != "tokenweir"
+    }
+
+
+def _deferred_nodes(tree):
+    """Nodes inside a function body — they run when called, not when imported."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for descendant in ast.walk(node):
+                if descendant is not node:
+                    yield descendant
+
+
+def _import_time_third_party_imports(path: Path) -> set:
+    """What a bare `pip install tokenweir` would have to satisfy.
+
+    Everything except function bodies: a class body and a top-level `if`/`try` do
+    execute at import time, so their imports count.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    deferred = {id(node) for node in _deferred_nodes(tree)}
+    return _imported_roots(node for node in ast.walk(tree) if id(node) not in deferred)
+
+
+def _deferred_third_party_imports(path: Path) -> set:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return _imported_roots(_deferred_nodes(tree))
+
+
+def _optional_extra_distributions() -> set:
+    """Import-name roots the project declares as **optional** extras.
+
+    `dev` is excluded on purpose: a test-only dependency has no business being
+    imported by library code at all, deferred or otherwise.
+    """
+    # From this test file, not from the package: an editable install and a real
+    # one put the package in different places relative to the project root, and
+    # only the test file is reliably beside it.
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("no pyproject.toml (e.g. an installed distribution)")
+    config = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    extras = config["project"]["optional-dependencies"]
+    return {
+        # "psycopg[binary]>=3" -> "psycopg". Crude, and adequate: these are this
+        # project's own extras, not arbitrary requirement strings.
+        re.split(r"[<>=!~\[; ]", requirement, maxsplit=1)[0].strip().replace("-", "_")
+        for name, requirements in extras.items()
+        if name != "dev"
+        for requirement in requirements
     }
 
 
 def _core_modules():
+    # rglob, not glob: since TOKWEIR-5 the package has a subpackage
+    # (`tokenweir.migrations`), and a top-level-only sweep would have exempted
+    # exactly the new code most likely to reach for a database driver.
     package_dir = Path(tokenweir.contract.__file__).parent
-    return sorted(package_dir.glob("*.py"))
+    return sorted(package_dir.rglob("*.py"))
+
+
+def _module_id(path: Path) -> str:
+    # Relative to the package root, so `migrations/__init__.py` is distinguishable
+    # from the package's own `__init__.py` in the test id.
+    return str(path.relative_to(Path(tokenweir.contract.__file__).parent))
 
 
 @pytest.mark.parametrize(
-    "module", _core_modules(), ids=lambda p: p.name
+    "module", _core_modules(), ids=_module_id
 )
 def test_core_modules_import_only_the_standard_library(module):
     # ADR-0001 Pillar 2: no transport and no provider SDK may enter the core, so
     # `pip install tokenweir` with no extras pulls in nothing (SC-005). Covers
     # every module in the package, not just contract.py.
-    third_party = _third_party_imports(module)
+    #
+    # Scoped to import time since TOKWEIR-5. A driver imported *inside the one
+    # function that connects* costs a bare install nothing, and that deferral is
+    # how an optional extra is supposed to be reached — `tokenweir.migrations`
+    # does it for psycopg and the AMQP adapter will do it for pika. The rule that
+    # actually matters is the one below: a deferred import must correspond to a
+    # declared extra, so "deferred" cannot become a way to smuggle in a hard
+    # dependency that merely fails later.
+    third_party = _import_time_third_party_imports(module)
     assert third_party == set(), f"{module.name} must stay stdlib-only; found {third_party}"
+
+
+@pytest.mark.parametrize("module", _core_modules(), ids=_module_id)
+def test_a_deferred_import_must_be_a_declared_optional_extra(module):
+    deferred = _deferred_third_party_imports(module)
+    declared = _optional_extra_distributions()
+    assert deferred <= declared, (
+        f"{module.name} defers an import of {sorted(deferred - declared)}, which is "
+        "not declared as an optional extra in pyproject.toml — a deferred import "
+        "still has to be installable by someone, and an undeclared one is a hard "
+        "dependency that fails at the call instead of at install"
+    )
+
+
+def test_the_deferred_import_check_is_not_vacuous():
+    # `tokenweir.migrations.connect` imports psycopg inside the function. If that
+    # ever stops being true — or the detector stops seeing it — the check above
+    # passes on every module for the wrong reason.
+    package_dir = Path(tokenweir.contract.__file__).parent
+    assert _deferred_third_party_imports(package_dir / "migrations" / "__init__.py") == {
+        "psycopg"
+    }
+    assert "psycopg" in _optional_extra_distributions()
 
 
 def test_core_module_sweep_actually_covers_the_package():
     # Guards the parametrization above: if the glob silently matched nothing, the
     # dependency-hygiene check would vacuously "pass".
-    names = {p.name for p in _core_modules()}
-    assert {"__init__.py", "contract.py", "sink.py", "source.py"} <= names
+    names = {_module_id(p) for p in _core_modules()}
+    assert {
+        "__init__.py",
+        "contract.py",
+        "sink.py",
+        "source.py",
+        # The store, added by TOKWEIR-5. Listed explicitly because these are the
+        # modules whose whole job is to talk to Postgres — they import the driver
+        # inside the one function that connects, and this sweep is what keeps it
+        # that way.
+        "postgres.py",
+        str(Path("migrations") / "__init__.py"),
+        str(Path("migrations") / "__main__.py"),
+    } <= names
 
 
 # --- TOKWEIR-4: the two error types are a documented distinction --------------
