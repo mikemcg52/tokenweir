@@ -440,8 +440,16 @@ observe that only the call that actually connects fails.
 - **SC-029**: `python -m tokenweir.migrations status` run as a **subprocess** exits 0 against a
   migrated database and prints no traceback. In-process `main()` calls cannot catch a broken
   `__main__` guard, which is the entry point SC-020 actually names.
-- **SC-030**: A connect failure whose DSN carries a password prints the failure without the password,
-  for a URL DSN, a keyword DSN and a malformed one alike.
+- **SC-030**: A connect failure whose DSN carries a password prints the failure without **any
+  whitespace-separated fragment** of that password — for a URL DSN, a keyword DSN and a malformed one
+  alike, and specifically for a password containing an unquoted space, which is where libpq quotes
+  half of it back. A DSN carrying no password keeps its full diagnostic text.
+
+  The fragment wording is the requirement, not a detail. The first version of this criterion said
+  "without the password", was checked against five DSNs that all placed the secret in a well-formed
+  position, and was recorded as met while `--dsn "host=h password=p4ss w0rd dbname=d"` printed
+  `missing "=" after "w0rd"`. A test that looks only for the whole secret cannot see a leak of part
+  of it.
 - **SC-031**: A **built wheel**, opened as an archive, contains all six `sql/*.sql` files. Reading an
   editable install or the `pyproject.toml` declaration cannot see a build that stops honouring a
   declaration that is still correct, and SC-001 is written about the installed package.
@@ -450,6 +458,14 @@ observe that only the call that actually connects fails.
   construction and nothing after it.
 - **SC-033**: Every cost-valued column in the shipped SQL ends in `_usd_per_mtok`, asserted with no
   database, so a rename in a later migration fails here rather than in a cost report.
+- **SC-034**: Adopting a state table that lacks `applied_at` leaves the pre-existing rows' timestamps
+  NULL, while rows this runner writes are still stamped. FR-042 forbids inventing a checksum for a
+  migration another tool ran; a timestamp is the same claim and a more convincing one, because it
+  reads as a record rather than a guess.
+- **SC-035**: The reader grant's no-op notice **reaches the client**, for both the unconfigured and
+  the nonexistent-role branch. Asserting that `RAISE NOTICE` appears in the SQL says nothing about
+  whether anything is delivered, and an undelivered notice makes a skipped grant silent — which
+  surfaces weeks later as a permission error in a dashboard.
 
 ### A deliberate asymmetry: what may be *described* and what may not
 

@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -233,14 +234,20 @@ def test_an_edited_released_migration_is_refused(migrated):
 def gateway_shaped_state_table(connection):
     """Reduce `schema_migrations` to the shape the AI Gateway's runner left it in.
 
-    The gateway recorded a version and a timestamp; `name` and `checksum` are this
-    runner's additions (FR-038). Dropping them here is how a test in a pod with no
-    gateway checkout gets a genuinely pre-existing state table rather than a
-    hand-written approximation of one — the rows above it were applied for real.
+    `name`, `checksum` and `applied_at` are all dropped: a state table from
+    another tool may be missing any of them, and leaving `applied_at` in place
+    meant the branch that adds it back was never exercised — which is where a
+    `DEFAULT now()` was quietly stamping the adoption instant onto rows somebody
+    else applied.
+
+    Dropping columns here is how a test in a pod with no gateway checkout gets a
+    genuinely pre-existing state table rather than a hand-written approximation of
+    one — the rows above it were applied for real.
     """
     with connection.cursor() as cursor:
         cursor.execute("ALTER TABLE schema_migrations DROP COLUMN checksum")
         cursor.execute("ALTER TABLE schema_migrations DROP COLUMN name")
+        cursor.execute("ALTER TABLE schema_migrations DROP COLUMN applied_at")
     connection.commit()
 
 
@@ -289,6 +296,29 @@ def test_adopted_rows_keep_a_null_checksum_and_are_not_drift(scratch_schema, mon
     # And the adopted rows do not make the next run refuse the database.
     assert pending(connection) == ()
     assert apply(connection) == ()
+
+
+def test_adoption_does_not_invent_an_applied_at_for_someone_elses_rows(
+    scratch_schema, monkeypatch
+):
+    """`ADD COLUMN … NOT NULL DEFAULT now()` back-fills, so adopting a state table
+    without `applied_at` stamped every pre-existing row with the instant of
+    adoption. A fabricated timestamp is worse than a fabricated checksum: it reads
+    as a record of when the migration ran, and nothing marks it as a guess."""
+    connect, _ = scratch_schema
+    connection = connect()
+
+    monkeypatch.setattr("tokenweir.migrations.discover", lambda: SHIPPED[:3])
+    apply(connection)
+    monkeypatch.undo()
+    gateway_shaped_state_table(connection)
+    apply(connection)
+
+    stamped = dict(fetch(connection, "SELECT version, applied_at FROM schema_migrations"))
+    assert [v for v, at in sorted(stamped.items()) if at is None] == [1, 2, 3]
+    assert all(stamped[v] is not None for v in (4, 5, 6)), (
+        "rows this runner wrote must still be timestamped"
+    )
 
 
 def test_status_can_still_describe_a_state_table_that_predates_us(
@@ -538,25 +568,47 @@ def test_the_module_entry_point_runs_as_a_command(postgres_dsn, scratch_schema, 
         "postgresql://u:{pw}@localhost:1/db",
         "postgresql://u:{pw}@localhost:1/db?bogus=1",
         "password={pw} bogus_key=1",
-        "not a dsn {pw}",
         "host=localhost password={pw} dbname=x sslmode=bogusvalue",
+        # The one that actually leaked. An unquoted space in a password is an
+        # ordinary typo; libpq parses up to it and then quotes the *next* token
+        # in its complaint — so the message carried half the password. Every
+        # earlier case here put the secret in a well-formed position, which is
+        # how sampling five DSNs pinned the samples instead of the property.
+        "host=h password={pw} dbname=d",
     ],
 )
-def test_a_failing_connection_does_not_echo_the_password(dsn, psycopg_module, capsys):
+@pytest.mark.parametrize(
+    "password", ["s3cr3t-do-not-log", "p4ss w0rd", "hunter2 hunter3"]
+)
+def test_a_failing_connection_does_not_echo_the_password(
+    dsn, password, psycopg_module, capsys
+):
     """A DSN carries a password and a connect failure is printed to stderr, which
-    on a deploy goes to a log somebody else can read. libpq quotes the offending
-    *keyword* rather than the value, but that is a property worth pinning rather
-    than assuming — the message is built by string interpolation of a driver
-    exception this project does not control."""
-    from tokenweir.migrations import __main__ as cli
+    on a deploy goes to a log somebody else can read.
 
-    password = "s3cr3t-do-not-log"
+    Asserted on every whitespace-separated *fragment* of the password, not the
+    whole string: the leak that got through was a fragment, and a test that only
+    looks for the whole thing cannot see one.
+    """
+    from tokenweir.migrations import __main__ as cli
 
     assert cli.main(["status", "--dsn", dsn.format(pw=password)]) == 1
     captured = capsys.readouterr()
+
     assert "error:" in captured.err
-    assert password not in captured.err
-    assert password not in captured.out
+    for fragment in password.split():
+        assert fragment not in captured.err, f"{fragment!r} reached stderr"
+        assert fragment not in captured.out
+
+
+def test_a_dsn_with_no_password_keeps_its_full_diagnostic(psycopg_module, capsys):
+    """Redaction is conservative enough to blank a hostname, so it must not apply
+    where there is nothing to hide — otherwise every operator debugging an
+    ordinary connection failure pays for a secret that was never there."""
+    from tokenweir.migrations import __main__ as cli
+
+    assert cli.main(["status", "--dsn", "postgresql://localhost:1/tokenweir"]) == 1
+    assert "***" not in capsys.readouterr().err
 
 
 # --- Grants: the fixtures the reader-role tests share -------------------------
@@ -569,32 +621,34 @@ def reader_role(scratch_schema, psycopg_module):
     Shared rather than inlined because two tests need it now: one asserting the
     grant lands, one asserting it is *not* silently lost. The second is only
     meaningful next to the first.
+
+    The name is **uniquified**, like the schema. A role is a cluster-global object
+    with no schema to hide in, so a fixed name means two suite runs against one
+    server collide: the second finds the role already there and skips its own
+    cleanup, while the first drops it out from under the second. FR-033's "each
+    test owns its objects" has to hold for the objects that are not schema-scoped
+    too.
     """
     connect, _ = scratch_schema
     connection = connect()
-    role = "tokenweir_test_reader"
+    role = f"tokenweir_test_reader_{uuid.uuid4().hex[:12]}"
 
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
-        exists = cursor.fetchone() is not None
-    if not exists:
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(f'CREATE ROLE "{role}" NOLOGIN')
-            connection.commit()
-        except psycopg_module.errors.InsufficientPrivilege:
-            connection.rollback()
-            pytest.skip("the test role cannot be created; CREATEROLE is not held")
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f'CREATE ROLE "{role}" NOLOGIN')
+        connection.commit()
+    except psycopg_module.errors.InsufficientPrivilege:
+        connection.rollback()
+        pytest.skip("the test role cannot be created; CREATEROLE is not held")
 
     try:
         yield role
     finally:
-        if not exists:
-            with connection.cursor() as cursor:
-                cursor.execute(f'REASSIGN OWNED BY "{role}" TO CURRENT_USER')
-                cursor.execute(f'DROP OWNED BY "{role}"')
-                cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
-            connection.commit()
+        with connection.cursor() as cursor:
+            cursor.execute(f'REASSIGN OWNED BY "{role}" TO CURRENT_USER')
+            cursor.execute(f'DROP OWNED BY "{role}"')
+            cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
+        connection.commit()
 
 
 def granted_relations(connection, role):
@@ -840,3 +894,29 @@ def test_a_role_that_does_not_exist_is_a_notice_not_a_failure(scratch_schema):
     connect, _ = scratch_schema
     connection = connect()
     assert len(apply(connection, reader_role="no_such_role_anywhere")) == 6
+
+
+@pytest.mark.parametrize(
+    "reader_role_argument, expected",
+    [(None, "no reader role configured"), ("no_such_role_anywhere", "does not exist")],
+    ids=["unconfigured", "nonexistent"],
+)
+def test_the_skipped_grant_actually_tells_the_operator(
+    scratch_schema, reader_role_argument, expected
+):
+    """FR-030 says the grant no-ops **with a notice**, and until now only the
+    string `RAISE NOTICE` in the SQL was checked — which passes whether or not
+    anything reaches the client. A notice nobody receives is a silent no-op, and
+    a silently skipped grant is exactly how an operator ends up debugging a
+    permission error in a dashboard weeks later.
+    """
+    connect, _ = scratch_schema
+    connection = connect()
+    received = []
+    connection.add_notice_handler(lambda diagnostic: received.append(diagnostic.message_primary))
+
+    apply(connection, reader_role=reader_role_argument)
+
+    assert any(expected in message for message in received), (
+        f"no notice mentioning {expected!r}; got {received}"
+    )

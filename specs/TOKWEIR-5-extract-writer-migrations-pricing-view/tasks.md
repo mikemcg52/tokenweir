@@ -181,9 +181,10 @@
       in-process. Added a `subprocess` test of the real entry point, which is the only thing that can
       catch a broken `__main__` guard.
 - [x] **T064** **Low** — the reviewer flagged as unverified whether a password-bearing DSN can reach
-      stderr through the connect-failure message. Checked five adversarial forms against psycopg:
-      libpq quotes the offending *keyword*, never the value. No leak — and now pinned by a test, since
-      the message interpolates a driver exception this project does not control.
+      stderr through the connect-failure message. Checked five adversarial forms against psycopg and
+      concluded "libpq quotes the offending *keyword*, never the value. No leak."
+      **That conclusion was wrong** — see T074. All five samples put the secret in a well-formed
+      password position, so the check pinned the samples rather than the property.
 
 ## Fix round 4 (review findings)
 
@@ -224,3 +225,36 @@
 - [x] **T073** Carried the TOKWEIR-10 hand-off — "diff this reconstructed DDL against the live
       `ai_gateway_metrics` schema before pointing the gateway at it" — onto the Jira issue itself,
       rather than leaving it only in this repo's spec folder.
+
+## Fix round 5 (review findings)
+
+- [x] **T074** **High** — SC-030 was false and T064 had recorded it closed. A password with an
+      unquoted space is an ordinary typo, and libpq then quotes the *next* token in its complaint:
+      `--dsn "host=h password=p4ss w0rd dbname=d"` printed `missing "=" after "w0rd"`. The naive fix
+      (mask the password value) cannot work, because the leaking case is precisely the one where the
+      DSN could not be parsed and has no reliable password value to extract. So the rule is the
+      conservative one: when a DSN carries a password at all, every word of it that is not a libpq
+      keyword is masked wherever it appears in the message. That over-masks — a hostname goes too —
+      which is the right direction for text printed to a deploy log. A DSN with no password keeps its
+      full diagnostic, pinned by its own test. The parametrization now includes the leaking form and
+      asserts on every whitespace-separated *fragment*, since the leak was a fragment.
+- [x] **T075** **Med** — adoption fabricated `applied_at`. `ADD COLUMN … NOT NULL DEFAULT now()`
+      back-fills, so adopting a state table without that column stamped every migration another tool
+      applied with the instant of adoption — the same invented claim FR-042 refuses to make about a
+      checksum, and a more convincing one, because a timestamp reads as a record. The column is now
+      added bare and its default set separately, so pre-existing rows keep NULL and rows this runner
+      writes are still stamped. The branch was untested because `gateway_shaped_state_table` dropped
+      only two of the three columns; it now drops all three.
+- [x] **T076** **Low** — the test reader role had a fixed cluster-global name, so two suite runs
+      against one server raced: the second found it existing and skipped cleanup while the first
+      dropped it. Uniquified like the schema.
+- [x] **T077** **Low** — `apply`'s docstring offered `advisory_lock=False` "for a store that has no
+      such lock", which does not exist: `_ensure_state_table` reads `to_regclass` and `pg_attribute`
+      regardless, and the migrations are Postgres DDL. Reworded to what the flag is actually for
+      (a caller serializing runs itself), and the blocking consequence of FR-012 documented — a
+      `status` health check now waits out a running `apply`, which is a wait, not a failure.
+- [x] **T078** **Low** — FR-030's notice was pinned by the string `RAISE NOTICE` in the SQL, which
+      holds whether or not anything reaches the client. Now asserted through psycopg's notice handler,
+      for both the unconfigured and the nonexistent-role branch.
+- [x] **T079** **Low** — documented that `PostgresSource.write` commits and rolls back the whole
+      connection, the same caveat the runner already states about itself.

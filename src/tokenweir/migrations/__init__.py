@@ -303,11 +303,17 @@ def _ensure_state_table(cursor: Any) -> None:
     the database. The ``ADD COLUMN IF NOT EXISTS`` statements below make taking
     over an existing table the ordinary path rather than a wall.
 
-    The adopted columns are **nullable**, because existing rows have no value to
-    give them and inventing one would be a lie about what was applied. A NULL
-    ``checksum`` means "applied before this runner recorded checksums"; :func:`pending`
-    reports those as unverifiable rather than as drift. A table this runner creates
-    itself keeps ``NOT NULL``, since every row it inserts carries both.
+    The adopted columns are **nullable and not back-filled**, because existing
+    rows have no value to give them and inventing one would be a lie about what
+    was applied. A NULL ``checksum`` means "applied before this runner recorded
+    checksums"; :func:`pending` reports those as unverifiable rather than as
+    drift. NULL ``applied_at`` means the same thing about the time — which is why
+    the column is added bare and its default set separately, since
+    ``ADD COLUMN … DEFAULT now()`` would stamp every pre-existing row with the
+    moment of adoption and make it look like a record rather than a guess.
+
+    A table this runner creates itself keeps ``NOT NULL`` on all three, since
+    every row it inserts carries them.
     """
     cursor.execute(
         f"""
@@ -330,17 +336,29 @@ def _ensure_state_table(cursor: Any) -> None:
         (SCHEMA_MIGRATIONS_TABLE,),
     )
     present = {row[0] for row in cursor.fetchall()}
-    for column, definition in (
+    for column, column_type in (
         ("name", "TEXT"),
         ("checksum", "TEXT"),
-        ("applied_at", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
+        ("applied_at", "TIMESTAMPTZ"),
     ):
         if column in present:
             continue
+        # Added bare, with no ``NOT NULL DEFAULT now()``. Postgres back-fills a
+        # default into existing rows, which for ``applied_at`` would stamp every
+        # migration another tool applied with the instant we adopted it — the
+        # same invented claim this function refuses to make about a checksum, and
+        # a more convincing one because a timestamp looks like a record.
         cursor.execute(
             f"ALTER TABLE {SCHEMA_MIGRATIONS_TABLE} "
-            f"ADD COLUMN IF NOT EXISTS {column} {definition}"
+            f"ADD COLUMN IF NOT EXISTS {column} {column_type}"
         )
+        if column == "applied_at":
+            # Rows *this* runner writes from here on do get a timestamp; setting
+            # the default afterwards applies it to future inserts only.
+            cursor.execute(
+                f"ALTER TABLE {SCHEMA_MIGRATIONS_TABLE} "
+                "ALTER COLUMN applied_at SET DEFAULT now()"
+            )
 
 
 def applied_versions(
@@ -543,9 +561,19 @@ def apply(
             visible where the call is, not in a config file somebody set last year.
         advisory_lock: serialize concurrent runs with a session-level Postgres
             advisory lock. Two deploys racing otherwise both try to create the
-            same objects. Pass ``False`` for a store that has no such lock — the
-            caller is then responsible for not running two migrators at once, and
-            gets a warning saying so rather than a silent downgrade.
+            same objects. Pass ``False`` when the caller is serializing the runs
+            itself — a deploy tool holding its own lease, say — and accepts
+            responsibility for not running two migrators at once; it gets a
+            warning rather than a silent downgrade. It is **not** an escape hatch
+            for a non-Postgres store: :func:`_ensure_state_table` reads
+            ``to_regclass`` and ``pg_attribute`` regardless, and the migrations
+            themselves are Postgres DDL.
+
+            Note that the lock is taken by :func:`status` and :func:`pending` too,
+            and it blocks: a health check calling ``status`` against a database a
+            long ``apply`` is migrating will wait for that ``apply`` to finish.
+            That is the cost of FR-012 — on a fresh database the reader is a
+            creator too — and it is a wait, not a failure.
         verify_checksums: see :func:`pending`.
 
     Raises:

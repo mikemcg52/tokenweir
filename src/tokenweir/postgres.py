@@ -210,6 +210,12 @@ class PostgresSource:
     independently, which is precisely the guarantee a consumer acking after the
     batch relies on not being true.
 
+    **This object owns the connection's transaction boundaries.** :meth:`write`
+    commits on success and rolls back on failure, so anything else in flight on
+    that connection commits with the batch or is lost with it. Give it a
+    connection of its own; a writer that shares one with application work has
+    already given up the atomicity this class exists to provide.
+
     Ownership: a connection you pass in stays yours, and :meth:`close` leaves it
     open. One opened by :meth:`from_dsn` is closed by :meth:`close`.
     """
