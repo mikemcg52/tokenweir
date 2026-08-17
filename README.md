@@ -300,7 +300,9 @@ The rules the extraction preserved, as behaviour rather than convention:
   a per-call argument on purpose: the decision belongs where a reviewer reads it.
 - **Idempotent and atomic.** Applying an up-to-date database does nothing; each
   migration commits together with its `schema_migrations` row, so a failure leaves
-  neither; concurrent runs are serialized by an advisory lock.
+  neither; concurrent runs are serialized by an advisory lock, which every entry
+  point takes — `status` and `apply` racing on a fresh database is the ordinary
+  case, since whichever arrives first is the one that creates `schema_migrations`.
 - **A database ahead of the library is refused** rather than migrated on top of.
 
 #### Taking over a database the gateway already migrated
@@ -349,7 +351,7 @@ diagnosis, not for making the disagreement go away.
 ```python
 from tokenweir.postgres import PostgresSource
 
-source = PostgresSource(connection)
+source = PostgresSource(connection)    # refuses an autocommit connection
 written = source.write(batch)          # one transaction; returns the row count
 ```
 

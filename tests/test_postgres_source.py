@@ -2,8 +2,8 @@
 
 Everything here runs with **no database and no driver**. That is deliberate:
 `row_for`/`rows_for` and `INSERT_SQL` were factored out as pure values precisely
-so the parts of the writer that can be checked without a server are, in the
-environment this project's suite actually runs in.
+so the parts of the writer that can be checked without a server are checked on a
+bare install, where the real-Postgres suite skips.
 
 What is *not* here is whether Postgres accepts the statement or stores the values
 faithfully. That is `test_postgres_integration.py`, against a real server, with no
@@ -305,6 +305,31 @@ def test_a_generator_of_records_is_accepted():
     conn = RecordingConnection()
     written = PostgresSource(conn).write(make_record() for _ in range(2))
     assert written == 2
+
+
+# --- The connection it will accept --------------------------------------------
+
+
+def test_an_autocommit_connection_is_refused():
+    """FR-016's "one transaction per batch" is not a property of this class alone
+    — an autocommit connection makes every row durable on its own, so a failure
+    partway leaves a partial batch and the consumer's ack becomes a lie. The
+    docstring said so and nothing enforced it; a silent loss of atomicity shows up
+    as occasional partial data long after anyone would connect it to this."""
+    conn = RecordingConnection()
+    conn.autocommit = True
+
+    with pytest.raises(ValueError, match="autocommit"):
+        PostgresSource(conn)
+
+
+def test_a_connection_with_no_notion_of_autocommit_is_accepted():
+    """`autocommit` is psycopg's attribute, not DB-API's. A connection that does
+    not have one is not in autocommit mode, and must not be refused for lacking a
+    property it was never obliged to have."""
+    conn = RecordingConnection()
+    assert not hasattr(conn, "autocommit")
+    assert PostgresSource(conn).write([make_record()]) == 1
 
 
 # --- Ownership and close() ----------------------------------------------------

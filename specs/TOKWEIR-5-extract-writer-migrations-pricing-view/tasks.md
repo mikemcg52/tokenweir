@@ -124,3 +124,37 @@
       rate ⇒ unpriced, and NULL `pricing_mode` ⇒ priceable (spec US3, README).
 - [x] **T050** **Low** — the `verify_checksums=False` escape hatch documented in README; `status()`
       no longer reads `schema_migrations` twice, so both halves of its answer come from one snapshot.
+
+## Fix round 2 (review findings)
+
+- [x] **T051** **High** — T043 fixed `apply` and left the reader path unlocked. `status`,
+      `pending` and `applied_versions` all reach `_ensure_state_table`, so a health check's `status`
+      against a fresh database still killed a concurrent deploy with a catalog `UniqueViolation`
+      (reproduced 3/3 barrier-synchronised). The lock now lives in a `_advisory_lock` context manager
+      that every entry point takes; `apply` passes `advisory_lock=False` inward rather than relying on
+      Postgres reference-counting re-entry. SC-006 now races `status`+`apply` and `status`+`status`,
+      not only two writers (FR-012).
+- [x] **T052** **Med** — `BOOL_AND`, the story's named fix, had no behavioural test: swapping in
+      `BOOL_OR` left all 27 real-Postgres tests green because every group in the suite was uniformly
+      priced or uniformly not, and the two agree on uniform groups. Added the one shape that can tell
+      them apart — one priced call and one cache-unpriced call in the same group — and verified the
+      mutation now fails (FR-025, SC-027).
+- [x] **T053** **Med** — T047 corrected the "no usable Postgres" claim in two places and left it
+      standing in five: `plan.md`'s environment facts and the docstrings of four test modules, plus a
+      claim that the `pglast` check is skipped here. All corrected; `README`'s advisory-lock line
+      narrowed to what is now true.
+- [x] **T054** **Low** — the FR-030 grant check read a hardcoded list of three relations, the same
+      hole T045 closed for the column scan. Now derived from every `CREATE TABLE`/`VIEW` in the
+      shipped SQL, with an anti-vacuity test proving a 007 that forgets its grant is caught.
+- [x] **T055** **Low** — `_ensure_state_table` probed nothing and issued three
+      `ALTER TABLE … ADD COLUMN IF NOT EXISTS` on every call, each taking `ACCESS EXCLUSIVE` as a
+      no-op. It now reads `pg_attribute` first and alters only what is missing, so the steady state
+      issues no DDL.
+- [x] **T056** **Low** — every CLI test stubbed `connect`, so argparse-through-psycopg-to-a-server was
+      never run. Added real-driver integration tests for `apply`, re-`apply`, `status` and a drifted
+      database (FR-013, SC-020, SC-022).
+- [x] **T057** **Low** — `PostgresSource` documented that the connection must not be in autocommit and
+      enforced nothing. It now refuses one, because losing atomicity silently is worse than being
+      told (FR-016).
+- [x] **T058** **Low** — `status` gained `--verify-checksums`: FR-038 only requires the opt-*out*, but
+      the command line was the one place an operator could never see drift.

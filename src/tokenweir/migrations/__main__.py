@@ -86,8 +86,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser(
+    status_parser = sub.add_parser(
         "status", help="show applied and pending migrations.", parents=[common]
+    )
+    status_parser.add_argument(
+        "--verify-checksums",
+        action="store_true",
+        help=(
+            "also check that every applied migration still matches the shipped "
+            "file, and fail if one does not. Off by default so that a drifted "
+            "database can still be described; on, this is the only way to notice "
+            "the drift from the command line."
+        ),
     )
 
     apply_parser = sub.add_parser(
@@ -156,7 +166,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if args.command == "status":
-            done, outstanding = status(connection)
+            done, outstanding = status(
+                connection, verify_checksums=args.verify_checksums
+            )
             print(f"shipped:  {_iter_versions(shipped)}")
             print(f"applied:  {_iter_versions(done)}")
             print(f"pending:  {_iter_versions(outstanding)}")

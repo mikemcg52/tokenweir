@@ -275,11 +275,14 @@ observe that only the call that actually connects fails.
 - **FR-011**: The runner MUST take a **DB-API connection**, not a DSN, so it works with any driver and
   is testable without one. A DSN-based convenience MUST exist separately.
 - **FR-012**: The runner MUST serialize concurrent runs with an advisory lock. The lock MUST be
-  acquired **before any statement that reads or creates `schema_migrations`**. Creating that table is
-  itself part of the race: Postgres's `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent
-  creation, so a runner that reads pending state first leaves the one statement that must be
-  serialized outside the serialization, and two deploys against a fresh database collide on the system
-  catalog. `pg_advisory_lock` requires no table, so nothing forces the other order.
+  acquired **before any statement that reads or creates `schema_migrations`**, on **every entry point
+  that can reach one** — `apply`, `status`, `pending` and `applied_versions` alike, not only the one
+  that writes. Creating that table is itself the race: Postgres's `CREATE TABLE IF NOT EXISTS` is not
+  atomic against a concurrent creation, and on a fresh database the table is created by whichever call
+  arrives first, which on a deploying cluster is as likely to be a health check's `status` as the
+  deploy's `apply`. Locking only the writer leaves a reader able to kill a deploy — and leaves the
+  reader itself raising, which is the "refused a description of the database" outcome FR-038 and
+  FR-042 exist to prevent. `pg_advisory_lock` requires no table, so nothing forces the other order.
 - **FR-013**: The runner MUST be usable as a command (`python -m tokenweir.migrations`) with at least
   `apply` and `status`, mirroring the `scripts/migrate.py` it replaces. Its connection options MUST be
   accepted on **either side of the subcommand** — `... status --dsn X` is the form anyone writes
@@ -310,6 +313,11 @@ observe that only the call that actually connects fails.
 - **FR-015**: `PostgresSource` MUST implement the existing `Source` protocol (`write`, `close`) without
   changing it.
 - **FR-016**: `write` MUST persist a batch in one transaction and return the number of rows written.
+  It MUST **refuse an autocommit connection** rather than document the requirement: autocommit makes
+  each row durable on its own, so a mid-batch failure leaves a partial batch and a consumer's
+  ack-after-`write` becomes a false claim. The symptom is occasional partial data, arriving long after
+  anything would connect it back to the connection setting, which is exactly the class of thing that
+  belongs in a constructor's refusal rather than a docstring.
 - **FR-017**: `write` MUST raise on store failure. The write side is off the critical path and a
   swallowed failure there is silent data loss; this is the deliberate opposite of `Sink.emit`.
 - **FR-018**: `write` MUST validate the whole batch and raise **before** opening a transaction if any
@@ -406,7 +414,14 @@ observe that only the call that actually connects fails.
 - **SC-006**: Two migrators run concurrently against one database and produce one set of applied rows.
   Asserted against a **real server** against an **empty** database, which is the case that fails when
   the lock is taken too late — with `schema_migrations` already present the race closes on its own and
-  a test that starts from a migrated database reports success either way.
+  a test that starts from a migrated database reports success either way. The pairs raced MUST include
+  a **reader against a writer** (`status` + `apply`) and two readers, not only two writers: racing two
+  `apply`s alone passes while a concurrent `status` still kills the deploy.
+- **SC-027**: A single group containing one priced call and one call whose cache tokens the rate card
+  does not price reports `is_priced = false` and `est_cost_usd = NULL`. This is the only group shape
+  that distinguishes `BOOL_AND` from `BOOL_OR` — the rate and `pricing_mode` are constant within a
+  group, so every uniform group agrees under either — and without it the story's named fix is pinned
+  by a string search alone.
 - **SC-026**: A database whose `schema_migrations` has no `checksum` column is adopted: `apply`
   applies only what is genuinely missing, `status` describes it rather than raising, the pre-existing
   rows keep a NULL checksum, and a later run does not read those NULLs as drift. Asserted against a

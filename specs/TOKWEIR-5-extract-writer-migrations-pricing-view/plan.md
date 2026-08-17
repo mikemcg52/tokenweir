@@ -25,12 +25,17 @@ from the repo root with `CI=true`; exit codes 0 and 5 pass.
 1. **No `ai-gateway` checkout.** The DDL is reconstructed from ADR-0001 and from
    `tokenweir.contract`'s v1 field set. A test pins the table's columns to the contract's fields so
    the two cannot drift apart unnoticed.
-2. **No usable Postgres.** Not installed, not in apt, no root, no Docker; the data VM's 5432 is
-   production and off-limits. Everything that can be verified without a server is, and the rest is
-   gated behind `TOKENWEIR_TEST_DSN` and skips.
+2. **A Postgres is available, and the first draft of this plan wrongly said otherwise.** No server is
+   installed, none is in apt, there is no root and no Docker, and the data VM's 5432 is production and
+   off-limits — but `pgserver` ships the server binaries in its wheel and needs none of those things.
+   The real-Postgres suite runs here. It stays gated behind `TOKENWEIR_TEST_DSN` *or* an importable
+   `pgserver` (`dev` extra only), so a core-only install still skips rather than going red.
 
-Fact 2 is what makes the SQL-text tests load-bearing rather than decorative: they are the only
-mechanism by which the preserved fixes are enforced in the environment the project actually tests in.
+Fact 2 is why the SQL-text tests are a **second line** rather than the only one. They remain
+load-bearing for anyone running a bare install, and they catch a reverted fix with no server at all —
+but they are not a substitute for behaviour. Two findings in this story's own review make the point:
+a concurrency defect only a real server could show, and a `BOOL_AND` that a string grep "covered"
+while `BOOL_OR` passed every behavioural test in the suite.
 
 ## Design decisions
 

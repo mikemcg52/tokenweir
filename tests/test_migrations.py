@@ -9,8 +9,14 @@ depends on it doing so.
 That distinction is the project's real-Postgres test pattern, not an exception to
 it. Whether the DDL is *correct* is asserted against a live server in
 `test_postgres_integration.py`; whether the runner *sequences* it correctly is a
-property of this module and is asserted here — where it can be checked in an
-environment with no database, which is the environment this suite runs in.
+property of this module and is asserted here — where it can be checked with no
+database, so a bare install still holds the line.
+
+Sequencing is not the same as safety, and this module cannot tell the difference.
+The statement order it pins looked correct while `CREATE TABLE IF NOT EXISTS
+schema_migrations` was being issued outside the advisory lock, because whether two
+sessions collide is a fact about Postgres, not about the order one session emits
+statements in. That defect was caught by the integration suite; run it.
 """
 
 import logging

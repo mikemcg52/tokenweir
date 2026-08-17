@@ -4,12 +4,16 @@ TOKWEIR-5 says "keep the `DATE_TRUNC` STABLE/IMMUTABLE and `is_priced`/`BOOL_AND
 fixes", and "forward-only, no DROP-without-review preserved". A fix kept only as a
 comment is a fix waiting to be reverted, so each of them is a test here.
 
-These read the SQL text and **need no database**. That is not a convenience: this
-project's automated test environment has no Postgres and cannot get one (not
-installed, not packaged for the pod, no root, no Docker), so the real-Postgres
-suite in `test_postgres_integration.py` skips there. These assertions are
-therefore the only thing standing between a future edit and a silently
-reintroduced bug in the environment where the suite actually runs.
+These read the SQL text and **need no database**, so they hold on a bare
+`pip install -e .` where the real-Postgres suite skips.
+
+They are a second line, not the only one, and the difference matters. An earlier
+draft of this suite claimed no Postgres could be had here; it could (`pgserver`,
+see `tests/conftest.py`), and `test_postgres_integration.py` now runs. Reading the
+SQL proves a fix is still *written*, never that it *works*: `BOOL_AND` was
+"covered" by a grep in this file while every behavioural test passed with
+`BOOL_OR` substituted. Add the behavioural test in the integration suite; keep
+these for the environment that has no server.
 
 Every check strips comments first. Without that, the prose above each migration —
 which necessarily names `DATE_TRUNC` in order to explain why it is not used — would
@@ -27,7 +31,11 @@ from pathlib import Path
 import pytest
 
 from tokenweir.contract import UsageRecord
-from tokenweir.migrations import destructive_statements, discover
+from tokenweir.migrations import (
+    SCHEMA_MIGRATIONS_TABLE,
+    destructive_statements,
+    discover,
+)
 from tokenweir.postgres import COLUMNS as INSERT_COLUMNS
 
 #: Same shapes the runner strips. Duplicated deliberately rather than imported:
@@ -376,17 +384,55 @@ def test_the_writer_inserts_every_contract_field(gateway_usage_columns):
 # --- Grants (FR-030) ----------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "relation", ["gateway_usage", "model_pricing_rates", "gateway_usage_daily"]
-)
-def test_every_created_relation_is_granted_to_the_reader_role(relation, code_by_filename):
+def _created_relations(code_by_filename):
+    """Every table and view the shipped migrations create.
+
+    Derived, not listed. A hardcoded trio passes forever once it is written, so a
+    `007` creating a relation and forgetting its grant would sail through the very
+    check meant to catch it — the same hole `_gateway_usage_columns` had.
+    """
+    relations: set[str] = set()
+    for sql in code_by_filename.values():
+        for match in re.finditer(
+            r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|MATERIALIZED\s+VIEW)\s+"
+            r"(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)",
+            sql,
+            re.IGNORECASE,
+        ):
+            relations.add(match.group(1))
+    return relations - {SCHEMA_MIGRATIONS_TABLE}
+
+
+def _ungranted(code_by_filename):
+    everything = "\n".join(code_by_filename.values())
+    return sorted(
+        relation
+        for relation in _created_relations(code_by_filename)
+        if not re.search(
+            rf"GRANT\s+SELECT\s+ON\s+{relation}\s+TO", everything, re.IGNORECASE
+        )
+    )
+
+
+def test_every_created_relation_is_granted_to_the_reader_role(code_by_filename):
     """Postgres grants nothing to other roles by default, so a relation with no
     grant migration is invisible to the reporting role — and the first anyone
     hears of it is a permission error in a dashboard."""
-    everything = "\n".join(code_by_filename.values())
-    assert re.search(
-        rf"GRANT\s+SELECT\s+ON\s+{relation}\s+TO", everything, re.IGNORECASE
-    ), f"no reader grant for {relation}"
+    found = _created_relations(code_by_filename)
+    assert found >= {"gateway_usage", "model_pricing_rates", "gateway_usage_daily"}, (
+        f"the scan lost track of a known relation; found {sorted(found)}"
+    )
+    assert _ungranted(code_by_filename) == []
+
+
+def test_the_grant_check_reaches_a_relation_added_later(code_by_filename):
+    """Anti-vacuity guard, mirroring the one on the column scan: a migration that
+    creates a relation without granting it must be *caught*, not merely absent
+    from a list somebody remembered to extend."""
+    hypothetical = dict(code_by_filename)
+    hypothetical["007_audit_log.sql"] = "CREATE TABLE IF NOT EXISTS audit_log (id BIGSERIAL);"
+
+    assert _ungranted(hypothetical) == ["audit_log"]
 
 
 def test_the_grants_degrade_rather_than_fail_without_a_role(code_by_filename):
@@ -422,10 +468,9 @@ def test_the_shipped_sql_parses_as_postgres(migrations):
     that it does the right thing, and semantic errors (a column that does not
     exist, a STABLE expression in an index) are invisible to it.
 
-    Skipped where pglast is absent, which includes this project's automated
-    environment — it is in the `dev` extra, not a hard dependency, because a
-    compiled parser is a heavy thing to require of someone who only wants to
-    import the contract.
+    Skipped where pglast is absent — it is in the `dev` extra, not a hard
+    dependency, because a compiled parser is a heavy thing to require of someone
+    who only wants to import the contract. `pip install -e '.[dev]'` runs it.
     """
     pglast = pytest.importorskip(
         "pglast", reason="pglast is not installed (`pip install -e '.[dev]'`)"

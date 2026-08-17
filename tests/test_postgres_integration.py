@@ -5,18 +5,25 @@ server and no database mocking, per the project's pattern, and they **skip** wit
 a message naming `TOKENWEIR_TEST_DSN` when none is configured — see
 `tests/conftest.py`.
 
-Read that skip honestly: this project's automated environment has no Postgres and
-cannot get one, so in CI this file contributes skips rather than passes. What is
-asserted here — the SQL Postgres actually accepts, the rollup's arithmetic, the
-transactional behaviour — is asserted **nowhere else**, because faking it would
-only assert that the code calls the fake. The compensating control is
-`test_migration_sql.py`, which pins the properties that can be read off the text
-in an environment with no server; it is not a substitute for this file and is not
-offered as one.
+A bare `pip install -e .` skips this file. `pip install -e '.[dev]'` does not:
+`pgserver` ships the server binaries in its wheel, so `conftest.py` starts a
+throwaway PostgreSQL with no root, no apt and no Docker. An earlier draft of this
+story recorded "no usable Postgres" as an environment fact and never tested the
+claim; **run this file before believing a change to the runner or the SQL.** Two
+of this story's review findings were only visible here — a concurrency defect the
+statement-order tests could not see, and a `BOOL_AND` that a string grep declared
+covered while `BOOL_OR` passed everything else.
+
+What is asserted here — the SQL Postgres actually accepts, the rollup's
+arithmetic, the transactional and concurrent behaviour — is asserted **nowhere
+else**, because faking it would only assert that the code calls the fake.
+`test_migration_sql.py` is a second line for the bare-install case, not a
+substitute for this file, and is not offered as one.
 
 To run them:
 
-    createdb tokenweir_scratch
+    pip install -e '.[dev]' && pytest tests/test_postgres_integration.py
+    # or against a server you chose:
     TOKENWEIR_TEST_DSN=postgresql:///tokenweir_scratch pytest tests/test_postgres_integration.py
 """
 
@@ -159,6 +166,45 @@ def test_two_migrators_racing_produce_one_set_of_rows(scratch_schema):
     assert set(applied_versions(first)) == {1, 2, 3, 4, 5, 6}
     counts = fetch(first, "SELECT version, count(*) FROM schema_migrations GROUP BY version")
     assert all(count == 1 for _, count in counts)
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [("status", "apply"), ("status", "status"), ("apply", "status")],
+    ids=["status+apply", "status+status", "apply+status"],
+)
+def test_a_concurrent_reader_does_not_collide_with_a_migrator(scratch_schema, operations):
+    """Racing two `apply`s is not enough to pin FR-012.
+
+    On a *fresh* database, whichever call arrives first is the one that creates
+    `schema_migrations` — and on a deploying cluster that is as likely to be a
+    health check's `status` as the deploy's own `apply`. With the lock held only
+    by `apply`, a concurrent `status` made the *apply* die on a catalog
+    duplicate-key error, and a `status` that raises is itself the "refused a
+    description of the database" outcome FR-038 and FR-042 exist to prevent.
+
+    Barrier-synchronised so both sides reach the create at the same moment; the
+    window is small enough that unsynchronised threads miss it.
+    """
+    connect, _ = scratch_schema
+    barrier = threading.Barrier(len(operations))
+    errors = []
+
+    def run(operation):
+        connection = connect()
+        try:
+            barrier.wait(timeout=30)
+            apply(connection) if operation == "apply" else status(connection)
+        except Exception as exc:  # pragma: no cover - a failure here is the finding
+            errors.append(f"{operation}: {type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=run, args=(op,)) for op in operations]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
 
 
 def test_a_database_ahead_of_the_library_is_refused(migrated):
@@ -383,6 +429,58 @@ def test_a_token_count_beyond_a_32_bit_integer_is_storable(migrated):
     assert fetch(migrated, "SELECT input_tokens FROM gateway_usage")[0][0] == 2**31 + 7
 
 
+# --- The command line, against a real driver (FR-013) -------------------------
+
+
+def test_the_cli_applies_and_reports_against_a_real_database(
+    scratch_schema, postgres_dsn, monkeypatch, capsys
+):
+    """Every other CLI test stubs `connect`, so the one path an operator actually
+    runs — argparse through psycopg to a server — was never exercised end to end.
+
+    `PGOPTIONS` rather than a fixture connection: the CLI opens its own, so the
+    scratch schema has to reach it through libpq's own environment.
+    """
+    from tokenweir.migrations import __main__ as cli
+
+    _, schema = scratch_schema
+    monkeypatch.setenv("PGOPTIONS", f"-c search_path={schema}")
+
+    assert cli.main(["apply", "--dsn", postgres_dsn]) == 0
+    assert "006_gateway_usage_app_day_index.sql" in capsys.readouterr().out
+
+    # Re-applying is a no-op, and `status` describes what happened.
+    assert cli.main(["--dsn", postgres_dsn, "apply"]) == 0
+    assert "already up to date" in capsys.readouterr().out
+
+    assert cli.main(["status", "--dsn", postgres_dsn, "--verify-checksums"]) == 0
+    out = capsys.readouterr().out
+    assert "pending:  (none)" in out
+    assert "001_gateway_usage.sql" in out
+
+
+def test_the_cli_reports_a_drifted_database_without_a_traceback(
+    scratch_schema, postgres_dsn, monkeypatch, capsys
+):
+    """FR-013 and FR-038 meeting: the operator asked to be told about drift, and
+    what they get is one line and a non-zero exit."""
+    from tokenweir.migrations import __main__ as cli
+
+    connect, schema = scratch_schema
+    connection = connect()
+    apply(connection)
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 1")
+    connection.commit()
+
+    monkeypatch.setenv("PGOPTIONS", f"-c search_path={schema}")
+
+    assert cli.main(["status", "--dsn", postgres_dsn, "--verify-checksums"]) == 1
+    captured = capsys.readouterr()
+    assert "001_gateway_usage.sql" in captured.err
+    assert "Traceback" not in captured.err
+
+
 # --- The rollup (US3) ---------------------------------------------------------
 
 
@@ -460,6 +558,47 @@ def test_cache_tokens_without_a_cache_rate_make_a_call_unpriced(migrated):
     row = rollup(migrated)[("mado", "2026-08-15", "claude-opus-5", None)]
     assert row[0] is False
     assert row[1] is None
+
+
+def test_a_mixed_group_is_blanked_by_its_one_unpriced_call(migrated):
+    """The `BOOL_AND` fix, asserted on the only shape that can distinguish it.
+
+    Every other rollup test builds groups whose calls are *uniformly* priced or
+    uniformly not — a missing rate and a `subscription` mode are both constant
+    within a group, because the rate is resolved per `(model, usage_day)` and
+    `pricing_mode` is a grouping key. On uniform groups `BOOL_AND` and `BOOL_OR`
+    agree, so swapping one for the other left the whole real-Postgres suite green
+    and only a string grep objected.
+
+    A group can be genuinely mixed only through the cache-token clauses. This is
+    that group: two calls, same app/day/model/mode, one priced outright and one
+    using cache reads the rate card does not price. Under `BOOL_OR` it reports
+    $15 with the cached tokens silently free — a number that is too low and reads
+    exactly like a complete one, which is the failure the fix exists to prevent.
+    """
+    price(migrated, "claude-opus-5", "2026-01-01", Decimal("15"), Decimal("75"))
+    PostgresSource(migrated).write(
+        [
+            make_record(
+                request_id="req-priced",
+                input_tokens=1_000_000,
+                ts="2026-08-15T01:00:00Z",
+            ),
+            make_record(
+                request_id="req-cache",
+                cache_read_input_tokens=1_000_000,
+                ts="2026-08-15T02:00:00Z",
+            ),
+        ]
+    )
+
+    is_priced, est_cost, calls = rollup(migrated)[
+        ("mado", "2026-08-15", "claude-opus-5", None)
+    ][:3]
+
+    assert calls == 2, "the two calls must land in one group or this proves nothing"
+    assert is_priced is False
+    assert est_cost is None
 
 
 def test_subscription_usage_is_never_priced(migrated):

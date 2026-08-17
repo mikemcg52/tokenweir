@@ -193,6 +193,23 @@ class PostgresSource:
     """
 
     def __init__(self, connection: Any, *, owns_connection: bool = False) -> None:
+        # An autocommit connection silently breaks the one-transaction-per-batch
+        # guarantee the docstring above promises and that a consumer acking after
+        # `write` depends on: each row would become durable on its own, so a
+        # mid-batch failure would leave a partial batch behind and the ack would
+        # be a lie. Refused rather than documented, because the symptom is
+        # occasional partial data long after the decision.
+        #
+        # `getattr` with a default: `autocommit` is a psycopg attribute, not a
+        # DB-API one, and a connection that has no such notion is not in
+        # autocommit mode.
+        if getattr(connection, "autocommit", False):
+            raise ValueError(
+                "PostgresSource needs a connection that is not in autocommit "
+                "mode: it commits each batch itself, and autocommit would make "
+                "rows durable one at a time, so a failure partway through would "
+                "leave part of a batch written. Set connection.autocommit = False."
+            )
         self._connection = connection
         self._owns_connection = owns_connection
         self._closed = False

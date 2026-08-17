@@ -44,9 +44,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import resources
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 __all__ = [
     "ADVISORY_LOCK_KEY",
@@ -247,31 +248,54 @@ def _ensure_state_table(cursor: Any) -> None:
         )
         """
     )
+    # Probe first, then alter only what is missing. The ``ADD COLUMN IF NOT
+    # EXISTS`` statements are cheap but not free: each takes ACCESS EXCLUSIVE on
+    # the table even when it does nothing, and this runs on every `status` too.
+    # In the steady state — which is every run after the first — the probe finds
+    # all three and this path issues no DDL at all.
+    cursor.execute(
+        "SELECT attname FROM pg_attribute "
+        "WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped",
+        (SCHEMA_MIGRATIONS_TABLE,),
+    )
+    present = {row[0] for row in cursor.fetchall()}
     for column, definition in (
         ("name", "TEXT"),
         ("checksum", "TEXT"),
         ("applied_at", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
     ):
+        if column in present:
+            continue
         cursor.execute(
             f"ALTER TABLE {SCHEMA_MIGRATIONS_TABLE} "
             f"ADD COLUMN IF NOT EXISTS {column} {definition}"
         )
 
 
-def applied_versions(connection: Any) -> dict[int, Optional[str]]:
+def applied_versions(
+    connection: Any, *, advisory_lock: bool = True
+) -> dict[int, Optional[str]]:
     """Return ``{version: checksum}`` for everything the database has applied.
 
     Creates ``schema_migrations`` if it does not exist, so a fresh database
     answers ``{}`` rather than raising. A version whose checksum is ``None`` was
     applied by something that did not record one — see :func:`_ensure_state_table`.
+
+    Args:
+        advisory_lock: hold the migration advisory lock while creating and reading
+            the table. On by default because *this* is the function that creates
+            it, and creating it is the race (FR-012). Pass ``False`` only when the
+            caller already holds the lock, as :func:`apply` does.
     """
-    with connection.cursor() as cursor:
-        _ensure_state_table(cursor)
-        cursor.execute(
-            f"SELECT version, checksum FROM {SCHEMA_MIGRATIONS_TABLE} ORDER BY version"
-        )
-        rows = cursor.fetchall()
-    connection.commit()
+    with _advisory_lock(connection, advisory_lock):
+        with connection.cursor() as cursor:
+            _ensure_state_table(cursor)
+            cursor.execute(
+                f"SELECT version, checksum FROM {SCHEMA_MIGRATIONS_TABLE} "
+                "ORDER BY version"
+            )
+            rows = cursor.fetchall()
+        connection.commit()
     return {int(row[0]): row[1] for row in rows}
 
 
@@ -322,7 +346,7 @@ def _check_applied(
 
 
 def pending(
-    connection: Any, *, verify_checksums: bool = True
+    connection: Any, *, verify_checksums: bool = True, advisory_lock: bool = True
 ) -> tuple[Migration, ...]:
     """Return the migrations this database has not applied, in order.
 
@@ -331,6 +355,7 @@ def pending(
             matches the shipped file. On by default: it is what makes
             "forward-only, never edited" a property of the system rather than a
             note in a README.
+        advisory_lock: see :func:`applied_versions`.
 
     Raises:
         UnknownAppliedVersionError: the database is ahead of the library.
@@ -338,7 +363,7 @@ def pending(
     """
     shipped = discover()
     by_version = {m.version: m for m in shipped}
-    applied = applied_versions(connection)
+    applied = applied_versions(connection, advisory_lock=advisory_lock)
     _check_applied(applied, by_version, verify_checksums=verify_checksums)
     return tuple(m for m in shipped if m.version not in applied)
 
@@ -349,6 +374,48 @@ def _acquire_lock(cursor: Any) -> None:
 
 def _release_lock(cursor: Any) -> None:
     cursor.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+
+
+@contextmanager
+def _advisory_lock(connection: Any, enabled: bool) -> Iterator[None]:
+    """Hold the migration advisory lock for the duration of the block.
+
+    Every entry point that may *create* ``schema_migrations`` goes through here,
+    not just :func:`apply`. Creating that table is the race — ``CREATE TABLE IF
+    NOT EXISTS`` is not atomic against a concurrent creation — and the table is
+    created by whichever call arrives first, which on a fresh database is as
+    likely to be a ``status`` from a health check as an ``apply`` from a deploy.
+    Locking only the writer left the reader able to kill it.
+
+    Nesting is avoided rather than relied on: :func:`apply` holds the lock and
+    passes ``advisory_lock=False`` inward. Postgres's session-level advisory locks
+    are reference-counted and would tolerate re-entry, but "the lock is taken in
+    exactly one place per call" is a property worth being able to read off the
+    code.
+    """
+    if not enabled:
+        yield
+        return
+
+    with connection.cursor() as cursor:
+        _acquire_lock(cursor)
+    connection.commit()
+    try:
+        yield
+    finally:
+        try:
+            with connection.cursor() as cursor:
+                _release_lock(cursor)
+            connection.commit()
+        except Exception:  # pragma: no cover - best effort
+            # The lock is session-scoped, so closing the connection releases it
+            # regardless. Failing to unlock must not mask the error that brought
+            # us here.
+            _logger.warning(
+                "tokenweir: could not release the migration advisory lock; "
+                "it is released when the connection closes",
+                exc_info=True,
+            )
 
 
 def apply(
@@ -401,30 +468,23 @@ def apply(
         )
 
     applied: list[Migration] = []
-    locked = False
-    try:
-        if advisory_lock:
-            # The lock is taken before *anything* touches `schema_migrations`,
-            # because creating that table is itself part of the race this lock
-            # exists to settle: Postgres's `CREATE TABLE IF NOT EXISTS` is not
-            # atomic against a concurrent creation, so two migrators meeting a
-            # fresh database both observe "absent" and one of them dies on a
-            # duplicate-key error from the system catalog. Reading pending state
-            # first — which is what this used to do — put the one statement that
-            # must be serialized outside the serialization.
-            #
-            # `pg_advisory_lock` needs no table of its own, so nothing stops it
-            # from going first.
-            with connection.cursor() as cursor:
-                _acquire_lock(cursor)
-            locked = True
-            connection.commit()
-
-        # Inside the lock: on a fresh database this is the call that creates
-        # `schema_migrations`, and on a contended one it is the re-read that makes
-        # waiting for the lock worthwhile — whoever went first may have applied
-        # everything already.
-        outstanding = pending(connection, verify_checksums=verify_checksums)
+    # The lock is taken before *anything* touches `schema_migrations`, because
+    # creating that table is itself part of the race this lock exists to settle:
+    # `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent creation, so
+    # two callers meeting a fresh database both observe "absent" and one dies on a
+    # duplicate-key error from the system catalog. `pg_advisory_lock` needs no
+    # table of its own, so nothing stops it from going first.
+    with _advisory_lock(connection, advisory_lock):
+        # `advisory_lock=False` inward: the lock is already held, and taking it
+        # in exactly one place per call is easier to read than relying on
+        # Postgres reference-counting a re-entrant acquisition.
+        #
+        # On a fresh database this call creates `schema_migrations`; on a
+        # contended one it is the re-read that makes waiting worthwhile, since
+        # whoever went first may have applied everything already.
+        outstanding = pending(
+            connection, verify_checksums=verify_checksums, advisory_lock=False
+        )
         if not outstanding:
             return ()
 
@@ -470,27 +530,12 @@ def apply(
                 raise
             applied.append(migration)
             _logger.info("tokenweir: applied migration %s", migration.filename)
-    finally:
-        if locked:
-            try:
-                with connection.cursor() as cursor:
-                    _release_lock(cursor)
-                connection.commit()
-            except Exception:  # pragma: no cover - best effort
-                # The lock is session-scoped, so closing the connection releases
-                # it regardless. Failing to unlock must not mask the error that
-                # brought us here.
-                _logger.warning(
-                    "tokenweir: could not release the migration advisory lock; "
-                    "it is released when the connection closes",
-                    exc_info=True,
-                )
 
     return tuple(applied)
 
 
 def status(
-    connection: Any, *, verify_checksums: bool = False
+    connection: Any, *, verify_checksums: bool = False, advisory_lock: bool = True
 ) -> tuple[Sequence[Migration], Sequence[Migration]]:
     """Return ``(applied, pending)`` as migration objects.
 
@@ -501,10 +546,15 @@ def status(
     One read of ``schema_migrations``, not two: both halves of the answer come from
     the same snapshot, so a concurrent migration cannot land between them and make
     the pair describe a database that never existed.
+
+    ``advisory_lock`` is on here too, and not as a formality: on a fresh database
+    it is this call that creates the state table, so a health check running
+    ``status`` against a database a deploy is migrating would otherwise be enough
+    to kill the deploy.
     """
     shipped = discover()
     by_version = {m.version: m for m in shipped}
-    known = applied_versions(connection)
+    known = applied_versions(connection, advisory_lock=advisory_lock)
     _check_applied(known, by_version, verify_checksums=verify_checksums)
     done = tuple(by_version[v] for v in sorted(known) if v in by_version)
     outstanding = tuple(m for m in shipped if m.version not in known)

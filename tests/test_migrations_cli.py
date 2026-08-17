@@ -12,8 +12,8 @@ codes, not about the database. What the runner then does with a real connection 
 
 import pytest
 
+from tokenweir.migrations import MigrationChecksumError, discover
 from tokenweir.migrations import __main__ as cli
-from tokenweir.migrations import discover
 
 SHIPPED = discover()
 
@@ -152,6 +152,47 @@ def test_the_later_dsn_wins_and_neither_position_is_discarded(stub_connect):
         == 0
     )
     assert stub_connect == ["postgresql:///second"]
+
+
+def test_status_does_not_verify_checksums_unless_asked(stub_connect, monkeypatch):
+    """The default is what FR-038 requires: being refused a *description* of a
+    drifted database is the opposite of helpful."""
+    seen = {}
+    monkeypatch.setattr(
+        cli, "status", lambda connection, **kwargs: seen.update(kwargs) or ((), ())
+    )
+
+    assert cli.main(["status", "--dsn", "postgresql:///s"]) == 0
+    assert seen["verify_checksums"] is False
+
+
+def test_status_can_be_asked_to_verify_checksums(stub_connect, monkeypatch):
+    """Without the flag there is no way to see drift from the command line, which
+    is where an operator is standing when they need to."""
+    seen = {}
+    monkeypatch.setattr(
+        cli, "status", lambda connection, **kwargs: seen.update(kwargs) or ((), ())
+    )
+
+    assert cli.main(["status", "--dsn", "postgresql:///s", "--verify-checksums"]) == 0
+    assert seen["verify_checksums"] is True
+
+
+def test_a_drifted_database_reported_by_status_exits_non_zero(
+    stub_connect, monkeypatch, capsys
+):
+    """A refusal must still be a message and a non-zero exit, never a traceback
+    (FR-013) — including on the path that only exists to surface a refusal."""
+
+    def drifted(connection, **kwargs):
+        raise MigrationChecksumError("001_gateway_usage.sql has been edited")
+
+    monkeypatch.setattr(cli, "status", drifted)
+
+    assert cli.main(["status", "--dsn", "postgresql:///s", "--verify-checksums"]) == 1
+    captured = capsys.readouterr()
+    assert "001_gateway_usage.sql" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_the_dsn_falls_back_to_the_environment(stub_connect, monkeypatch):
