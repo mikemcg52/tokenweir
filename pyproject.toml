@@ -39,6 +39,10 @@ dev = [
     "psycopg[binary]>=3",
     "pglast>=6",
     "pgserver>=0.1.4; sys_platform != 'win32'",
+    # `build` lets the suite build a wheel and look inside it, which is the only
+    # way to check that the migrations really reach an install (SC-001) rather
+    # than that the declaration saying they should is still there.
+    "build>=1",
 ]
 
 [tool.setuptools.packages.find]

@@ -174,6 +174,28 @@ def rows_for(records: Iterable[UsageRecord]) -> list[tuple[Any, ...]]:
     return [row_for(record) for record in records]
 
 
+def _reject_autocommit(connection: Any) -> None:
+    """Refuse an autocommit connection, which silently breaks batch atomicity.
+
+    Under autocommit each row becomes durable on its own, so a failure partway
+    through leaves part of a batch written — and a consumer that acks after
+    :meth:`PostgresSource.write` returns has then acked messages that were never
+    stored. Refused rather than documented, because the symptom is occasional
+    partial data surfacing long after anyone would connect it to a connection
+    setting.
+
+    ``getattr`` with a default: ``autocommit`` is a psycopg attribute, not a
+    DB-API one, and a connection with no such notion is not in autocommit mode.
+    """
+    if getattr(connection, "autocommit", False):
+        raise ValueError(
+            "PostgresSource needs a connection that is not in autocommit mode: "
+            "it commits each batch itself, and autocommit would make rows "
+            "durable one at a time, so a failure partway through would leave "
+            "part of a batch written. Set connection.autocommit = False."
+        )
+
+
 class PostgresSource:
     """A :class:`~tokenweir.source.Source` that persists records to Postgres.
 
@@ -193,23 +215,7 @@ class PostgresSource:
     """
 
     def __init__(self, connection: Any, *, owns_connection: bool = False) -> None:
-        # An autocommit connection silently breaks the one-transaction-per-batch
-        # guarantee the docstring above promises and that a consumer acking after
-        # `write` depends on: each row would become durable on its own, so a
-        # mid-batch failure would leave a partial batch behind and the ack would
-        # be a lie. Refused rather than documented, because the symptom is
-        # occasional partial data long after the decision.
-        #
-        # `getattr` with a default: `autocommit` is a psycopg attribute, not a
-        # DB-API one, and a connection that has no such notion is not in
-        # autocommit mode.
-        if getattr(connection, "autocommit", False):
-            raise ValueError(
-                "PostgresSource needs a connection that is not in autocommit "
-                "mode: it commits each batch itself, and autocommit would make "
-                "rows durable one at a time, so a failure partway through would "
-                "leave part of a batch written. Set connection.autocommit = False."
-            )
+        _reject_autocommit(connection)
         self._connection = connection
         self._owns_connection = owns_connection
         self._closed = False
@@ -233,6 +239,11 @@ class PostgresSource:
     def write(self, records: Iterable[UsageRecord]) -> int:
         """Persist a batch in one transaction; return the number of rows written.
 
+        The count is the number of rows *sent*, not a rowcount reported back by
+        the server. For an ``INSERT … VALUES`` batch that committed, the two are
+        the same — and if the insert had not fully succeeded this would have
+        raised rather than returned.
+
         Raises:
             ValueError, TypeError: a record cannot be mapped to a row. Raised
                 before any statement is sent, so nothing is partially written.
@@ -244,6 +255,14 @@ class PostgresSource:
                 not swallowed: this side is off the critical path, and a caller
                 that can retry needs to know it must.
         """
+        # Re-checked here, not only in `__init__`: `autocommit` is a mutable
+        # attribute, so a caller can flip it on a connection this object already
+        # holds and quietly lose the one-transaction guarantee the constructor
+        # checked for. Under psycopg 3 `executemany` happens to keep the batch
+        # atomic anyway, but this class documents psycopg 2 support too, and
+        # there a failure partway leaves the rows before it committed.
+        _reject_autocommit(self._connection)
+
         rows = rows_for(records)
         if not rows:
             # A consumer's flush timer firing with an empty buffer must not open a

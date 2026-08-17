@@ -16,6 +16,12 @@ branch name):
 > **Acceptance:** tokenweir owns and applies the migrations; writer persists records to Postgres;
 > existing correctness tests pass against real Postgres.
 
+**Verified against the live issue** (`getJiraIssue TOKWEIR-5`, cloud `bostoncio-cto`): the quote above
+matches the issue's description verbatim. Worth checking rather than assuming, because this file grew
+by ~500 lines during the story and FR-038 … FR-042 were authored *after* the code they describe — so a
+fidelity review graded against it is partly the implementation grading itself, and the three
+acceptance clauses are the only part of it the story did not write for itself.
+
 ## Context
 
 ADR-0001 Pillar 5 calls this "the highest-risk part of the extraction": ownership of `gateway_usage`
@@ -271,7 +277,13 @@ observe that only the call that actually connects fails.
 - **FR-010**: The runner MUST refuse to apply SQL containing a destructive statement unless the caller
   explicitly opts in, and the opt-in MUST be per-call rather than a setting. This is
   "no DROP without operator review" made mechanical. Detection MUST ignore comments and MUST NOT fire
-  on an identifier that merely contains the word (`drop_reason` is not a `DROP`).
+  on an identifier that merely contains the word (`drop_reason` is not a `DROP`). Its errors MUST fall
+  on the **refusing** side: a string literal containing one of the words MUST match — `EXECUTE 'DROP
+  TABLE …'` inside a `DO` block is a real drop, and blanking literals to remove the false positive
+  would trade it for a false negative exactly where it matters. Correspondingly, a `--` **inside** a
+  literal is not a comment and MUST NOT be treated as one, since doing so hides whatever shares its
+  line. Comment-stripping is therefore a scan, not a regex: the two constructs interleave and which
+  one opens first decides.
 - **FR-011**: The runner MUST take a **DB-API connection**, not a DSN, so it works with any driver and
   is testable without one. A DSN-based convenience MUST exist separately.
 - **FR-012**: The runner MUST serialize concurrent runs with an advisory lock. The lock MUST be
@@ -430,6 +442,26 @@ observe that only the call that actually connects fails.
   `__main__` guard, which is the entry point SC-020 actually names.
 - **SC-030**: A connect failure whose DSN carries a password prints the failure without the password,
   for a URL DSN, a keyword DSN and a malformed one alike.
+- **SC-031**: A **built wheel**, opened as an archive, contains all six `sql/*.sql` files. Reading an
+  editable install or the `pyproject.toml` declaration cannot see a build that stops honouring a
+  declaration that is still correct, and SC-001 is written about the installed package.
+- **SC-032**: `PostgresSource.write` refuses a connection switched into autocommit *after*
+  construction; `apply` refuses one at call time. A constructor-only check guards the moment of
+  construction and nothing after it.
+- **SC-033**: Every cost-valued column in the shipped SQL ends in `_usd_per_mtok`, asserted with no
+  database, so a rename in a later migration fails here rather than in a cost report.
+
+### A deliberate asymmetry: what may be *described* and what may not
+
+FR-038 (drift) and FR-042 (adoption) both carve out a way to have a database described anyway, and
+FR-014 does not. That is a decision, recorded here so it is not read as an oversight.
+
+A drifted or adopted database is one this library can still describe: it ships those versions and
+knows their names and contents, so refusing would withhold something it has. A database **ahead** of
+the library is not — tokenweir has no name, no content and no checksum for version N+1. The honest
+answer is that it cannot describe this database, which is what the refusal says, naming the versions
+and the remedy. Softening it to a warning would yield a `status` that lists six applied migrations
+while silently omitting a seventh, which is worse than a refusal.
 - **SC-026**: A database whose `schema_migrations` has no `checksum` column is adopted: `apply`
   applies only what is genuinely missing, `status` describes it rather than raising, the pre-existing
   rows keep a NULL checksum, and a later run does not read those NULLs as drift. Asserted against a

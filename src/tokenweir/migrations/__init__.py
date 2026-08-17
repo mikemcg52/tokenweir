@@ -22,6 +22,12 @@ The rules the gateway earned, restated as behaviour rather than convention:
 - **Atomic.** A migration's DDL and its ``schema_migrations`` row commit together,
   so "recorded as applied" and "actually applied" cannot disagree.
 
+**The connection's transactions belong to the runner.** Every function here
+commits — the runner owns its transaction boundaries, which is what makes "the
+DDL and its ``schema_migrations`` row commit together" true — and taking the
+advisory lock commits as well. Give it a connection of its own rather than one
+with other work in flight.
+
 **A connection, not a DSN.** Every function here takes a DB-API connection. That
 keeps the driver out of this package's import graph (ADR-0001 Pillar 2 — the core
 compiles in no database library), lets a deployment own pooling and credentials,
@@ -90,10 +96,62 @@ ADVISORY_LOCK_KEY = (
 #: order numeric order, which is what makes "apply in filename order" correct.
 _FILENAME_RE = re.compile(r"^(?P<version>\d{3})_(?P<name>[a-z0-9_]+)\.sql$")
 
-#: ``--`` to end of line, and ``/* … */``. Stripped before scanning for
-#: destructive statements so that a comment *explaining* why nothing is dropped
-#: does not read as a drop.
-_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+def _strip_comments(sql: str) -> str:
+    """Blank out SQL comments, leaving string literals intact.
+
+    Comments go because the prose above each migration necessarily *names* the
+    things it promises not to do; read literally it would trip the guard below.
+
+    Literals stay, contents and all. That asymmetry is the point: a ``DROP``
+    inside a string is most likely an ``EXECUTE 'DROP TABLE …'``, which is
+    precisely what "no DROP without operator review" is for. Blanking literals
+    would turn the guard's one acknowledged false positive into a false negative
+    at the only place that matters.
+
+    Written as a scan rather than a regex because the two constructs interleave,
+    and which one *opens first* decides. A regex for ``--`` to end of line does
+    not know it is inside a literal, so
+
+        INSERT INTO audit(reason) VALUES ('cleanup -- see #12'); DROP TABLE t;
+
+    read as a comment from ``--`` onwards and hid the ``DROP`` on the same line.
+    """
+    out: list[str] = []
+    index, end = 0, len(sql)
+    while index < end:
+        pair = sql[index : index + 2]
+        if pair == "--":
+            newline = sql.find("\n", index)
+            index = end if newline == -1 else newline
+            out.append(" ")
+        elif pair == "/*":
+            # Postgres block comments nest, unlike C's.
+            depth, scan = 1, index + 2
+            while scan < end and depth:
+                if sql[scan : scan + 2] == "/*":
+                    depth, scan = depth + 1, scan + 2
+                elif sql[scan : scan + 2] == "*/":
+                    depth, scan = depth - 1, scan + 2
+                else:
+                    scan += 1
+            index = scan
+            out.append(" ")
+        elif sql[index] == "'":
+            scan = index + 1
+            while scan < end:
+                if sql[scan] == "'":
+                    if sql[scan + 1 : scan + 2] == "'":  # '' escapes a quote
+                        scan += 2
+                        continue
+                    scan += 1
+                    break
+                scan += 1
+            out.append(sql[index:scan])  # kept, not blanked
+            index = scan
+        else:
+            out.append(sql[index])
+            index += 1
+    return "".join(out)
 
 #: Whole-word matching, so an identifier that merely contains the word — a
 #: ``drop_reason`` column, a ``truncated_at`` timestamp — is not a destructive
@@ -214,12 +272,18 @@ def destructive_statements(sql: str) -> tuple[str, ...]:
     mentions dropping nor a column called ``drop_reason`` trips it.
 
     The limit worth knowing: a *string literal* containing one of these words
-    would match. That is a false positive rather than a false negative — it
-    refuses a safe migration instead of admitting a dangerous one — and the
-    ``allow_destructive`` escape hatch covers it.
+    matches. That is a false positive rather than a false negative — it refuses a
+    safe migration instead of admitting a dangerous one — and the
+    ``allow_destructive`` escape hatch covers it. It is also the right way round
+    for the case that matters: ``EXECUTE 'DROP TABLE …'`` inside a ``DO`` block is
+    a real drop, and blanking literals to remove the false positive would let it
+    through.
+
+    Comment-stripping is a scan, not a regex, because a ``--`` *inside* a literal
+    is not a comment; treating it as one hid anything sharing its line.
     """
     return tuple(
-        match.group(0) for match in _DESTRUCTIVE_RE.finditer(_COMMENT_RE.sub(" ", sql))
+        match.group(0) for match in _DESTRUCTIVE_RE.finditer(_strip_comments(sql))
     )
 
 
@@ -317,6 +381,17 @@ def _check_applied(
     Shared by :func:`pending` and :func:`status` so the two cannot drift apart on
     what counts as a database worth refusing.
     """
+    # This one has no opt-out, including from `status`, and that is a decision
+    # rather than an oversight — FR-038 and FR-042 both carved one out, so the
+    # asymmetry is worth stating. A drifted or adopted database is one this
+    # library can still *describe*: it ships those versions and knows their names
+    # and contents, so refusing to describe them would withhold something it has.
+    # A database ahead of the library is not. tokenweir does not ship version N+1
+    # and has no name, no content and no checksum for it; the honest report is
+    # that it cannot describe this database, which is what the refusal says —
+    # naming the versions and the remedy. Softening it to a warning would produce
+    # a `status` that lists six applied migrations while silently omitting a
+    # seventh, which is worse than a refusal.
     unknown = sorted(set(applied) - set(by_version))
     if unknown:
         raise UnknownAppliedVersionError(
@@ -404,6 +479,13 @@ def _advisory_lock(connection: Any, enabled: bool) -> Iterator[None]:
     are reference-counted and would tolerate re-entry, but "the lock is taken in
     exactly one place per call" is a property worth being able to read off the
     code.
+
+    **This commits the connection** on entry and on exit — so anything the caller
+    had open on it commits too. Every function here already commits (the runner
+    owns its transaction boundaries; that is what FR-009 is), and a migration
+    connection is not one to interleave other work on. Callers who need their own
+    transaction should use their own connection, or pass ``advisory_lock=False``
+    and serialize the runs themselves.
     """
     if not enabled:
         yield

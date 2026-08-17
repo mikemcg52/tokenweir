@@ -323,6 +323,22 @@ def test_an_autocommit_connection_is_refused():
         PostgresSource(conn)
 
 
+def test_autocommit_switched_on_after_construction_is_still_refused():
+    """`autocommit` is a mutable attribute, so a constructor-only check guards
+    the moment of construction and nothing after it. Under psycopg 3
+    `executemany` happens to keep the batch atomic regardless, but this class
+    documents psycopg 2 support, where a failure partway leaves the rows before
+    it committed — and "it happens to be safe on one driver" is not the
+    guarantee `write` advertises."""
+    conn = RecordingConnection()
+    source = PostgresSource(conn)
+    conn.autocommit = True
+
+    with pytest.raises(ValueError, match="autocommit"):
+        source.write([make_record()])
+    assert conn.events == [], "nothing may be sent on a connection we refuse"
+
+
 def test_a_connection_with_no_notion_of_autocommit_is_accepted():
     """`autocommit` is psycopg's attribute, not DB-API's. A connection that does
     not have one is not in autocommit mode, and must not be refused for lacking a

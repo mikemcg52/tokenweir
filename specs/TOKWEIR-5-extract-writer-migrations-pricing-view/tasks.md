@@ -184,3 +184,43 @@
       stderr through the connect-failure message. Checked five adversarial forms against psycopg:
       libpq quotes the offending *keyword*, never the value. No leak — and now pinned by a test, since
       the message interpolates a driver exception this project does not control.
+
+## Fix round 4 (review findings)
+
+- [x] **T065** **Med** — the destructive guard had a false negative in the dangerous direction, and
+      its docstring claimed it could not: `_COMMENT_RE` treated a `--` inside a *string literal* as a
+      comment, so `VALUES ('cleanup -- see #12'); DROP TABLE gateway_usage;` scanned clean.
+      Comment-stripping is now a left-to-right scan that knows literals from comments (and handles
+      Postgres's nesting block comments). Literal *contents* are deliberately kept — `EXECUTE 'DROP
+      TABLE …'` in a `DO` block is a real drop, so blanking literals would swap one false negative for
+      a worse one. Docstring corrected, both directions pinned by tests (FR-010).
+- [x] **T066** **Med** — SC-001 ("discovered from the installed package, no repository present") was
+      tested only by proxy: one test read an editable install, the other read the `pyproject.toml`
+      declaration. Both stay green if the declaration is right and the build stops honouring it. Now
+      builds a wheel into `tmp_path` and asserts the six `sql/*.sql` members are inside it; `build`
+      added to the `dev` extra, skipped when absent (SC-031).
+- [x] **T067** **Med** — the reviewer could not reach Jira and flagged the spec's verbatim story quote
+      as unverified, noting this file was revised during the story and so partly grades itself.
+      Fetched TOKWEIR-5: the quote matches the description verbatim. Recorded in `spec.md` along with
+      the caveat, since it is a real one. **Left for the human:** ratifying `test_contract.py`'s
+      relaxation from "no third-party import anywhere" to "none at import time" — authorised by
+      FR-039, which this story wrote. The compensating controls are real, but inheriting a relaxation
+      the change itself authorised is a call for the developer, not for the change.
+- [x] **T068** **Low** — `PostgresSource`'s autocommit refusal was constructor-only, and `autocommit`
+      is a mutable attribute. Extracted to `_reject_autocommit` and re-checked in `write`, so flipping
+      it after construction no longer slips past (SC-032).
+- [x] **T069** **Low** — `_advisory_lock` commits the connection on entry and exit, which commits
+      anything the caller had in flight. Documented on the context manager and in the module
+      docstring: the runner owns this connection's transaction boundaries, which is what FR-009 is.
+- [x] **T070** **Low** — recorded the deliberate call that `status` still refuses a database *ahead*
+      of the library while FR-038/FR-042 both grant an opt-out. tokenweir can describe a drifted or
+      adopted database; it cannot describe a version it does not ship. A `status` listing six
+      migrations while silently omitting a seventh is worse than a refusal (spec, `_check_applied`).
+- [x] **T071** **Low** — FR-029 (the rate unit in the column name) had no no-database assertion; it
+      rested on a README marker. Now every cost-valued column in the shipped SQL must end in
+      `_usd_per_mtok`, with a guard against the scan finding nothing (SC-033).
+- [x] **T072** **Low** — documented that `write` returns the number of rows *sent* rather than a
+      server rowcount, and why the two cannot disagree here.
+- [x] **T073** Carried the TOKWEIR-10 hand-off — "diff this reconstructed DDL against the live
+      `ai_gateway_metrics` schema before pointing the gateway at it" — onto the Jira issue itself,
+      rather than leaving it only in this repo's spec folder.

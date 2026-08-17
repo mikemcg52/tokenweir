@@ -22,7 +22,10 @@ documentation.
 """
 
 import re
+import subprocess
+import sys
 import tomllib
+import zipfile
 from dataclasses import fields
 from fnmatch import fnmatch
 from importlib import resources
@@ -235,6 +238,18 @@ def test_no_shipped_migration_is_destructive(migrations):
         "TRUNCATE gateway_usage;",
         "DELETE FROM gateway_usage WHERE ts < now();",
         "ALTER TABLE gateway_usage DROP COLUMN queue;",
+        # A `--` inside a string literal is not a comment. Stripping comments by
+        # regex read this one as "comment from `--` to end of line" and hid the
+        # DROP sharing that line — the guard's one false *negative*, and the
+        # dangerous direction for a guard whose whole job is to refuse.
+        "INSERT INTO audit(reason) VALUES ('cleanup -- see #12'); DROP TABLE gateway_usage;",
+        "SELECT 'it''s -- fine'; DROP TABLE gateway_usage;",
+        "INSERT INTO t VALUES ('a /* x'); TRUNCATE gateway_usage;",
+        # Contents of a literal still count. `EXECUTE 'DROP …'` in a DO block is
+        # the most likely way a real drop arrives, so blanking literals to remove
+        # the acknowledged false positive would trade it for a false negative
+        # exactly where it matters.
+        "DO $$ BEGIN EXECUTE 'DROP TABLE gateway_usage'; END $$;",
     ],
 )
 def test_the_destructive_detector_catches_what_it_is_for(sql):
@@ -250,6 +265,9 @@ def test_the_destructive_detector_catches_what_it_is_for(sql):
         "/* DROP is forbidden; TRUNCATE too */ CREATE TABLE t (a int);",
         "CREATE TABLE t (drop_reason TEXT, truncated_at TIMESTAMPTZ);",
         "CREATE TABLE t (a int REFERENCES p(id) ON DELETE CASCADE);",
+        # Postgres block comments nest, unlike C's; the inner `*/` must not end
+        # the outer comment and expose the word after it.
+        "/* outer /* inner */ still a comment, DROP */ CREATE TABLE t (a int);",
     ],
 )
 def test_the_destructive_detector_does_not_cry_wolf(sql):
@@ -379,6 +397,31 @@ def test_the_writer_inserts_every_contract_field(gateway_usage_columns):
     """The insert column list and the table must agree, minus the generated key."""
     assert set(INSERT_COLUMNS) == gateway_usage_columns - {"id"}
     assert len(INSERT_COLUMNS) == len(set(INSERT_COLUMNS))
+
+
+def test_every_rate_column_names_its_unit(code_by_filename):
+    """FR-029, with no database. A rate card loaded against the wrong unit is a
+    thousand-fold error and nothing in the data reveals it, so the unit lives in
+    the column name — and a rename in some future `007` should fail here rather
+    than in a cost report.
+    """
+    rate_columns = {
+        match.group(1)
+        for sql in code_by_filename.values()
+        for match in re.finditer(
+            r"^\s*([a-z_][a-z0-9_]*(?:cost|price|rate)[a-z0-9_]*)\s+NUMERIC",
+            sql,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    }
+
+    assert rate_columns, "no cost-valued columns found; the scan has stopped scanning"
+    unitless = sorted(c for c in rate_columns if not c.endswith("_usd_per_mtok"))
+    assert unitless == [], (
+        f"cost column(s) {unitless} do not name their unit — a rate card loaded "
+        "against the wrong one is a thousand-fold error with nothing in the data "
+        "to reveal it"
+    )
 
 
 # --- Grants (FR-030) ----------------------------------------------------------
@@ -567,6 +610,42 @@ def test_the_build_declares_the_sql_as_package_data(migrations):
         assert any(fnmatch(relative, pattern) for pattern in patterns), (
             f"{relative} matches no declared package-data pattern {patterns}"
         )
+
+
+def test_an_actually_built_wheel_carries_the_sql(migrations, tmp_path):
+    """SC-001 as written: discovered from the *installed package*, no repo present.
+
+    The two checks above are proxies. One reads an editable install, where the
+    repository is on disk whatever the build does; the other reads the
+    declaration rather than the artifact. Both stay green if the declaration is
+    right and the build stops honouring it — a `MANIFEST.in`, an `include-package
+    -data` flip, a backend upgrade. This builds the wheel and looks inside it.
+
+    Skipped where the build backend is not installed, which includes a bare
+    install: a check that cannot be evaluated must not turn one red.
+    """
+    if not (REPO_ROOT / "pyproject.toml").is_file():
+        pytest.skip("no pyproject.toml (e.g. an installed distribution)")
+    pytest.importorskip("build", reason="`pip install build` to check the wheel itself")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path), str(REPO_ROOT)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+
+    wheels = list(tmp_path.glob("*.whl"))
+    assert len(wheels) == 1, f"expected one wheel, got {wheels}"
+    with zipfile.ZipFile(wheels[0]) as wheel:
+        packaged = {
+            name
+            for name in wheel.namelist()
+            if name.startswith("tokenweir/migrations/sql/") and name.endswith(".sql")
+        }
+
+    assert packaged == {f"tokenweir/migrations/sql/{m.filename}" for m in migrations}
 
 
 @pytest.mark.parametrize(
