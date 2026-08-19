@@ -345,3 +345,41 @@ def test_a_non_record_does_not_reach_the_store_through_the_client(value):
         emitter.emit(value)
         assert emitter.flush(timeout=TIMEOUT)
     assert source.writes == []
+
+
+# --- Non-records are refused, as AMQPSink refuses them (Low #1) --------------
+
+
+@pytest.mark.parametrize("value", [None, "not a record", 42, {"request_id": "r"}])
+def test_a_non_record_never_reaches_the_store(value):
+    """`MemorySource` validates nothing, so a `None` from a construction drop used
+    to be *stored*. `AMQPSink` refuses the same value at the same seam; the two
+    adapters agreeing is the point."""
+    source = CountingSource()
+    sink = DirectSink(source)
+    sink.emit(value)  # must not raise
+    assert source.records == []
+    assert source.writes == []
+    assert sink.dropped == 1
+
+
+def test_a_non_record_does_not_cost_the_good_records_in_its_batch():
+    """Filtered rather than refusing the batch whole — the one place this
+    deliberately differs from `rows_for`. That rule exists so a batch is never
+    *half* written; a value that could never have been written at all is not the
+    same hazard, and losing four good records to one producer `None` would be."""
+    source = CountingSource()
+    sink = DirectSink(source)
+    sink.emit_batch([_record(1), None, _record(2), "junk", _record(3)])
+    assert [r.request_id for r in source.records] == ["req-1", "req-2", "req-3"]
+    assert source.writes == [3], "the good records were not written as one batch"
+    assert sink.dropped == 2
+    assert sink.written == 3
+
+
+def test_a_batch_of_only_non_records_opens_no_transaction():
+    source = CountingSource()
+    sink = DirectSink(source)
+    sink.emit_batch([None, None])
+    assert source.writes == []
+    assert sink.dropped == 2

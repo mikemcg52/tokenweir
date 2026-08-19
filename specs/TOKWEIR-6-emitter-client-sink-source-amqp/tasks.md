@@ -130,8 +130,13 @@ broker or network can reach the caller.
       `__init__`, not in `from_url` alone** — deferring past construction puts it on the publish
       path, which may not raise, so a missing driver became a silent permanent drop (review round 1,
       High). See the FR-020 amendment in `spec.md`.
-- [x] **T031** In `amqp.py`, add reconnection for a connection the sink owns: re-establish on a
-      later publish attempt, not by retrying inside one (FR-024).
+- [x] **T031** In `amqp.py`, add reconnection for a connection the sink **can re-make**:
+      re-establish on a later publish attempt, not by retrying inside one (FR-024). Two corrections
+      from review round 3, both Med: gating this on *ownership* was wrong, because only `from_url`
+      supplies the callable that can reconnect — so `AMQPSink(channel, connection=c,
+      owns_connection=True)` closed its connection and was then permanently dead. And attempts are
+      now spaced by `reconnect_interval`: a blocking dial per record is the retry loop this design
+      refuses, reintroduced one attempt at a time.
 - [x] **T032** In `amqp.py`, add `close()` honouring the ownership rule and never raising (FR-023).
 - [x] **T033** Create `tests/test_amqp.py`: the mapping tests, which must pass with no `pika`
       installed (SC-007, FR-025).
@@ -180,6 +185,11 @@ broker or network can reach the caller.
 
 - [x] **T044** Run the authoritative suite from `/workspace/.mado/project.yaml`
       (`CI=true /workspace/repo/.venv/bin/pytest`, passing exit codes `[0, 5]`) and confirm green.
+      Verified in **both** environments: MADO's own (`pip install -e . pytest`, no `pika`) and with
+      the `dev` extra's `pika` present, since review round 3 noted FR-022 was asserted only against
+      a test double. The two real-driver tests skip in the first and pass in the second, and the
+      dependency-light subprocess assertions pass in both — which is stronger evidence with `pika`
+      installed than without, because then the import genuinely could happen and does not.
 - [x] **T045** Run `ruff check` against the new modules for the lint rules
       `pyproject.toml` declares (`E`, `F`, `I`, `N`, `W`, line length 100) — clean.
       **`ruff format` is not this project's gate** and was not applied: 19 files already

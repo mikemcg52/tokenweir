@@ -5,7 +5,10 @@
 **Status**: Draft
 **Jira**: TOKWEIR-6 (Story) — "Emitter client + Sink/Source interfaces + AMQP adapter"
 **Input**: The Jira story, fetched with `getJiraIssue` on 2026-08-19 and quoted verbatim below
-rather than reconstructed from the branch name.
+rather than reconstructed from the branch name. Re-fetched and diffed against the quote during fix
+round 3 — identical. Recorded because three independent reviews each flagged it Unverified: the
+reviewer subagent has no Jira access, so the quote below is the only story text it can grade
+against, and "the implementer wrote the spec on this branch" is a fair thing to want checked.
 
 > Build the buffered emitter client targeting a `Sink` interface, and the writer-side `Source`
 > interface. Emission is fire-and-forget / off the critical path (buffers, returns immediately,
@@ -195,8 +198,17 @@ running environment.
 - **FR-001**: The library MUST provide a buffered emitter client that accepts a `Sink` and delivers
   records to it from a background worker, so the calling thread never performs transport I/O.
 - **FR-002**: The client's emit call MUST return without waiting for delivery, and MUST NOT raise
-  for any sink failure, buffer state, or lifecycle state. `KeyboardInterrupt`/`SystemExit` MUST
-  still propagate, matching the existing guarded seam.
+  for any sink failure, buffer state, or lifecycle state. A `BaseException` raised **on the calling
+  thread** — by the logging handler an application installed, say — MUST still propagate, as it does
+  through the guarded seam.
+
+  A sink's `BaseException` is a **different case**, and saying it "matches the guarded seam" would
+  be wrong. Through `emit_record` the sink runs on the caller's thread, so its `KeyboardInterrupt`
+  reaches the caller. Through this client the sink runs on the worker, and an exception there is not
+  the emitting thread's to receive — it belongs to no request in particular. It is not caught
+  either: the worker dies rather than pretending a `BaseException` is a drop, and
+  `EmitterStats.worker_alive` is what makes that state legible instead of leaving it to be inferred
+  from `buffered` climbing while `delivered` does not.
 - **FR-003**: The buffer MUST be bounded, with the bound configurable, and MUST drop rather than
   block or grow when full.
 - **FR-004**: The client MUST deliver in batches, with batch size and a maximum wait configurable,

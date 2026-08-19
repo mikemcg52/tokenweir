@@ -625,7 +625,15 @@ def test_repeated_reconnect_failures_are_rate_limited_despite_varying_text(
     attempt against a broker that is down, which is precisely the FR-008 failure
     mode. A driver that includes an attempt number, a port or a timestamp in its
     message is not exotic; it is the normal case."""
-    sink = AMQPSink.from_url("amqp://guest:guest@rabbit/", warn_interval=3600.0)
+    # `reconnect_interval=0.0` on purpose: the backoff added for the
+    # attempt-per-record defect would otherwise let this pass with a single
+    # reconnect attempt, and the thing under test is the *rate limiter's* keying,
+    # not the backoff. With the interval closed off, every emit really does try to
+    # reconnect and really does produce a distinct error string, which is what
+    # makes removing `key=` fail this test.
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", warn_interval=3600.0, reconnect_interval=0.0
+    )
     fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
     sink.emit(_record(0))
     caplog.clear()
@@ -673,3 +681,169 @@ def test_an_invalidated_borrowed_channel_keeps_reporting(fake_pika, caplog):
             sink.emit(_record(n))
     assert sink.dropped == 3
     assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+# --- Reconnection is gated on being able to, not on owning (Med #1) ----------
+
+
+def test_a_constructor_owned_connection_still_publishes_after_a_failure(fake_pika):
+    """`owns_connection=True` outside `from_url` used to be a death sentence:
+    `_invalidate` keyed off ownership, but only `from_url` supplies the callable
+    that can re-make a connection, so the sink closed the one it had and then had
+    no way to make another. Strictly worse than the borrowed case, where the caller
+    can at least repair the channel out of band."""
+    channel = RecordingChannel(fail_with=RuntimeError("connection reset"))
+    connection = RecordingConnection(channel)
+    sink = AMQPSink(channel, connection=connection, owns_connection=True)
+
+    sink.emit(_record(1))
+    assert sink.dropped == 1
+
+    # The broker comes back and the caller repairs the channel they own.
+    channel.fail_with = None
+    sink.emit(_record(2))
+
+    assert sink.published == 1, "the sink was permanently dead after one failure"
+    assert len(channel.published) == 1
+
+
+def test_a_connection_it_cannot_remake_is_not_closed_underneath_the_caller(fake_pika):
+    channel = RecordingChannel(fail_with=RuntimeError("connection reset"))
+    connection = RecordingConnection(channel)
+    sink = AMQPSink(channel, connection=connection, owns_connection=True)
+    sink.emit(_record(1))
+    assert connection.closed == 0, "a connection with no way to be re-made was closed"
+    assert sink.channel is channel
+
+
+def test_close_still_closes_a_constructor_owned_connection(fake_pika):
+    """Ownership still decides *closing*; it just no longer decides reconnecting."""
+    channel = RecordingChannel()
+    connection = RecordingConnection(channel)
+    AMQPSink(channel, connection=connection, owns_connection=True).close()
+    assert connection.closed == 1
+
+
+# --- Reconnect attempts are spaced (Med #2) ----------------------------------
+
+
+def test_a_down_broker_is_not_re_dialled_once_per_record(fake_pika):
+    """`pika.BlockingConnection` blocks for the connect timeout, and this runs on
+    the delivery worker — so an attempt per record is the "retry loop in front of a
+    broken broker" the module docstring refuses, reintroduced one attempt at a
+    time. Against a real down broker it would spend a full connect timeout per
+    buffered record while the buffer fills behind it."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))  # invalidates
+
+    attempts = []
+
+    def refuse(parameters):
+        attempts.append(now[0])
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+
+    for n in range(1, 51):
+        now[0] += 0.1  # 5 seconds of traffic, well inside the 30s interval
+        sink.emit(_record(n))
+
+    assert len(attempts) == 1, f"{len(attempts)} connect attempts for 50 records"
+    assert sink.dropped == 51
+
+
+def test_the_first_attempt_after_a_failure_is_immediate(fake_pika):
+    """A blip must recover at once. Making a caller wait out an interval to recover
+    from a dropped connection would trade a real fault for an invented one."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=3600.0, clock=lambda: now[0]
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+
+    sink.emit(_record(1))  # no clock movement at all
+
+    assert len(fake_pika.connections) == 2, "the blip was not recovered immediately"
+    assert sink.published == 1
+
+
+def test_the_interval_reopens_once_it_has_elapsed(fake_pika):
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+
+    attempts = []
+
+    def refuse(parameters):
+        attempts.append(now[0])
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+
+    sink.emit(_record(1))
+    now[0] += 10.0
+    sink.emit(_record(2))
+    now[0] += 25.0  # now past the interval
+    sink.emit(_record(3))
+
+    assert len(attempts) == 2, attempts
+
+
+def test_a_successful_reconnect_clears_the_interval(fake_pika):
+    """Otherwise a recovered broker would still be treated as backing off."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("reset")
+    sink.emit(_record(0))
+    sink.emit(_record(1))  # immediate reconnect, succeeds
+    assert sink.published == 1
+
+    fake_pika.connections[1].channel().fail_with = RuntimeError("reset again")
+    sink.emit(_record(2))  # fails, invalidates
+    sink.emit(_record(3))  # must reconnect immediately again, not be gated
+    assert sink.published == 2, "the interval outlived the successful reconnect"
+
+
+# --- FR-022 against the real driver, not only the double (Low #5) ------------
+
+
+def test_publish_properties_construct_a_real_pika_basicproperties():
+    """Every other publish assertion here goes through `FakeProperties`, so nothing
+    proved that real pika accepts these kwargs or keeps their values. Skips where
+    `pika` is absent — it is in the `dev` extra and nothing else, so an ordinary
+    `pip install -e .` still skips, the same rule `tests/conftest.py` holds for the
+    real-Postgres suite."""
+    pika = pytest.importorskip("pika", reason="pika is dev-only; install '.[dev]'")
+
+    properties = pika.BasicProperties(**publish_properties())
+
+    assert properties.content_type == CONTENT_TYPE
+    assert properties.delivery_mode == PERSISTENT_DELIVERY_MODE
+
+
+def test_a_real_pika_sink_publishes_persistent_json_to_a_channel_double():
+    """The default construction path end to end with the genuine driver: no fake
+    module in `sys.modules`, a real `BasicProperties`, and a channel double
+    standing in only for the broker."""
+    pytest.importorskip("pika", reason="pika is dev-only; install '.[dev]'")
+
+    channel = RecordingChannel()
+    sink = AMQPSink(channel, routing_key="tokenweir.usage")
+    sink.emit(_record(1, input_tokens=120))
+
+    assert len(channel.published) == 1
+    published = channel.published[0]
+    assert published["routing_key"] == "tokenweir.usage"
+    assert UsageRecord.from_json(published["body"]).input_tokens == 120
+    assert published["properties"].delivery_mode == PERSISTENT_DELIVERY_MODE
+    assert published["properties"].content_type == CONTENT_TYPE

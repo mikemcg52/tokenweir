@@ -162,6 +162,13 @@ class EmitterStats:
             :class:`~tokenweir.contract.UsageRecord`, most often a ``None`` from a
             construction drop.
         dropped_closed: records offered after :meth:`BufferedEmitter.close`.
+        dropped_at_close: records abandoned because :meth:`BufferedEmitter.close`
+            hit its timeout with the buffer not yet drained — a wedged sink, most
+            likely a dead broker. Counted separately because it is the only drop
+            that happens *after* the client stopped accepting work, and because
+            without it these records appeared in no ``dropped_*`` counter at all:
+            an operator alerting on :attr:`dropped` would have missed the entire
+            class.
         buffered: records currently waiting for delivery.
         worker_alive: whether the delivery worker is still running. ``False`` on a
             client that has not been closed means nothing further will ever be
@@ -178,6 +185,7 @@ class EmitterStats:
     dropped_buffer_full: int = 0
     dropped_not_a_record: int = 0
     dropped_closed: int = 0
+    dropped_at_close: int = 0
     buffered: int = 0
     worker_alive: bool = True
 
@@ -189,6 +197,7 @@ class EmitterStats:
             + self.dropped_buffer_full
             + self.dropped_not_a_record
             + self.dropped_closed
+            + self.dropped_at_close
         )
 
 
@@ -219,7 +228,8 @@ class BufferedEmitter:
         name: the worker thread's name, so it is identifiable in a stack dump.
 
     Raises:
-        ValueError: for a nonsensical bound, batch size or timeout. Construction
+        ValueError: for a nonsensical bound, batch size, interval or timeout.
+            Construction
             is wiring-time, not request-time, so this is the one place in the emit
             path where raising is the correct behaviour — the same reasoning
             :class:`~tokenweir.contract.UsageRecord` uses for its own validation.
@@ -240,6 +250,12 @@ class BufferedEmitter:
         self._batch_size = _positive_int("batch_size", batch_size)
         self._linger = _non_negative_float("linger", linger)
         self._close_timeout = _non_negative_float("close_timeout", close_timeout)
+        # Validated like the rest: the docstring promises a `ValueError` for a
+        # nonsensical timeout, and `warn_interval` is one. Left unchecked it was
+        # silently clamped inside the warner, and `warn_interval=None` raised a
+        # `TypeError` from the clamp rather than the advertised `ValueError` —
+        # wiring-time validation that only covers some of the wiring.
+        warn_interval = _non_negative_float("warn_interval", warn_interval)
 
         self._sink = sink
         # Resolved once: whether the sink can take a batch is a property of the
@@ -263,6 +279,7 @@ class BufferedEmitter:
         self._dropped_buffer_full = 0
         self._dropped_not_a_record = 0
         self._dropped_closed = 0
+        self._dropped_at_close = 0
 
         self._warner = RateLimitedWarner(_logger, interval=warn_interval)
 
@@ -319,8 +336,9 @@ class BufferedEmitter:
         The final flush is **bounded** by ``timeout`` (defaulting to the
         ``close_timeout`` given at construction). A sink wedged against a dead
         broker must not be able to hang a process shutdown, so the wait ends and
-        the remaining records are lost — logged, and visible as ``buffered`` in a
-        final :meth:`stats`. If the worker is still delivering when that happens,
+        the remaining records are lost — logged, and counted as
+        :attr:`EmitterStats.dropped_at_close`, which is inside
+        :attr:`EmitterStats.dropped`. If the worker is still delivering when that happens,
         the sink is closed underneath it; the resulting failure is guarded and
         counted like any other.
 
@@ -343,6 +361,16 @@ class BufferedEmitter:
         if worker.is_alive() and worker is not threading.current_thread():
             worker.join(wait_for)
             if worker.is_alive():
+                # Abandon what is left, and *account* for it. Clearing the buffer
+                # under the lock is what makes the count exact rather than a
+                # guess: these records are now definitively lost, and emptying it
+                # means a worker that wakes up later cannot also deliver them and
+                # be counted twice. Records already in flight are not in the
+                # buffer, so they stay attributable to `delivered` or `failed`.
+                with self._condition:
+                    abandoned = len(self._buffer)
+                    self._buffer.clear()
+                    self._dropped_at_close += abandoned
                 self._warner.warn(_FLUSH_TIMED_OUT, exc_info=False)
 
         try:
@@ -412,6 +440,7 @@ class BufferedEmitter:
                 dropped_buffer_full=self._dropped_buffer_full,
                 dropped_not_a_record=self._dropped_not_a_record,
                 dropped_closed=self._dropped_closed,
+                dropped_at_close=self._dropped_at_close,
                 buffered=len(self._buffer),
                 worker_alive=self._worker_alive,
             )

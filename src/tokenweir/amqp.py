@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any, Callable, Optional, Tuple
 
 from tokenweir._ratelimit import RateLimitedWarner
@@ -272,6 +273,12 @@ class AMQPSink:
         owns_connection: whether :meth:`close` should close ``connection``.
         warn_interval: seconds between warning lines for a repeating failure, so an
             unreachable broker cannot produce one log line per metered call.
+        reconnect_interval: minimum seconds between reconnect *attempts* after one
+            has failed. The first attempt after a connection is lost is always
+            immediate; this bounds how often a down broker is re-dialled, because
+            a blocking connect per record is a retry loop by another name. ``0``
+            attempts on every publish.
+        clock: monotonic seconds source, for testing the interval without sleeping.
 
     Raises:
         ImportError: ``pika`` is not installed and no ``properties`` were given,
@@ -288,6 +295,8 @@ class AMQPSink:
         connection: Any = None,
         owns_connection: bool = False,
         warn_interval: float = 60.0,
+        reconnect_interval: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._channel = channel
         self._connection = connection
@@ -304,6 +313,9 @@ class AMQPSink:
         )
         self._url: Optional[str] = None
         self._reconnect: Optional[Callable[[], Tuple[Any, Any]]] = None
+        self._clock = clock
+        self._reconnect_interval = max(0.0, float(reconnect_interval))
+        self._next_reconnect_at = 0.0
         self._warner = RateLimitedWarner(_logger, interval=warn_interval)
 
     @classmethod
@@ -315,6 +327,8 @@ class AMQPSink:
         routing_key: str = DEFAULT_ROUTING_KEY,
         properties: Any = None,
         warn_interval: float = 60.0,
+        reconnect_interval: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> "AMQPSink":
         """Open a pika ``BlockingConnection`` from an AMQP URL and own it.
 
@@ -348,6 +362,8 @@ class AMQPSink:
             connection=connection,
             owns_connection=True,
             warn_interval=warn_interval,
+            reconnect_interval=reconnect_interval,
+            clock=clock,
         )
         sink._url = url
         sink._reconnect = connect
@@ -429,16 +445,33 @@ class AMQPSink:
     # --- internals ---------------------------------------------------------
 
     def _live_channel(self) -> Any:
-        """The channel to publish on, reconnecting if this sink owns the connection."""
+        """The channel to publish on, re-establishing it if this sink can.
+
+        **Reconnect attempts are spaced by ``reconnect_interval``**, and that bound
+        is the point rather than a refinement. ``pika.BlockingConnection`` blocks
+        for the socket's connect timeout, and this runs on the delivery worker — so
+        an unbounded attempt-per-record rate is exactly the "retry loop in front of
+        a broken broker" this module's docstring says it refuses, reintroduced one
+        attempt at a time. Against a broker that is down it would spend a full
+        connect timeout per buffered record while the buffer fills behind it.
+
+        The *first* attempt after a connection is invalidated is always immediate:
+        the common case is a blip, and making a caller wait out an interval to
+        recover from it would trade a real fault for an invented one. The spacing
+        starts only once an attempt has actually failed.
+        """
         if self._channel is not None:
             return self._channel
         if self._reconnect is None:
-            # A borrowed channel that has been invalidated, or no channel at all.
-            # Not ours to re-make; the caller owns its liveness.
+            # A channel this sink cannot re-make — borrowed, or absent entirely.
+            # Not ours to replace; whoever owns it owns its liveness.
+            return None
+        if self._clock() < self._next_reconnect_at:
             return None
         try:
             self._connection, self._channel = self._reconnect()
         except Exception as exc:
+            self._next_reconnect_at = self._clock() + self._reconnect_interval
             # `exc_info=False`, and the cause rendered by hand: a traceback would
             # carry the driver's own message, and a driver that echoes the URL it
             # could not reach would put `user:password@host` in the log through
@@ -451,17 +484,27 @@ class AMQPSink:
                 exc_info=False,
             )
             return None
+        self._next_reconnect_at = 0.0
         return self._channel
 
     def _invalidate(self) -> None:
         """Drop a failed connection so the next publish re-establishes it.
 
-        Only for a connection this sink owns: re-making a caller's channel would
-        substitute this module's idea of how to connect for theirs. A borrowed
-        channel is left exactly as it was, so a caller who repairs it out of band
-        sees publishing resume with no cooperation from here.
+        Gated on being **able to reconnect**, not on owning the connection. Those
+        are not the same condition, and keying off ownership was a defect: only
+        :meth:`from_url` sets ``_reconnect``, so the documented public combination
+        ``AMQPSink(channel, connection=conn, owns_connection=True)`` closed its
+        connection, nulled its channel, and then had no way to make another — a
+        sink permanently dead after one publish failure, which is strictly worse
+        than the borrowed case it was modelled on, since there the caller can at
+        least repair the channel out of band.
+
+        A channel this sink cannot re-make is therefore left exactly as it was,
+        whoever owns it. Publishing keeps failing, and keeps being counted and
+        logged, until the thing behind it is repaired — which is a state a caller
+        can act on, unlike silence.
         """
-        if not self._owns_connection:
+        if self._reconnect is None:
             return
         self._release()
         self._channel = None

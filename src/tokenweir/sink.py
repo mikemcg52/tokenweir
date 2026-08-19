@@ -233,7 +233,7 @@ class DirectSink:
 
     @property
     def dropped(self) -> int:
-        """Records lost because the store failed or the sink was closed."""
+        """Records lost — refused, unstorable, or offered after :meth:`close`."""
         with self._lock:
             return self._dropped
 
@@ -244,19 +244,42 @@ class DirectSink:
     def emit_batch(self, records: Iterable[UsageRecord]) -> None:
         """Write a batch in a single :meth:`~tokenweir.source.Source.write` call.
 
-        Never raises. A batch containing one unwritable record is lost whole rather
-        than in part, which is ``rows_for``'s documented behaviour and the reason it
-        validates before opening a transaction: the alternative is a partially written
-        batch, which is worse than a wholly dropped one for a consumer that acks on the
-        call returning.
+        Never raises. Two different rules apply to two different kinds of bad input,
+        and the difference is deliberate:
+
+        - A value that is **not a** :class:`~tokenweir.contract.UsageRecord` is
+          filtered out and counted, and the rest of the batch is written. It could
+          never have been stored, so dropping it costs the good records nothing.
+        - A record the **store** cannot take loses the batch **whole**. That is
+          ``rows_for``'s documented behaviour and the reason it validates before
+          opening a transaction: a partially written batch is worse than a wholly
+          dropped one for a consumer that acks on the call returning.
         """
         try:
-            batch = list(records)
+            offered = list(records)
         except Exception:
             # A generator that raises while being drained. Nothing was written and
             # there is no count to attribute it to, so it is one drop event.
             self._warner.warn(_DIRECT_WRITE_FAILED)
             return
+        # Non-records are refused here rather than handed to the store, matching
+        # what `AMQPSink` does at the same seam. Both adapters sit downstream of
+        # `build_record`, which returns `None` on a construction drop, and a
+        # `Source` is under no obligation to notice: `MemorySource` would store the
+        # `None`, and `PostgresSource.rows_for` would raise — losing the whole
+        # batch around it rather than the one bad value.
+        #
+        # Filtered rather than refusing the batch whole, which is the one place
+        # this deliberately differs from `rows_for`. That rule exists so a batch is
+        # never *half* written; dropping a value that could never have been written
+        # at all costs the good records nothing, and salvaging them is strictly
+        # better than losing them to a producer's `None`.
+        batch = [record for record in offered if isinstance(record, UsageRecord)]
+        refused = len(offered) - len(batch)
+        if refused:
+            with self._lock:
+                self._dropped += refused
+            self._warner.warn(_NOT_A_RECORD, exc_info=False)
         if not batch:
             return
         # The flag is read under the same lock that guards the counters. It was

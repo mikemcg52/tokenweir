@@ -700,6 +700,14 @@ def test_the_client_delivers_to_a_direct_sink_over_a_source():
         {"linger": float("inf")},
         {"linger": "soon"},
         {"close_timeout": -1.0},
+        # `warn_interval` skipped this validation at first and was silently
+        # clamped inside the warner, so the docstring promised a `ValueError` the
+        # constructor did not deliver — and `warn_interval=None` raised `TypeError`
+        # from the clamp instead. Wiring-time validation that covers only some of
+        # the wiring is the kind that gets trusted and then surprises someone.
+        {"warn_interval": -1.0},
+        {"warn_interval": None},
+        {"warn_interval": "a minute"},
     ],
 )
 def test_a_nonsensical_configuration_is_rejected_at_construction(kwargs):
@@ -831,3 +839,98 @@ def test_a_healthy_client_reports_a_live_worker():
         emitter.emit(_record(1))
         assert emitter.flush(timeout=TIMEOUT)
         assert emitter.stats().worker_alive is True
+
+
+# --- Records abandoned by a close timeout are accounted for (Low #2) ---------
+
+
+def test_records_abandoned_by_a_close_timeout_are_counted():
+    """`close()` is bounded so a dead broker cannot hang a shutdown, and the
+    records still buffered when the wait ends are lost. They used to land in no
+    `dropped_*` counter at all — an operator alerting on `stats().dropped`, which
+    the README calls the signal to alert on, missed the entire class."""
+    sink = BlockingSink()
+    emitter = BufferedEmitter(sink, linger=0.0, batch_size=1, max_buffer=100)
+    try:
+        emitter.emit(_record(0))
+        assert sink.entered.wait(TIMEOUT), "the worker never entered the sink"
+        for n in range(1, 11):
+            emitter.emit(_record(n))
+
+        emitter.close(timeout=0.2)
+
+        stats = emitter.stats()
+        assert stats.dropped_at_close == 10, stats
+        assert stats.dropped >= 10
+        assert stats.buffered == 0, "the abandoned records were left in the buffer"
+    finally:
+        sink.release.set()
+
+
+def test_a_clean_close_abandons_nothing():
+    sink = RecordingSink()
+    emitter = BufferedEmitter(sink, linger=0.0)
+    for n in range(10):
+        emitter.emit(_record(n))
+    emitter.close(timeout=TIMEOUT)
+    stats = emitter.stats()
+    assert stats.dropped_at_close == 0
+    assert stats.delivered == 10
+    assert stats.dropped == 0
+
+
+def test_an_abandoned_record_is_not_also_counted_as_delivered():
+    """Clearing the buffer under the lock is what makes the count exact: a worker
+    that wakes up after the timeout must not deliver records already written off."""
+    sink = BlockingSink()
+    emitter = BufferedEmitter(sink, linger=0.0, batch_size=1)
+    try:
+        emitter.emit(_record(0))
+        assert sink.entered.wait(TIMEOUT)
+        for n in range(1, 6):
+            emitter.emit(_record(n))
+        emitter.close(timeout=0.2)
+    finally:
+        sink.release.set()
+
+    # The close timed out with the worker still inside `emit`, so the in-flight
+    # record has not landed yet and the identity below is not true *yet*. Joining
+    # the worker is the deterministic way to wait for it; there is no public "wait
+    # for the worker after a close that timed out", and reading the counters
+    # immediately would be asserting on a race rather than on the accounting.
+    emitter._worker.join(TIMEOUT)
+    assert not emitter._worker.is_alive(), "the worker never finished"
+
+    stats = emitter.stats()
+    # The in-flight record stays attributable; the five abandoned ones are lost.
+    # Nothing is counted twice, which is what clearing the buffer under the lock
+    # buys — a worker waking after the timeout cannot re-deliver a written-off
+    # record.
+    assert stats.dropped_at_close == 5
+    assert stats.accepted == 6
+    assert stats.delivered + stats.failed + stats.dropped_at_close == stats.accepted
+
+
+# --- FR-002: what still propagates on the calling thread (Low #3) ------------
+
+
+def test_a_base_exception_on_the_calling_thread_still_propagates():
+    """The half of FR-002 nothing pinned. A sink's `BaseException` belongs to the
+    worker and never reaches an emitting thread — but one raised *on* the calling
+    thread, by an application's own logging handler, is that thread's to receive.
+    `KeyboardInterrupt` staying swallowed here would be the worse bug."""
+    logger = logging.getLogger("tokenweir.emitter")
+
+    class Interrupting(logging.Handler):
+        def emit(self, record):
+            raise KeyboardInterrupt
+
+    handler = Interrupting()
+    handler.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        with BufferedEmitter(RecordingSink(), linger=0.0) as emitter:
+            with pytest.raises(KeyboardInterrupt):
+                emitter.emit(None)  # a refused record warns, and the handler bites
+    finally:
+        logger.removeHandler(handler)

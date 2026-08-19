@@ -309,6 +309,7 @@ did not produce it.
 stats = emitter.stats()
 stats.accepted, stats.delivered, stats.failed
 stats.dropped_buffer_full, stats.dropped_not_a_record, stats.dropped_closed
+stats.dropped_at_close   # abandoned when close() hit its timeout
 stats.dropped        # every record the client took on and did not deliver
 stats.buffered, stats.worker_alive
 ```
@@ -325,6 +326,8 @@ is worth knowing precisely:
 - **`worker_alive` is the one flag that means "this client has stopped metering".**
   It goes false only if a sink raised a `BaseException`, which is deliberately not
   caught. Everything else is a counted drop and the client keeps working.
+- **`dropped` includes `dropped_at_close`**, so records abandoned by a `close()`
+  that timed out against a wedged sink are inside the one number worth alerting on.
 
 ### Knobs
 
@@ -334,7 +337,7 @@ is worth knowing precisely:
 | `batch_size` | `100` | The most records handed to the sink at once. |
 | `linger` | `0.2` | How long the worker waits for a partial batch to fill. `flush()` and `close()` both cut it short, so it never delays a shutdown. |
 | `close_timeout` | `5.0` | Bound on `close()`'s final flush. A wedged sink must not hang a process exit. |
-| `warn_interval` | `60.0` | Seconds between warning lines for a repeating failure. |
+| `warn_interval` | `60.0` | Seconds between warning lines for a repeating failure, **per reason**. |
 
 ### Lifecycle
 
@@ -397,12 +400,21 @@ failure is redacted before it is logged, the same rule `tokenweir.migrations`
 applies to a Postgres DSN. `from_url` still raises the driver's own exception
 unredacted, because you supplied the URL and may be catching pika's exception type.
 
-**Ownership decides reconnection.** A connection the sink opened, it may re-open:
-on a publish failure it drops the connection and re-establishes on the *next*
-attempt, never by retrying inside the current one. A channel you hand in is never
-reconnected — this object does not know how it was made, and guessing would replace
-your TLS context, credentials or pooling with its own. `close()` closes only a
-connection the sink opened itself.
+**Being able to reconnect decides reconnection** — not ownership, which is a
+different question. A sink built by `from_url` knows how to re-dial, so on a publish
+failure it drops the connection and re-establishes on the *next* attempt, never by
+retrying inside the current one. A channel you hand in is never re-made, whoever
+owns it: this object does not know how it was built, and guessing would replace your
+TLS context, credentials or pooling with its own. Such a channel is left exactly as
+it was, so publishing resumes the moment you repair it, with no cooperation needed
+here. `close()` still closes only a connection the sink opened itself.
+
+Reconnect *attempts* are spaced by `reconnect_interval` (default 5s). The first
+attempt after a connection is lost is always immediate — a blip should recover at
+once — and the spacing applies only after an attempt has failed. Without it, a
+`BlockingConnection` dial per buffered record would block the emitter's worker for a
+full connect timeout each time, which is the retry loop this design refuses,
+reintroduced one attempt at a time.
 
 **Declaring the topology is not the adapter's job.** Exchanges, queues and bindings
 outlive any process; a library that declared them would silently own them, and fail
