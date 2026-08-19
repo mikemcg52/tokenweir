@@ -96,7 +96,24 @@ must end with that reproduction as a test that fails on the parent commit.
 
 ---
 
-## Phase 7: Verification
+## Phase 7 (fix round 5): the guidance on the line that fires
+
+- [x] **T026** Move the exchange/routing-key hint from `_AWAITING_PUBLISHABLE` to
+      `_DIAL_CEILING_REACHED`. Measured against a driver-shaped double, a missing exchange never
+      reaches the "could not publish" arm at all — the phantom first publish makes every connection
+      look productive, so the cap is what stops it, and the cap's line is the one an operator
+      actually sees. The advice was correct and in the wrong place (Med-1, Med-2).
+- [x] **T027** Correct the README paragraph that sent someone debugging that exact outage to the
+      wrong table row and the wrong log line (Med-1).
+- [x] **T028** Record that `reconnect_interval=0` disables the cap — the story's only structural
+      guarantee has a supported off switch, previously documented only inside `_may_dial` (Low-1);
+      reword FR-003 to match where the reset actually lives (Low-2); assert the 20-interval dial
+      count exactly rather than at a zero-headroom upper bound (Low-3); extend the thread-safety
+      note to the four fields this story added (Low-4).
+
+---
+
+## Phase 8: Verification
 
 - [x] **T018** Mutation-check **every** assignment the fix adds — not "both halves", which is what
       this task first said and what the round-1 commit claimed to have done. There are three, and
