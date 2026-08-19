@@ -450,9 +450,13 @@ those records dropped, where dialling per record would have stumbled into a work
 connection. That is the trade — the dialling is the thing that was hurting the
 metered service — and the window bounds it.
 
-The allowance renews per *working* connection, so a flaky link that keeps
-publishing between drops recovers instantly every time rather than degrading into a
-rate-limited one.
+The allowance renews per *working* connection, so a flaky link that keeps publishing
+between drops recovers instantly rather than degrading into a rate-limited one —
+up to `MAX_DIALS_PER_INTERVAL` recoveries per interval. A link dropping more often
+than that inside one window has the excess refused and its records dropped until the
+window turns over, because the cap above overrides every immediacy rule here. That
+is the intended order of precedence: a link failing that often is not one the sink
+should keep re-dialling.
 
 **Declaring the topology is not the adapter's job.** Exchanges, queues and bindings
 outlive any process; a library that declared them would silently own them, and fail

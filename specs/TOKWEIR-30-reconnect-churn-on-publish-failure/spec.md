@@ -180,7 +180,13 @@ tests; this story must not quietly change what they assert.
   published a record, the reconnect interval MUST be armed, so subsequent records do not each
   trigger a dial.
 - **FR-001a**: Dials MUST be capped per interval **unconditionally**, whatever FR-001's and
-  FR-002's reasoning about productivity concludes.
+  FR-002's reasoning about productivity concludes. The cap therefore **overrides FR-002's
+  immediacy**: a link dropping more often than `MAX_DIALS_PER_INTERVAL` times inside one window has
+  the excess recoveries refused and its records dropped until the window turns over. The window is
+  fixed rather than sliding, so the rate is per interval asymptotically while a span of one
+  interval's length can straddle a boundary and contain up to `2 * MAX_DIALS_PER_INTERVAL - 1` dials.
+  Both are deliberate, and both must be stated wherever immediacy is promised — including
+  TOKWEIR-6's FR-024, which FR-008 covers.
 
   > **Added in fix round 2, and it is now the clause that carries the story.** FR-001 and FR-002
   > infer *why* a connection failed from whether it had published. Review 2 established from pika's

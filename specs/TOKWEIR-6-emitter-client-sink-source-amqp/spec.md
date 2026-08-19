@@ -315,6 +315,16 @@ running environment.
   > TOKWEIR-30 answers it — a connection that had been publishing earns an immediate re-dial, one
   > that never published earns exactly one, and after that the interval applies — and carries the
   > reasoning.
+  >
+  > **And it bounds the word "immediate" in this clause.** TOKWEIR-30 adds
+  > `tokenweir.amqp.MAX_DIALS_PER_INTERVAL`, a hard cap on dials per interval that overrides every
+  > immediacy rule above it, including this one: a link that drops and recovers more than
+  > `MAX_DIALS_PER_INTERVAL` times inside a single interval has the excess recoveries refused, and
+  > its records dropped, until the window turns over. That is deliberate — the cap exists because
+  > the immediacy rules infer a broker's intent from a driver whose publish is asynchronous, and an
+  > inference is the wrong thing to hang a bound on — but "the first attempt after a lost connection
+  > immediate" as written here is now true only up to that cap, and this clause would be promising
+  > something the code does not deliver if it did not say so.
 - **FR-025**: The record→message mapping MUST be a pure function, testable with no `pika` installed
   and no broker running.
 

@@ -111,8 +111,12 @@ state that class already had the natural home for.
   is checked by running it against the parent commit, not assumed.
 - **The property most at risk**: blip recovery. Asserted with the clock **not advanced at all**, so
   a fix that armed the interval unconditionally cannot pass.
-- **Renewal**: publish → fail → recover → publish → fail → recover, asserting both recoveries are
-  immediate.
+- **Renewal**: publish → fail → recover, repeated `MAX_DIALS_PER_INTERVAL` times **with the clock
+  frozen**, so no recovery can be explained by the interval expiring. Three cycles rather than four
+  because the cap refuses a fourth inside one window — and an earlier draft that advanced the clock
+  between cycles to make room for four stopped testing renewal altogether: disabling the productive
+  branch outright left it green. Freezing the clock is the assertion; the cycle count follows from
+  the cap.
 - **Regression**: every existing AMQP test runs unchanged. If one needs editing, the fix is wrong.
 - **Mutation**: revert each half of the change and confirm a test fails, rather than trusting that
   new tests bite.

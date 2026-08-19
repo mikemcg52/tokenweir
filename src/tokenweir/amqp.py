@@ -137,16 +137,30 @@ _NO_CHANNEL = (
 #: So the productivity rule stays as the thing that gets the *common* case right and
 #: keeps recovery instant, and this cap is what holds when the rule is fooled.
 #: Structural rather than inferential: however many times the rule concludes "this
-#: one deserves an immediate re-dial", dialling is capped. Three is small enough to
-#: bound churn hard and large enough that a genuine recovery burst — lose, recover,
-#: lose again — never reaches it.
+#: one deserves an immediate re-dial", dialling is capped — the cap **overrides**
+#: those rules rather than deferring to them, which is the whole point of having it.
+#:
+#: Three is small enough to bound churn hard and large enough for an ordinary
+#: recovery burst — lose, recover, lose again — to complete inside one window. A
+#: link that drops more often than that within a single interval *does* reach the
+#: cap and has the excess recoveries refused, with its records dropped until the
+#: window turns over. That is the intended trade and not an edge case to be
+#: designed away: a link failing four times in one interval is not one worth
+#: re-dialling on every record.
+#:
+#: The window is **fixed**, not sliding: it is anchored at the first dial after the
+#: previous one expired. So the asymptotic rate is this many dials per interval,
+#: while an adversarially-placed span of one interval's length can contain up to
+#: ``2 * MAX_DIALS_PER_INTERVAL - 1`` of them, straddling a boundary. A sliding
+#: window would cost a timestamp deque to remove a factor of two from a backstop,
+#: which is not a trade worth making.
 MAX_DIALS_PER_INTERVAL = 3
 
 _DIAL_CEILING_REACHED = (
     "tokenweir: usage record not published — the AMQP sink has hit its cap of "
-    f"{MAX_DIALS_PER_INTERVAL} reconnects per interval and is waiting; the broker "
-    "is accepting connections but records are not getting through. No metering "
-    "for these calls"
+    f"{MAX_DIALS_PER_INTERVAL} reconnects per interval and is waiting; the "
+    "connection is being lost and re-made faster than this sink will keep chasing "
+    "it. No metering for these calls"
 )
 # Three distinct reasons the sink is not publishing, and they must not share a
 # message. This module has already litigated the point once (`_NO_CHANNEL` used to
@@ -158,11 +172,16 @@ _AWAITING_REDIAL = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
     "after a failed connection attempt; no metering for this call"
 )
+# "two or more", not "two": the count keeps climbing while the fault persists, and
+# it does not decay with time either — two reset-before-first-publish blips a day
+# apart are still consecutive as far as this counter is concerned. That matches
+# FR-001 as written and costs at most one interval of guidance pointed slightly the
+# wrong way; what it must not do is state a number it has not checked.
 _AWAITING_PUBLISHABLE = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
-    "after two connections in a row failed to publish anything; if this persists, "
-    "check that the exchange and routing key exist and are permitted. No metering "
-    "for these calls"
+    "after two or more connections in a row failed to publish anything; if this "
+    "persists, check that the exchange and routing key exist and are permitted. No "
+    "metering for these calls"
 )
 
 

@@ -1109,21 +1109,32 @@ def test_the_immediate_recovery_allowance_renews_per_productive_connection(fake_
     sink = AMQPSink.from_url(
         "amqp://guest:guest@rabbit/", reconnect_interval=interval, clock=lambda: now[0]
     )
-    for cycle in range(4):
+
+    # The clock never moves. That is the whole assertion: every recovery below
+    # happens with zero elapsed time, so none of them can be explained by the
+    # interval expiring — which is the only way this test distinguishes "the
+    # allowance renewed" from "we waited long enough".
+    #
+    # Three cycles, not four, and not because three reads better: `MAX_DIALS_PER_INTERVAL`
+    # is 3, so a fourth recovery inside one frozen window is refused by the cap
+    # (correctly — see `test_the_cap_overrides_even_an_immediate_recovery`). An
+    # earlier version of this test advanced the clock past the interval between
+    # cycles to make room for four, which made every recovery explicable by the
+    # interval and quietly stopped testing renewal at all: disabling the productive
+    # branch outright left it green.
+    for cycle in range(MAX_DIALS_PER_INTERVAL):
         sink.emit(_record(cycle * 10))  # publishes: this connection is productive
+        assert sink.published == cycle + 1, f"cycle {cycle} did not publish"
         fake_pika.connections[-1].channel().fail_with = RuntimeError("connection reset")
         sink.emit(_record(cycle * 10 + 1))  # fails, invalidates
-        # The clock does **not** move across that failure and the recovery below,
-        # which is what proves the recovery is immediate. It moves *between*
-        # cycles, past the interval, so the four recoveries fall in four separate
-        # dial windows — otherwise this would be asserting that a sink may dial
-        # four times with zero elapsed time, which `MAX_DIALS_PER_INTERVAL` refuses
-        # on purpose and no real workload asks for.
-        now[0] += interval + 1.0
+
     sink.emit(_record(99))
 
-    assert sink.published == 5, f"only {sink.published} published across 4 blips"
-    assert len(fake_pika.connections) == 5
+    assert sink.published == MAX_DIALS_PER_INTERVAL + 1, (
+        f"only {sink.published} published across {MAX_DIALS_PER_INTERVAL} blips with "
+        "the clock frozen — a recovery was not immediate"
+    )
+    assert len(fake_pika.connections) == MAX_DIALS_PER_INTERVAL + 1
 
 
 def test_one_free_redial_then_the_interval_arms(fake_pika):
@@ -1617,3 +1628,53 @@ def test_a_non_record_does_not_disturb_a_reconnectable_sinks_state(fake_pika):
     sink.emit(_record(1))  # and the sink still works
     assert sink.published == 2
     assert len(fake_pika.connections) == 1
+
+
+def test_the_cap_overrides_even_an_immediate_recovery(fake_pika):
+    """The cap's precedence, asserted rather than left to be inferred from two
+    paragraphs that have to be read together.
+
+    A link that drops and recovers faster than `MAX_DIALS_PER_INTERVAL` per
+    interval has the excess recoveries refused — even though each one is a
+    productive connection being lost, which every rule above the cap says earns an
+    immediate re-dial. That ordering is the reason the cap is worth having: the
+    rules above it are inferences about a broker's intent, and this one is not.
+    """
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    for cycle in range(MAX_DIALS_PER_INTERVAL + 3):
+        sink.emit(_record(cycle * 10))
+        fake_pika.connections[-1].channel().fail_with = RuntimeError("connection reset")
+        sink.emit(_record(cycle * 10 + 1))
+        now[0] += 0.1  # well inside the window
+
+    assert sink.published == MAX_DIALS_PER_INTERVAL + 1, (
+        f"{sink.published} published — the cap did not override the immediate "
+        "recovery rule"
+    )
+    assert len(fake_pika.connections) == MAX_DIALS_PER_INTERVAL + 1
+
+    # And it is a window, not a wall: once it turns over, recovery resumes.
+    now[0] += 30.0
+    sink.emit(_record(999))
+    assert sink.published == MAX_DIALS_PER_INTERVAL + 2
+
+
+def test_the_dial_cap_is_the_value_the_spec_names():
+    """Pinned because nothing else does: every other assertion refers to the
+    symbol, so changing the constant leaves the whole suite green while the spec
+    goes on naming a different number.
+
+    That is not a hypothetical failure mode here — SC-001 and SC-005 between them
+    needed three amendments in this story alone, each because code moved and a
+    number written elsewhere did not. This is the cheapest possible guard against
+    the next one: if the value should change, this test says so out loud and the
+    spec gets changed in the same commit.
+    """
+    assert MAX_DIALS_PER_INTERVAL == 3, (
+        "MAX_DIALS_PER_INTERVAL changed; update SC-001 and FR-001a in "
+        "specs/TOKWEIR-30-reconnect-churn-on-publish-failure/spec.md, and the "
+        "README's reconnect section, in this commit"
+    )

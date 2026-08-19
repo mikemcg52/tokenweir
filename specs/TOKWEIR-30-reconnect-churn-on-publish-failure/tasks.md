@@ -80,7 +80,23 @@ must end with that reproduction as a test that fails on the parent commit.
 
 ---
 
-## Phase 6: Verification
+## Phase 6 (fix round 4): saying what the cap actually costs
+
+- [x] **T023** State the cap's precedence everywhere immediacy is promised — TOKWEIR-6's FR-024
+      (which FR-008 exists to keep honest and which still said "immediate" unqualified), the README,
+      and the constant's own docstring, whose justification for the value `3` was the claim the cap
+      falsifies (Med-1, Med-2).
+- [x] **T024** Rewrite the renewal test to freeze the clock. Round 2 had made it advance past the
+      interval between cycles so four would fit under the cap, which made every recovery explicable
+      by the interval and stopped it testing renewal at all — disabling the productive branch left
+      it green. Three cycles under a frozen clock is the assertion (Med-3).
+- [x] **T025** Add a test for the cap overriding an immediate recovery, and one pinning
+      `MAX_DIALS_PER_INTERVAL == 3` so the constant and the spec cannot drift apart silently — which
+      is the failure this story has already had three times (Low-3).
+
+---
+
+## Phase 7: Verification
 
 - [x] **T018** Mutation-check **every** assignment the fix adds — not "both halves", which is what
       this task first said and what the round-1 commit claimed to have done. There are three, and
