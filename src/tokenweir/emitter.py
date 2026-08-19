@@ -156,6 +156,13 @@ class EmitterStats:
             construction drop.
         dropped_closed: records offered after :meth:`BufferedEmitter.close`.
         buffered: records currently waiting for delivery.
+        worker_alive: whether the delivery worker is still running. ``False`` on a
+            client that has not been closed means nothing further will ever be
+            delivered — the worker was killed by a ``BaseException`` from a sink,
+            which is deliberately not caught. Without this flag that state is
+            visible only as ``buffered`` climbing while ``delivered`` does not,
+            which is a symptom, not a diagnosis; a client that is quietly no
+            longer metering should be able to say so directly.
     """
 
     accepted: int = 0
@@ -165,6 +172,7 @@ class EmitterStats:
     dropped_not_a_record: int = 0
     dropped_closed: int = 0
     buffered: int = 0
+    worker_alive: bool = True
 
     @property
     def dropped(self) -> int:
@@ -398,6 +406,7 @@ class BufferedEmitter:
                 dropped_not_a_record=self._dropped_not_a_record,
                 dropped_closed=self._dropped_closed,
                 buffered=len(self._buffer),
+                worker_alive=self._worker_alive,
             )
 
     # --- internals ---------------------------------------------------------

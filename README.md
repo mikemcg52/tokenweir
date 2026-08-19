@@ -300,23 +300,37 @@ and counted. What actually recovers from an outage is reconnection, which belong
 the adapter and happens on a later delivery attempt.
 
 Neither drop is silent. Both are counted, and both log a rate-limited `WARNING` so a
-systematically broken sink cannot produce one log line per metered request.
+systematically broken sink cannot produce one log line per metered request. The
+window is **per reason**: a chatty broker failure never suppresses a first sighting
+of an unrelated one, and a suppressed count is never reported against a cause that
+did not produce it.
 
 ```python
 stats = emitter.stats()
 stats.accepted, stats.delivered, stats.failed
 stats.dropped_buffer_full, stats.dropped_not_a_record, stats.dropped_closed
 stats.dropped        # every record the client took on and did not deliver
+stats.buffered, stats.worker_alive
 ```
 
 `stats()` is the signal to alert on: it is a consistent snapshot, richer than a
-return value, and it reaches you regardless of logging configuration.
+return value, and it reaches you regardless of logging configuration. Two things it
+is worth knowing precisely:
+
+- **`delivered` counts hand-off, not persistence.** It means the sink accepted the
+  record without raising. A conforming sink cannot raise, so a sink that swallows
+  its own failure — `DirectSink` does exactly this when the store is down — is
+  counted as delivered here. On the broker-less path, read `DirectSink.dropped`
+  alongside it; on the AMQP path, `AMQPSink.dropped`.
+- **`worker_alive` is the one flag that means "this client has stopped metering".**
+  It goes false only if a sink raised a `BaseException`, which is deliberately not
+  caught. Everything else is a counted drop and the client keeps working.
 
 ### Knobs
 
 | Argument | Default | What it decides |
 |---|---|---|
-| `max_buffer` | `10_000` | The bound. Reaching it drops rather than blocking or growing. |
+| `max_buffer` | `10_000` | The bound on records *waiting*. Reaching it drops rather than blocking or growing. A batch already in flight is outside it, so peak retention is `max_buffer + batch_size`. |
 | `batch_size` | `100` | The most records handed to the sink at once. |
 | `linger` | `0.2` | How long the worker waits for a partial batch to fill. `flush()` and `close()` both cut it short, so it never delays a shutdown. |
 | `close_timeout` | `5.0` | Bound on `close()`'s final flush. A wedged sink must not hang a process exit. |
@@ -359,10 +373,29 @@ Each record is published as its JSON wire form, persistent (`delivery_mode=2`) w
 a JSON content type — metering that evaporated on a broker restart would make the
 broker path pointless.
 
-`pika` is imported only when a connection is opened, never at module import, so a
-bare `pip install tokenweir` carries no AMQP library and the record→message mapping
-(`message_for`) is usable and testable with none installed. A missing `pika` raises
-an `ImportError` naming `tokenweir[amqp]`.
+`pika` is never imported at module import, so a bare `pip install tokenweir` carries
+no AMQP library and the record→message mapping (`message_for`) is usable and testable
+with none installed. It *is* imported when a sink is **constructed** — wiring time,
+where a missing driver raises an `ImportError` naming `tokenweir[amqp]` while
+somebody is still watching.
+
+That last part is deliberate rather than incidental. Deferring the import further,
+to the first publish, looks tidier and is a trap: the publish path may not raise, so
+a missing driver discovered there is not an error at all — it is a silent 100% drop
+of every record, for the life of the process, in the one code path whose whole job
+is never to complain.
+
+To build a sink over a channel of your own with no `pika` installed at all, pass
+`properties=` — the driver is only needed to construct the message properties:
+
+```python
+sink = AMQPSink(channel, properties=my_basic_properties)
+```
+
+Nothing this library writes to a log carries the URL's credentials: a reconnect
+failure is redacted before it is logged, the same rule `tokenweir.migrations`
+applies to a Postgres DSN. `from_url` still raises the driver's own exception
+unredacted, because you supplied the URL and may be catching pika's exception type.
 
 **Ownership decides reconnection.** A connection the sink opened, it may re-open:
 on a publish failure it drops the connection and re-establishes on the *next*

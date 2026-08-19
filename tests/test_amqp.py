@@ -3,17 +3,29 @@
 Two of the story's three acceptance clauses live here: *"a service emits via the
 client with an AMQP sink"* and *"the core imports without transport libraries"*.
 
-**Everything here runs with no `pika` installed and no broker running**, which is
-not a compromise — it is the point. What an adapter test can meaningfully assert
-is that the right bytes go to the right exchange with the right properties; that
-RabbitMQ works is RabbitMQ's test. The pure mapping is exercised directly, the
-publish path against a recording channel, and the two code paths that genuinely
-need `pika` (its `BasicProperties`, and `from_url`) against a fake module injected
-into `sys.modules` — which exercises the real deferred-import code rather than a
-stand-in for it.
+**The whole suite runs with no broker and no `pika` package installed**, which is
+not a compromise — it is the point. What an adapter test can meaningfully assert is
+that the right bytes go to the right exchange with the right properties; that
+RabbitMQ works is RabbitMQ's test.
+
+Being precise about *how*, because the earlier version of this docstring was not
+and the imprecision hid a defect. `message_for` and `publish_properties` need
+nothing at all and are exercised directly. Constructing an `AMQPSink` does need a
+`pika` module object, because that is where the message properties come from — so
+these tests get one of two ways, each deliberate:
+
+- `properties=` — the documented escape hatch for a caller with a channel double,
+  which needs no `pika` in any form;
+- the `fake_pika` fixture, which injects a minimal module into `sys.modules` so the
+  real deferred-import code runs rather than a stand-in for it. That is the only
+  way to cover `from_url` and the default properties at all here.
+
+And `sys.modules["pika"] = None` covers the missing-driver path, which is the one
+that has to fail loudly rather than silently.
 """
 
 import json
+import logging
 import subprocess
 import sys
 import types
@@ -216,7 +228,7 @@ def test_the_properties_object_is_built_once(fake_pika):
 def test_it_is_a_sink_but_not_a_batch_sink():
     """AMQP has no batch publish; an `emit_batch` here would be a loop wearing a
     costume. Leaving it off is what exercises the emitter's per-record fallback."""
-    sink = AMQPSink(RecordingChannel())
+    sink = AMQPSink(RecordingChannel(), properties=FakeProperties())
     assert isinstance(sink, Sink)
     assert not isinstance(sink, BatchSink)
 
@@ -344,7 +356,7 @@ def test_a_reconnect_that_also_fails_is_a_drop_not_a_raise(monkeypatch, fake_pik
 
 def test_the_channel_is_reachable_for_a_caller_that_needs_it():
     channel = RecordingChannel()
-    assert AMQPSink(channel).channel is channel
+    assert AMQPSink(channel, properties=FakeProperties()).channel is channel
 
 
 def test_from_url_passes_the_url_to_pika(fake_pika):
@@ -367,15 +379,61 @@ def test_from_url_without_pika_names_the_extra(monkeypatch):
         AMQPSink.from_url("amqp://guest:guest@nowhere/")
 
 
-def test_publishing_without_pika_is_a_drop_not_a_crash(monkeypatch):
-    """A channel implies pika in practice, but a caller who supplies a double must
-    still not be able to make the emit path raise."""
+def test_constructing_without_pika_fails_loudly_rather_than_dropping_silently(
+    monkeypatch,
+):
+    """The defect this replaces: the driver import used to sit on the *publish*
+    path, inside the guard that may not raise. A missing `pika` was therefore not
+    an error at all — it was a silent 100% drop, for the life of the process, in
+    the one code path whose job is never to complain. Wiring time is where a
+    missing dependency has to surface, because it is the last moment anyone is
+    watching."""
+    monkeypatch.setitem(sys.modules, "pika", None)
+    with pytest.raises(ImportError, match=r"tokenweir\[amqp\]"):
+        AMQPSink(RecordingChannel())
+
+
+def test_a_channel_double_can_be_used_with_no_pika_at_all(monkeypatch):
+    """The remedy the ImportError advertises has to actually work. It did not
+    before: the text said "pass an existing channel instead", and that was the
+    exact path that silently dropped everything."""
     monkeypatch.setitem(sys.modules, "pika", None)
     channel = RecordingChannel()
-    sink = AMQPSink(channel)
-    sink.emit(_record(1))  # must not raise
-    assert channel.published == []
-    assert sink.dropped == 1
+    properties = FakeProperties(**publish_properties())
+    sink = AMQPSink(channel, properties=properties)
+
+    sink.emit(_record(1))
+
+    assert len(channel.published) == 1
+    assert channel.published[0]["properties"] is properties
+    assert sink.published == 1
+    assert sink.dropped == 0
+
+
+def test_the_import_errors_advertised_remedy_is_the_one_that_works(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pika", None)
+    with pytest.raises(ImportError) as caught:
+        AMQPSink(RecordingChannel())
+    message = str(caught.value)
+    assert "properties=" in message, "the error does not name the working remedy"
+    assert "pass an existing channel to AMQPSink instead" not in message
+
+
+def test_supplied_properties_are_used_verbatim(fake_pika):
+    """A caller adding an `app_id` or an `expiration` must not have them replaced
+    by the default."""
+    channel = RecordingChannel()
+    mine = FakeProperties(content_type="application/json", app_id="ai-gateway")
+    sink = AMQPSink(channel, properties=mine)
+    sink.emit(_record(1))
+    assert channel.published[0]["properties"] is mine
+
+
+def test_from_url_passes_properties_through(fake_pika):
+    mine = FakeProperties(app_id="ai-gateway")
+    sink = AMQPSink.from_url("amqp://guest:guest@rabbit/", properties=mine)
+    sink.emit(_record(1))
+    assert fake_pika.connections[0].channel().published[0]["properties"] is mine
 
 
 # --- The dependency-light core (FR-026, FR-027, SC-002) ----------------------
@@ -467,3 +525,91 @@ def test_a_service_emits_via_the_client_with_an_amqp_sink(fake_pika):
     assert delivered.input_tokens == 120
     assert delivered.output_tokens == 34
     assert sink.published == 1
+
+
+# --- Credentials never reach a log this library writes (Low #7) --------------
+
+
+def test_a_reconnect_failure_does_not_log_the_urls_credentials(fake_pika, caplog):
+    """An AMQP URL conventionally carries `user:password@host`, and a connect
+    failure is exactly when a library is tempted to echo what it could not reach.
+    `tokenweir.migrations` already set this rule for the Postgres equivalent
+    (`_redact` before printing a connect failure); this is the same rule."""
+    url = "amqp://gateway:sup3r-s3cret@rabbit:5672/%2Fmetering"
+    sink = AMQPSink.from_url(url)
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(1))
+
+    def refuse(parameters):
+        raise RuntimeError(f"could not connect to {url}: authentication failed")
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        import pika  # the fixture's fake
+
+        pika.BlockingConnection = refuse
+        sink.emit(_record(2))
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert logged, "the reconnect failure produced no warning at all"
+    assert "sup3r-s3cret" not in logged, logged
+    assert "gateway:sup3r-s3cret" not in logged, logged
+    # What an operator actually needs from the line survives redaction.
+    assert "authentication failed" in logged
+    assert "rabbit:5672" in logged
+
+
+@pytest.mark.parametrize(
+    ("text", "url", "expected"),
+    [
+        (
+            "cannot reach amqp://u:p@h/",
+            "amqp://u:p@h/",
+            "cannot reach amqp://***@h/",
+        ),
+        # No userinfo: nothing to hide, and nothing over-masked.
+        ("cannot reach amqp://h/", "amqp://h/", "cannot reach amqp://h/"),
+        # A bare user with no password carries no secret.
+        ("cannot reach amqp://u@h/", "amqp://u@h/", "cannot reach amqp://u@h/"),
+        # The password alone, echoed away from the URL, is masked too.
+        ("auth failed for s3cret", "amqp://u:s3cret@h/", "auth failed for ***"),
+        ("anything at all", None, "anything at all"),
+    ],
+)
+def test_redaction_masks_credentials_without_mangling_the_rest(text, url, expected):
+    from tokenweir.amqp import _redact_url
+
+    assert _redact_url(text, url) == expected
+
+
+def test_from_url_still_raises_the_drivers_own_exception(fake_pika):
+    """The deliberate boundary, matching `tokenweir.migrations.connect`: the
+    library propagates the driver's own exception type — the caller supplied the
+    URL and may well be catching `pika.exceptions.AMQPConnectionError` — and
+    redacts only what it writes to a log itself."""
+
+    class RefusedError(RuntimeError):
+        pass
+
+    def refuse(parameters):
+        raise RefusedError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+    with pytest.raises(RefusedError):
+        AMQPSink.from_url("amqp://u:p@rabbit/")
+
+
+# --- Distinct failure reasons are rate-limited separately (Med #2) -----------
+
+
+def test_a_publish_failure_does_not_silence_a_refused_record(fake_pika, caplog):
+    sink = AMQPSink(
+        RecordingChannel(fail_with=RuntimeError("channel closed")),
+        warn_interval=3600.0,
+    )
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        sink.emit(_record(1))  # a publish failure
+        sink.emit(None)  # a refused non-record, a different reason entirely
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("the AMQP channel failed" in m for m in messages), messages
+    assert any("non-UsageRecord" in m for m in messages), messages

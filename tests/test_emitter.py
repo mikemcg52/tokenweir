@@ -589,20 +589,24 @@ def test_a_drop_is_logged_at_all():
 def test_the_warning_reports_how_many_were_suppressed(caplog):
     from tokenweir._ratelimit import RateLimitedWarner
 
+    # One reason, four occurrences. The window is per reason, so the message has to
+    # be the *same* one each time — distinct texts are distinct reasons and each
+    # gets its own first-occurrence line, which is the behaviour the tests above
+    # pin. The clock is injected so this proves a 60-second window in no time at
+    # all: a test that slept to prove a rate limit would be slow *and* flaky.
     ticks = iter([0.0, 1.0, 2.0, 100.0])
     warner = RateLimitedWarner(
         logging.getLogger("tokenweir.emitter"), interval=60.0, clock=lambda: next(ticks)
     )
     with caplog.at_level(logging.WARNING, logger="tokenweir.emitter"):
-        warner.warn("first", exc_info=False)
-        warner.warn("suppressed", exc_info=False)
-        warner.warn("suppressed", exc_info=False)
-        warner.warn("after the window", exc_info=False)
+        for _ in range(4):
+            warner.warn("the sink failed", exc_info=False)
 
     messages = [r.getMessage() for r in caplog.records]
     assert len(messages) == 2, messages
-    assert messages[0] == "first"
+    assert messages[0] == "the sink failed"
     assert "2 further occurrence(s) suppressed" in messages[1]
+    assert messages[1].startswith("the sink failed")
 
 
 def test_a_logging_handler_that_raises_cannot_reach_the_caller():
@@ -703,9 +707,123 @@ def test_a_nonsensical_configuration_is_rejected_at_construction(kwargs):
 
 
 def test_stats_is_a_consistent_snapshot():
-    stats = BufferedEmitter(RecordingSink(), linger=0.0).stats()
+    # Closed rather than leaked: an unclosed client leaves a live thread and a
+    # `_LIVE` entry for the atexit hook to reap, and it is the test most likely to
+    # be blamed for a hang if the worker ever stops being a daemon.
+    with BufferedEmitter(RecordingSink(), linger=0.0) as emitter:
+        stats = emitter.stats()
     assert isinstance(stats, EmitterStats)
     assert stats == EmitterStats()
     assert stats.dropped == 0
+    assert stats.worker_alive
     with pytest.raises(Exception):
         stats.accepted = 5  # frozen: a snapshot that could be edited is not one
+
+
+# --- Distinct failure reasons are rate-limited separately (Med #2) -----------
+
+
+def test_a_delivery_failure_does_not_silence_a_refused_record(caplog):
+    """A single window shared across reasons does not merely suppress noise — it
+    makes a *new* failure mode invisible for a whole interval because an unrelated
+    one warned first, and then reports the suppressed count against whichever
+    message gets through next. A count attached to the wrong cause is not a smaller
+    truth than silence; it is a falsehood."""
+    with caplog.at_level(logging.WARNING, logger="tokenweir.emitter"):
+        with BufferedEmitter(RaisingSink(), linger=0.0, warn_interval=3600.0) as emitter:
+            emitter.emit(_record(1))  # a delivery failure
+            assert emitter.flush(timeout=TIMEOUT)
+            emitter.emit(None)  # a refused non-record — a different reason
+            assert emitter.flush(timeout=TIMEOUT)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("the sink failed" in m for m in messages), messages
+    assert any("non-UsageRecord" in m for m in messages), messages
+
+
+def test_a_suppressed_count_is_never_attributed_to_another_reason(caplog):
+    """The sharper half of the same bug: with one window, the three refused records
+    below would be counted and then reported on the *delivery failure* line, telling
+    an operator the sink failed four times when it failed once."""
+    with caplog.at_level(logging.WARNING, logger="tokenweir.emitter"):
+        with BufferedEmitter(RaisingSink(), linger=0.0, warn_interval=3600.0) as emitter:
+            for _ in range(3):
+                emitter.emit(None)
+            emitter.emit(_record(1))
+            assert emitter.flush(timeout=TIMEOUT)
+            stats = emitter.stats()
+
+    assert stats.dropped_not_a_record == 3
+    assert stats.failed == 1
+    failures = [r.getMessage() for r in caplog.records if "the sink failed" in r.getMessage()]
+    assert len(failures) == 1, failures
+    assert "suppressed" not in failures[0], (
+        "the sink-failure line is carrying another reason's suppressed count"
+    )
+
+
+def test_each_reason_keeps_its_own_suppressed_count():
+    from tokenweir._ratelimit import RateLimitedWarner
+
+    warner = RateLimitedWarner(logging.getLogger("tokenweir.emitter"), interval=3600.0)
+    for _ in range(3):
+        warner.warn("reason A", exc_info=False)
+    for _ in range(5):
+        warner.warn("reason B", exc_info=False)
+
+    assert warner.suppressed("reason A") == 2
+    assert warner.suppressed("reason B") == 4
+    assert warner.suppressed() == 6
+
+
+def test_an_interpolated_message_can_still_be_rate_limited_by_key(caplog):
+    """A message carrying varying detail would otherwise look distinct every time
+    and defeat the limiting entirely — which is why `key=` exists and why the AMQP
+    reconnect warning, the one message in this package that interpolates, uses it."""
+    from tokenweir._ratelimit import RateLimitedWarner
+
+    warner = RateLimitedWarner(logging.getLogger("tokenweir.emitter"), interval=3600.0)
+    with caplog.at_level(logging.WARNING, logger="tokenweir.emitter"):
+        for attempt in range(10):
+            warner.warn(f"could not connect (attempt {attempt})", key="reconnect", exc_info=False)
+    assert len(caplog.records) == 1, [r.getMessage() for r in caplog.records]
+
+
+# --- A dead worker says so (Low #4) ------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_stats_reports_a_worker_killed_by_a_base_exception():
+    """`BaseException` from a sink is deliberately not caught, so the worker dies
+    and nothing further is ever delivered. Without this flag that state shows only
+    as `buffered` climbing while `delivered` does not — a symptom, not a diagnosis,
+    and the README calls `stats()` the signal to alert on."""
+
+    class Interrupting:
+        def emit(self, record):
+            raise KeyboardInterrupt
+
+        def close(self):
+            return None
+
+    emitter = BufferedEmitter(Interrupting(), linger=0.0)
+    try:
+        emitter.emit(_record(0))
+        emitter.flush(timeout=TIMEOUT)
+
+        for n in range(1, 20):
+            emitter.emit(_record(n))
+
+        stats = emitter.stats()
+        assert stats.worker_alive is False, "a dead worker is reported as healthy"
+        assert stats.buffered > 0
+        assert stats.delivered == 0
+    finally:
+        emitter.close(timeout=1.0)
+
+
+def test_a_healthy_client_reports_a_live_worker():
+    with BufferedEmitter(RecordingSink(), linger=0.0) as emitter:
+        emitter.emit(_record(1))
+        assert emitter.flush(timeout=TIMEOUT)
+        assert emitter.stats().worker_alive is True

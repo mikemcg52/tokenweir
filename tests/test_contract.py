@@ -361,6 +361,16 @@ def test_core_module_sweep_actually_covers_the_package():
         "postgres.py",
         str(Path("migrations") / "__init__.py"),
         str(Path("migrations") / "__main__.py"),
+        # The emit side, added by TOKWEIR-6. `amqp.py` is here for the same reason
+        # `postgres.py` is: its whole job is to talk to a transport, it defers the
+        # driver import into the one place that needs it, and this sweep is what
+        # keeps it that way. `emitter.py` and `_ratelimit.py` are listed because a
+        # glob that silently stopped matching them would make the stdlib-only
+        # assertion vacuous for the newest code in the package, which is exactly
+        # the code most likely to reach for something.
+        "emitter.py",
+        "amqp.py",
+        "_ratelimit.py",
     } <= names
 
 

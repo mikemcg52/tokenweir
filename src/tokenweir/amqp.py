@@ -8,13 +8,22 @@ adapter. The broker-less half of the same sentence is
 :class:`~tokenweir.sink.DirectSink`.
 
 **No driver at import time.** Nothing here imports ``pika`` when the module is
-imported; the import is deferred into :meth:`AMQPSink.from_url`, the one place
-that opens a connection itself, and into the one call that builds pika's message
-properties. That is the same rule — and the same reasoning —
+imported. That is the same rule — and the same reasoning —
 :mod:`tokenweir.migrations` follows for psycopg: a bare ``pip install tokenweir``
 must carry no transport library, and the record-to-message mapping below has to be
 testable where no AMQP library exists at all, which is the environment this
 project's automated suite actually runs in.
+
+The import happens when an :class:`AMQPSink` is **constructed** — wiring time,
+where raising is safe and correct — and not one moment later. Deferring it further,
+to the first publish, is a mistake worth naming because it looks like a virtue: the
+publish path may not raise, so a missing driver discovered there is not an error at
+all, it is a silent 100% drop of every record, for the life of the process, in the
+one code path whose whole job is to never complain. If this module needs ``pika``,
+it says so while somebody is still watching.
+
+A caller who wants a sink with no ``pika`` at all — a test with a channel double —
+passes ``properties=``, which is the only thing the driver was needed for.
 
 **Publishing is deliberately plain.** ``basic_publish`` is a blocking call and
 this class makes no attempt to hide that, because hiding it is
@@ -47,6 +56,7 @@ publishes to what exists.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable, Optional, Tuple
 
 from tokenweir._ratelimit import RateLimitedWarner
@@ -113,10 +123,62 @@ def _import_pika() -> Any:
     except ImportError as exc:
         raise ImportError(
             "tokenweir needs pika to speak AMQP; install it with "
-            "`pip install 'tokenweir[amqp]'`, or pass an existing channel to "
-            "AMQPSink instead — nothing else in tokenweir requires an AMQP library"
+            "`pip install 'tokenweir[amqp]'`. Only tokenweir.amqp needs it — the "
+            "core, the contract and the store do not, so a caller that does not "
+            "publish to a broker never has to install it. To build a sink over a "
+            "channel of your own with no pika present, pass `properties=` to "
+            "AMQPSink; that is the only thing the driver is needed for here"
         ) from exc
     return pika
+
+
+def _redact_url(text: str, url: Optional[str]) -> str:
+    """Mask ``url``'s credentials wherever they appear in ``text``.
+
+    An AMQP URL conventionally carries ``user:password@host``, and a connect
+    failure is exactly the moment a library is tempted to echo the thing it could
+    not connect to into somebody's log. ``tokenweir.migrations`` already
+    established the rule for the equivalent Postgres case — redact before printing
+    a connect failure — and this is the same rule for the same reason.
+
+    Two things are masked: the whole ``user:password`` userinfo, and the password
+    on its own, since a driver may report the credential without the URL around it.
+
+    A URL whose userinfo has **no colon** is left entirely alone. That mirrors
+    ``tokenweir.migrations._carries_a_password``: a bare username is not a secret,
+    and blanking it would cost an operator the "which identity failed to
+    authenticate" half of the message for no gain.
+
+    The bare password is replaced only where it stands as its own token — not where
+    it happens to be a substring of a longer word. The naive
+    ``text.replace(password, "***")`` is unusable here, and not marginally: a
+    one-character password turns ``amqp://`` into ``amq***://`` and the line stops
+    being readable at all, while protecting nothing, because a password is only
+    legible *as* a credential where it stands alone. This still over-masks in the
+    direction the Postgres version chose — a password that is an ordinary English
+    word blanks that word out — and what an operator needs ("connection refused",
+    "authentication failed", the host and port) survives intact.
+
+    The boundary this does **not** cross: :meth:`AMQPSink.from_url` still lets the
+    driver's own exception propagate unredacted, exactly as
+    ``tokenweir.migrations.connect`` does for psycopg. The caller supplied the URL
+    and is in a position to handle the driver's own exception type; what this
+    library must not do is write those credentials to a log itself.
+    """
+    if not url:
+        return text
+    match = re.match(r"[a-z+]+://([^/@?]*)@", url, re.IGNORECASE)
+    if not match or not match.group(1):
+        return text
+    userinfo = match.group(1)
+    _, colon, password = userinfo.partition(":")
+    if not colon or not password:
+        # A bare username carries nothing to hide.
+        return text
+    redacted = text.replace(userinfo, "***")
+    return re.sub(
+        rf"(?<![A-Za-z0-9]){re.escape(password)}(?![A-Za-z0-9])", "***", redacted
+    )
 
 
 def message_for(record: UsageRecord) -> bytes:
@@ -185,16 +247,31 @@ class AMQPSink:
     guessing would replace the caller's TLS context, credentials or pooling with
     its own; a caller who supplies a channel owns its liveness.
 
+    **``pika`` is needed to construct one of these, and that is on purpose.** The
+    message properties are built here, at wiring time, rather than on the first
+    publish — see the module docstring: a driver discovered missing on the publish
+    path cannot be reported, because that path may not raise, so it would become a
+    permanent silent drop instead of an error. Pass ``properties=`` to build a sink
+    with no driver present.
+
     Args:
         channel: anything with ``basic_publish``. Not type-checked — a pika
             channel, a wrapper, or a test double are all legitimate.
         exchange: defaults to AMQP's default direct exchange.
         routing_key: defaults to :data:`DEFAULT_ROUTING_KEY`.
+        properties: the properties object attached to every message. Defaults to
+            ``pika.BasicProperties(**publish_properties())``, built once here.
+            Supply your own to add an ``app_id``, a ``expiration`` or headers — or
+            to construct a sink where ``pika`` is not installed.
         connection: the connection behind ``channel``, if this sink should be able
             to close it. Set by :meth:`from_url`.
         owns_connection: whether :meth:`close` should close ``connection``.
         warn_interval: seconds between warning lines for a repeating failure, so an
             unreachable broker cannot produce one log line per metered call.
+
+    Raises:
+        ImportError: ``pika`` is not installed and no ``properties`` were given,
+            naming the extra.
     """
 
     def __init__(
@@ -203,6 +280,7 @@ class AMQPSink:
         *,
         exchange: str = DEFAULT_EXCHANGE,
         routing_key: str = DEFAULT_ROUTING_KEY,
+        properties: Any = None,
         connection: Any = None,
         owns_connection: bool = False,
         warn_interval: float = 60.0,
@@ -215,7 +293,12 @@ class AMQPSink:
         self._closed = False
         self._published = 0
         self._dropped = 0
-        self._properties: Any = None
+        self._properties = (
+            properties
+            if properties is not None
+            else _import_pika().BasicProperties(**publish_properties())
+        )
+        self._url: Optional[str] = None
         self._reconnect: Optional[Callable[[], Tuple[Any, Any]]] = None
         self._warner = RateLimitedWarner(_logger, interval=warn_interval)
 
@@ -226,6 +309,7 @@ class AMQPSink:
         *,
         exchange: str = DEFAULT_EXCHANGE,
         routing_key: str = DEFAULT_ROUTING_KEY,
+        properties: Any = None,
         warn_interval: float = 60.0,
     ) -> "AMQPSink":
         """Open a pika ``BlockingConnection`` from an AMQP URL and own it.
@@ -238,7 +322,12 @@ class AMQPSink:
 
         Raises:
             ImportError: ``pika`` is not installed, naming the extra.
-            Exception: whatever pika raises if the broker is unreachable.
+            Exception: whatever pika raises if the broker is unreachable. Left
+                unredacted, and deliberately: the caller supplied ``url``, and
+                ``tokenweir.migrations.connect`` sets the same boundary for
+                psycopg — the library propagates the driver's own exception type,
+                and redacts only what it writes to a log *itself* (see
+                :func:`_redact_url`).
         """
 
         def connect() -> Tuple[Any, Any]:
@@ -251,10 +340,12 @@ class AMQPSink:
             channel,
             exchange=exchange,
             routing_key=routing_key,
+            properties=properties,
             connection=connection,
             owns_connection=True,
             warn_interval=warn_interval,
         )
+        sink._url = url
         sink._reconnect = connect
         return sink
 
@@ -302,7 +393,7 @@ class AMQPSink:
                 exchange=self.exchange,
                 routing_key=self.routing_key,
                 body=body,
-                properties=self._basic_properties(),
+                properties=self._properties,
             )
         except Exception:
             self._dropped += 1
@@ -326,18 +417,6 @@ class AMQPSink:
 
     # --- internals ---------------------------------------------------------
 
-    def _basic_properties(self) -> Any:
-        """pika's ``BasicProperties`` for :func:`publish_properties`, built once.
-
-        Built lazily rather than in ``__init__`` so that constructing a sink over a
-        caller-supplied channel needs no ``pika`` import of its own, and cached
-        because the value never varies and a metered path should not rebuild it per
-        record.
-        """
-        if self._properties is None:
-            self._properties = _import_pika().BasicProperties(**publish_properties())
-        return self._properties
-
     def _live_channel(self) -> Any:
         """The channel to publish on, reconnecting if this sink owns the connection."""
         if self._channel is not None:
@@ -348,8 +427,18 @@ class AMQPSink:
             return None
         try:
             self._connection, self._channel = self._reconnect()
-        except Exception:
-            self._warner.warn(_RECONNECT_FAILED)
+        except Exception as exc:
+            # `exc_info=False`, and the cause rendered by hand: a traceback would
+            # carry the driver's own message, and a driver that echoes the URL it
+            # could not reach would put `user:password@host` in the log through
+            # the one channel `_redact_url` cannot reach. The type and the redacted
+            # message are what an operator needs; the credentials are not.
+            self._warner.warn(
+                f"{_RECONNECT_FAILED}: {type(exc).__name__}: "
+                f"{_redact_url(str(exc), self._url)}",
+                key=_RECONNECT_FAILED,
+                exc_info=False,
+            )
             return None
         return self._channel
 
