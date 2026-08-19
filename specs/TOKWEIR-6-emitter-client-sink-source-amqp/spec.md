@@ -306,6 +306,15 @@ running environment.
   > blocks for a full connect timeout, on the emitter's delivery worker. Without spacing, a down
   > broker cost one connect timeout per buffered record, which is the retry loop this design
   > refuses, reassembled out of single attempts.
+  >
+  > **Still incomplete, and closed by TOKWEIR-30.** The rate limit as shipped here was armed only
+  > when a *dial* failed, and cleared whenever one succeeded — so on the path where dials succeed
+  > and **publishes** fail (a missing exchange, an access-refused channel) it was armed never and
+  > cleared constantly, and the sink opened a connection per record. This clause was also silent on
+  > the question that decides it: whether a failed publish counts as losing the connection.
+  > TOKWEIR-30 answers it — a connection that had been publishing earns an immediate re-dial, one
+  > that never published earns exactly one, and after that the interval applies — and carries the
+  > reasoning.
 - **FR-025**: The record→message mapping MUST be a pure function, testable with no `pika` installed
   and no broker running.
 

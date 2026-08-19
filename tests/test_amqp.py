@@ -973,3 +973,252 @@ def test_a_failed_channel_open_on_reconnect_does_not_leak_either(fake_pika):
     assert len(opened) == 3
     assert all(c.closed == 1 for c in opened), "reconnect leaked a socket per attempt"
     assert sink.dropped == 4
+
+
+# --- Publish failures on a healthy connection do not churn (TOKWEIR-30) ------
+#
+# The bug: `_invalidate` ran on any publish exception, and the reconnect interval
+# was armed only when a *dial* failed and cleared whenever one succeeded. On the
+# path where dials succeed and publishes fail — a missing exchange, an
+# access-refused channel — the interval was armed never and cleared constantly, so
+# the sink opened a fresh connection for every single record, forever. Against a
+# real broker each of those is a blocking TCP connect and AMQP handshake on the
+# emitter's one delivery worker.
+
+
+def _always_failing_publisher(fake_pika, dials, reason="NOT_FOUND - no exchange"):
+    """Make every dial succeed and every publish fail — the defect's exact shape."""
+
+    class Conn:
+        def __init__(self, parameters):
+            dials.append(parameters)
+            self.closed = 0
+            self._channel = RecordingChannel(fail_with=RuntimeError(reason))
+
+        def channel(self):
+            return self._channel
+
+        def close(self):
+            self.closed += 1
+
+    fake_pika.BlockingConnection = Conn
+
+
+def test_a_failing_exchange_does_not_open_a_connection_per_record(fake_pika):
+    """The ticket's reproduction. Pre-fix this dialled 50 times for 50 records."""
+    now = [1000.0]
+    dials = []
+    _always_failing_publisher(fake_pika, dials)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    dials.clear()  # the connection from_url opened is not a *re*connect
+
+    for n in range(50):
+        now[0] += 0.01  # half a second of traffic, well inside the 30s interval
+        sink.emit(_record(n))
+
+    assert len(dials) <= 1, f"{len(dials)} reconnects for 50 records"
+    assert sink.dropped == 50, "records must still be dropped and counted"
+    assert sink.published == 0
+
+
+def test_the_churn_bound_holds_at_one_reconnect_per_interval(fake_pika):
+    """Not merely bounded once — the rate must stay one per interval as traffic
+    continues, rather than the sink quietly going back to per-record dialling."""
+    now = [1000.0]
+    dials = []
+    _always_failing_publisher(fake_pika, dials)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    dials.clear()
+
+    for n in range(300):
+        now[0] += 1.0  # 300 seconds of traffic == 10 intervals
+        sink.emit(_record(n))
+
+    # 10 intervals, plus the one free re-dial the first unproductive connection
+    # gets (see spec FR-002a).
+    assert len(dials) <= 12, f"{len(dials)} reconnects across 10 intervals"
+    assert len(dials) >= 5, f"only {len(dials)} reconnects — recovery stopped being attempted"
+    assert sink.dropped == 300
+
+
+def test_every_dropped_record_is_still_counted_and_logged(fake_pika, caplog):
+    """Bounding the dialling must not bound the *reporting*: a sink that quietly
+    stopped saying anything would have traded one defect for a worse one."""
+    now = [1000.0]
+    _always_failing_publisher(fake_pika, [])
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/",
+        reconnect_interval=30.0,
+        warn_interval=0.0,
+        clock=lambda: now[0],
+    )
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        for n in range(20):
+            now[0] += 0.01
+            sink.emit(_record(n))
+
+    assert sink.dropped == 20
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) >= 20, "drops stopped being reported once the interval armed"
+    assert any("reconnect interval" in m for m in messages), messages
+
+
+# --- The property most easily destroyed by fixing the above ------------------
+
+
+def test_a_blip_on_a_productive_connection_still_recovers_immediately(fake_pika):
+    """The obvious one-line fix — arm the interval on every invalidation — bounds
+    the churn by breaking this. A connection that was doing its job and then
+    dropped is exactly what re-dialling is for."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=3600.0, clock=lambda: now[0]
+    )
+    sink.emit(_record(0))
+    assert sink.published == 1, "precondition: the connection must be productive"
+
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(1))  # fails, invalidates
+
+    sink.emit(_record(2))  # clock not advanced at all
+    assert len(fake_pika.connections) == 2, "the blip was not recovered immediately"
+    assert sink.published == 2
+
+
+def test_the_immediate_recovery_allowance_renews_per_productive_connection(fake_pika):
+    """Granting it once per sink would degrade a flaky-but-working link into a
+    rate-limited one after its first drop."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=3600.0, clock=lambda: now[0]
+    )
+    for cycle in range(4):
+        sink.emit(_record(cycle * 10))  # publishes: this connection is productive
+        fake_pika.connections[-1].channel().fail_with = RuntimeError("connection reset")
+        sink.emit(_record(cycle * 10 + 1))  # fails, invalidates
+        # No clock movement: recovery must be immediate every cycle.
+    sink.emit(_record(99))
+
+    assert sink.published == 5, f"only {sink.published} published across 4 blips"
+    assert len(fake_pika.connections) == 5
+
+
+def test_one_free_redial_then_the_interval_arms(fake_pika):
+    """The ambiguous case, resolved: a connection reset before its first publish is
+    indistinguishable from a bad exchange, so the first unproductive connection is
+    replaced once. If the replacement also cannot publish, the ambiguity is settled
+    and the interval arms."""
+    now = [1000.0]
+    dials = []
+    _always_failing_publisher(fake_pika, dials)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    dials.clear()
+
+    sink.emit(_record(1))  # first unproductive connection -> free re-dial allowed
+    assert len(dials) == 0, "invalidation itself must not dial"
+
+    sink.emit(_record(2))  # takes the free re-dial; it also cannot publish
+    assert len(dials) == 1
+
+    now[0] += 1.0
+    sink.emit(_record(3))  # ambiguity resolved: now gated
+    assert len(dials) == 1, "the interval did not arm after the free re-dial"
+
+    now[0] += 30.0
+    sink.emit(_record(4))
+    assert len(dials) == 2, "the interval never reopened"
+
+
+def test_a_dial_failure_still_arms_on_the_first_attempt(fake_pika):
+    """A dial that could not be made is unambiguous evidence and needs no free
+    retry — the existing TOKWEIR-6 behaviour, which this change must not relax."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))  # publish fails; free re-dial is available
+
+    attempts = []
+
+    def refuse(parameters):
+        attempts.append(now[0])
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+
+    for n in range(1, 30):
+        now[0] += 0.1
+        sink.emit(_record(n))
+
+    assert len(attempts) == 1, f"{len(attempts)} dial attempts inside one interval"
+
+
+def test_a_zero_interval_still_attempts_on_every_publish(fake_pika):
+    """`reconnect_interval=0` keeps meaning "no spacing" — several TOKWEIR-6 tests
+    depend on it, and a caller may want it."""
+    now = [1000.0]
+    dials = []
+    _always_failing_publisher(fake_pika, dials)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=0.0, clock=lambda: now[0]
+    )
+    dials.clear()
+    for n in range(10):
+        sink.emit(_record(n))
+    # Nine, not ten: the first record publishes on the connection `from_url`
+    # already opened (and cleared from `dials` above), so only the nine after it
+    # need a re-dial. With no spacing, each of those gets one.
+    assert len(dials) == 9
+
+
+def test_a_borrowed_channel_is_still_never_dialled_or_closed(fake_pika):
+    """No reconnect capability means none of this applies — unchanged."""
+    channel = RecordingChannel(fail_with=RuntimeError("NOT_FOUND"))
+    connection = RecordingConnection(channel)
+    sink = AMQPSink(channel, connection=connection)
+    for n in range(20):
+        sink.emit(_record(n))
+    assert fake_pika.connections == []
+    assert connection.closed == 0
+    assert sink.dropped == 20
+
+
+def test_a_connection_that_worked_and_then_stopped_still_bounds_its_churn(fake_pika):
+    """The case a mutation test caught this suite missing, and the most realistic
+    one of all: a service publishing happily when somebody deletes or renames the
+    exchange underneath it.
+
+    The productive flag must be **per connection**. If it survived into the
+    replacement connection, that replacement would inherit "this one works" without
+    ever having published, the interval would never arm, and the sink would be back
+    to a dial per record — the original defect, reached from a healthy start
+    instead of a cold one.
+    """
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    sink.emit(_record(0))
+    assert sink.published == 1, "precondition: the sink must be working first"
+
+    # The exchange goes away. Every dial from here succeeds; no publish ever will.
+    dials = []
+    _always_failing_publisher(fake_pika, dials, reason="NOT_FOUND - exchange deleted")
+    fake_pika.connections[-1].channel().fail_with = RuntimeError("NOT_FOUND")
+
+    for n in range(1, 51):
+        now[0] += 0.01  # half a second, well inside the interval
+        sink.emit(_record(n))
+
+    # One immediate recovery for the lost productive connection, then one free
+    # re-dial for the first unproductive one, then the interval holds.
+    assert len(dials) <= 2, f"{len(dials)} reconnects after the exchange went away"
+    assert sink.dropped == 50
+    assert sink.published == 1

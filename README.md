@@ -414,12 +414,29 @@ TLS context, credentials or pooling with its own. Such a channel is left exactly
 it was, so publishing resumes the moment you repair it, with no cooperation needed
 here. `close()` still closes only a connection the sink opened itself.
 
-Reconnect *attempts* are spaced by `reconnect_interval` (default 5s). The first
-attempt after a connection is lost is always immediate — a blip should recover at
-once — and the spacing applies only after an attempt has failed. Without it, a
+Reconnect *attempts* are spaced by `reconnect_interval` (default 5s). Without it, a
 `BlockingConnection` dial per buffered record would block the emitter's worker for a
-full connect timeout each time, which is the retry loop this design refuses,
-reintroduced one attempt at a time.
+full connect timeout each time — the retry loop this design refuses, reassembled out
+of single attempts.
+
+When an attempt is free and when it waits comes down to one question: **can
+re-dialling plausibly help?**
+
+| What failed | Next attempt |
+|---|---|
+| A connection that had been publishing | **Immediate.** Something outside the process broke, and re-dialling is exactly what fixes it. Waiting out an interval here would trade a real fault for an invented one. |
+| The dial itself | **Spaced.** A broker that refused the connection will refuse the next one too. |
+| A publish, on a connection that never published | **One free re-dial, then spaced.** A reset before the first publish looks identical to a bad exchange, so one retry settles it: if a fresh connection also cannot publish, the fault is not the connection. |
+
+That last row is the one to know about if you are debugging a silent metering
+outage: a routing key or exchange that does not exist means every publish fails,
+every record is dropped and counted, and the sink deliberately stops re-dialling
+rather than opening a connection per metered call. The `WARNING` says which of the
+three cases you are in.
+
+The allowance renews per *working* connection, so a flaky link that keeps
+publishing between drops recovers instantly every time rather than degrading into a
+rate-limited one.
 
 **Declaring the topology is not the adapter's job.** Exchanges, queues and bindings
 outlive any process; a library that declared them would silently own them, and fail

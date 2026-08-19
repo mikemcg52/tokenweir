@@ -329,6 +329,12 @@ class AMQPSink:
         self._clock = clock
         self._reconnect_interval = max(0.0, float(reconnect_interval))
         self._next_reconnect_at = 0.0
+        # Whether the connection currently held has ever successfully published,
+        # and how many connections in a row have been discarded without doing so.
+        # Together they decide whether a publish failure earns an immediate re-dial
+        # or has to wait out `reconnect_interval` — see `_invalidate`.
+        self._connection_published = False
+        self._consecutive_unproductive = 0
         self._warner = RateLimitedWarner(_logger, interval=warn_interval)
 
     @classmethod
@@ -453,6 +459,9 @@ class AMQPSink:
             self._warner.warn(_PUBLISH_FAILED)
             return
         self._published += 1
+        # This connection has now done its job at least once, which is what buys
+        # it an immediate re-dial if it later drops. See `_invalidate`.
+        self._connection_published = True
 
     def close(self) -> None:
         """Release resources. Safe to call more than once, and never raises.
@@ -493,7 +502,9 @@ class AMQPSink:
             self._warner.warn(_NO_CHANNEL, exc_info=False)
             return None
         if self._clock() < self._next_reconnect_at:
-            # Backing off after a failed dial. Recoverable, and saying so is the
+            # Backing off after a dial that failed, or after a connection that was
+            # dialled successfully and never managed to publish (see
+            # `_invalidate`). Recoverable either way, and saying so is the
             # difference between an operator waiting and an operator paging.
             self._warner.warn(_AWAITING_RECONNECT, exc_info=False)
             return None
@@ -514,6 +525,12 @@ class AMQPSink:
             )
             return None
         self._next_reconnect_at = 0.0
+        # `_connection_published` is deliberately *not* reset here. `_invalidate`
+        # is the only path that nulls `_channel`, and it clears the flag as it
+        # goes, so a connection reached from here always starts unproven — one
+        # reset point rather than two agreeing ones. A mutation test found the
+        # second assignment could be deleted with the whole suite green, which is
+        # what redundant state looks like from the outside.
         return self._channel
 
     def _invalidate(self) -> None:
@@ -532,12 +549,58 @@ class AMQPSink:
         whoever owns it. Publishing keeps failing, and keeps being counted and
         logged, until the thing behind it is repaired — which is a state a caller
         can act on, unlike silence.
+
+        **Whether the next dial waits** is the question TOKWEIR-6's FR-024 left
+        open: does a failed *publish* count as losing the connection? TOKWEIR-30
+        answers it, and the answer is not a simple yes or no, because a publish
+        failure is genuinely ambiguous evidence:
+
+        - The connection **had been publishing** and then failed. Something outside
+          this process broke, re-dialling is what fixes it, and making a caller
+          wait out an interval to recover from a blip trades a real fault for an
+          invented one. Immediate.
+        - The connection **never published**, and neither did the one before it.
+          Two fresh connections in a row could not deliver a record, so the fault
+          is not in the connection — a bad exchange, a permissions error, a routing
+          key that matches nothing. Re-dialling cannot help, and doing it per
+          record is a blocking dial per metered call on the emitter's delivery
+          worker: the retry loop this module refuses. Armed.
+        - The connection **never published** but is the first to fail. This is the
+          ambiguous case, and it is why the rule is not simply "did it publish?".
+          A connection reset *before* the first publish is an ordinary blip, and
+          from a sink's very first record it is indistinguishable from a
+          misconfiguration. So it gets **one** free re-dial: if the replacement
+          also cannot publish, the ambiguity is resolved and the interval arms.
+          One extra dial is a cheap price for not turning every cold-start blip
+          into an interval-long outage.
+
+        Deliberately *not* done by classifying the driver's exceptions into
+        channel-level and connection-level errors. That is more precise on paper
+        and worse here: it would couple this adapter to a pika exception hierarchy
+        it otherwise imports nothing from — the module's discipline is that
+        ``pika`` appears in exactly one function — and it would need
+        broker-specific reply codes to stay accurate, so it would rot silently.
+        Counting connections that failed to publish needs no driver knowledge and
+        answers the question that actually matters: can re-dialling plausibly help?
         """
         if self._reconnect is None:
             return
+        if self._connection_published:
+            # A productive connection was lost. That is what re-dialling is for,
+            # and the allowance renews here rather than once per sink, so a flaky
+            # link that keeps working between drops recovers instantly every time.
+            self._consecutive_unproductive = 0
+        else:
+            self._consecutive_unproductive += 1
+            if self._consecutive_unproductive > 1:
+                self._next_reconnect_at = self._clock() + self._reconnect_interval
         self._release()
         self._channel = None
         self._connection = None
+        # The single reset point for this flag (see `_live_channel`): a connection
+        # discarded here is the only way a new one comes to be dialled, so clearing
+        # it now is what makes every fresh connection start unproven.
+        self._connection_published = False
 
     def _release(self) -> None:
         """Close an owned connection, swallowing whatever it says about it."""
