@@ -573,6 +573,20 @@ def test_a_reconnect_failure_does_not_log_the_urls_credentials(fake_pika, caplog
         # The password alone, echoed away from the URL, is masked too.
         ("auth failed for s3cret", "amqp://u:s3cret@h/", "auth failed for ***"),
         ("anything at all", None, "anything at all"),
+        # An unencoded `@` in the password. RFC-3986-invalid, and precisely the
+        # URL whose owner most needs the redaction to work: matching to the first
+        # `@` split the userinfo in the wrong place and leaked the tail.
+        (
+            "could not connect to amqp://user:p@ss@rabbit:5672/v",
+            "amqp://user:p@ss@rabbit:5672/v",
+            "could not connect to amqp://***@rabbit:5672/v",
+        ),
+        # A port in the host must not be mistaken for a password.
+        (
+            "cannot reach amqp://rabbit:5672/v",
+            "amqp://rabbit:5672/v",
+            "cannot reach amqp://rabbit:5672/v",
+        ),
     ],
 )
 def test_redaction_masks_credentials_without_mangling_the_rest(text, url, expected):
@@ -906,3 +920,56 @@ def test_one_drop_produces_one_warning_on_the_dial_path(fake_pika, caplog):
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1, warnings
     assert "re-establish" in warnings[0]
+
+
+def test_a_failed_channel_open_does_not_leak_the_connection(fake_pika):
+    """`connect` is also the reconnect callable, so a broker that accepts TCP and
+    then refuses to open a channel leaked one socket per reconnect interval for the
+    life of the process."""
+    opened = []
+
+    class Refusing:
+        def __init__(self, parameters):
+            self.closed = 0
+            opened.append(self)
+
+        def channel(self):
+            raise RuntimeError("broker refused to open a channel")
+
+        def close(self):
+            self.closed += 1
+
+    fake_pika.BlockingConnection = Refusing
+
+    with pytest.raises(RuntimeError, match="refused to open a channel"):
+        AMQPSink.from_url("amqp://guest:guest@rabbit/")
+
+    assert len(opened) == 1
+    assert opened[0].closed == 1, "the connection was left open"
+
+
+def test_a_failed_channel_open_on_reconnect_does_not_leak_either(fake_pika):
+    sink = AMQPSink.from_url("amqp://guest:guest@rabbit/", reconnect_interval=0.0)
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+
+    opened = []
+
+    class Refusing:
+        def __init__(self, parameters):
+            self.closed = 0
+            opened.append(self)
+
+        def channel(self):
+            raise RuntimeError("broker refused to open a channel")
+
+        def close(self):
+            self.closed += 1
+
+    fake_pika.BlockingConnection = Refusing
+    for n in range(1, 4):
+        sink.emit(_record(n))  # must not raise
+
+    assert len(opened) == 3
+    assert all(c.closed == 1 for c in opened), "reconnect leaked a socket per attempt"
+    assert sink.dropped == 4

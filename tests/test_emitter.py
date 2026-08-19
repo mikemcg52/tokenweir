@@ -1063,3 +1063,102 @@ def test_a_batch_sink_that_raises_does_not_kill_the_worker():
     assert stats.failed == 1
     assert stats.delivered == 1
     assert stats.worker_alive is True
+
+
+# --- A wedged sink close cannot hang a shutdown (High, review 5) -------------
+
+
+class SinkWedgedOnClose:
+    """Its `close()` never returns — a pika connection against a black-holed
+    broker, in the shape a test can actually construct."""
+
+    def __init__(self):
+        self.records = []
+        self.close_entered = threading.Event()
+        self.release = threading.Event()
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def close(self):
+        self.close_entered.set()
+        self.release.wait(TIMEOUT)
+
+
+def test_close_is_bounded_even_when_the_sinks_own_close_blocks():
+    """`close_timeout` used to bound the *flush* and then make an unbounded call
+    afterwards, so a sink whose `close` blocks defeated the whole guarantee. The
+    existing wedged-sink test could not catch it: `BlockingSink.close()` *releases*
+    the worker, so it was the one blocking sink that closed instantly."""
+    sink = SinkWedgedOnClose()
+    emitter = BufferedEmitter(sink, linger=0.0)
+    try:
+        emitter.emit(_record(1))
+        started = time.monotonic()
+        emitter.close(timeout=0.2)
+        elapsed = time.monotonic() - started
+        assert elapsed < 5.0, f"close() took {elapsed:.1f}s behind a wedged sink.close()"
+    finally:
+        sink.release.set()
+
+
+def test_a_process_whose_sink_close_wedges_still_exits():
+    """SC-009 for the case that actually bites: the `atexit` hook runs `close()`
+    for every live client, so an unbounded sink close there hangs the interpreter
+    rather than one call. Asserted in a subprocess, because the property is about
+    interpreter shutdown and nothing inside a test can observe it."""
+    program = (
+        "import threading\n"
+        "from tokenweir import BufferedEmitter, UsageRecord\n"
+        "class Wedged:\n"
+        "    def emit(self, record):\n"
+        "        pass\n"
+        "    def close(self):\n"
+        "        threading.Event().wait()\n"  # never returns
+        "emitter = BufferedEmitter(Wedged(), close_timeout=1.0, linger=0.0)\n"
+        "emitter.emit(UsageRecord(request_id='r', app_id='a', endpoint='/e',\n"
+        "                         model='m', status='ok'))\n"
+        "print('ok')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, f"the interpreter did not exit cleanly: {result.stderr}"
+    assert result.stdout.strip() == "ok"
+
+
+# --- Exactly one thread ever touches the sink (Med, review 5) ----------------
+
+
+def test_the_sink_is_closed_by_the_worker_not_by_the_closing_thread():
+    """`AMQPSink` says an AMQP channel is not safe to share between threads, and
+    offers `BufferedEmitter` as the remedy — so the client closing a sink while its
+    worker is still inside `emit` would have made the remedy the hazard. Two
+    threads on one pika connection is undefined, not merely exceptional."""
+    seen = {}
+    entered = threading.Event()
+    release = threading.Event()
+
+    class ThreadRecordingSink:
+        def emit(self, record):
+            seen["emit"] = threading.current_thread()
+            entered.set()
+            release.wait(TIMEOUT)
+
+        def close(self):
+            seen["close"] = threading.current_thread()
+            seen["overlapped"] = entered.is_set() and not release.is_set()
+
+    emitter = BufferedEmitter(ThreadRecordingSink(), linger=0.0, batch_size=1)
+    try:
+        emitter.emit(_record(1))
+        assert entered.wait(TIMEOUT)
+        emitter.emit(_record(2))
+        emitter.close(timeout=0.2)  # times out with the worker still in emit()
+        assert "close" not in seen, "the sink was closed underneath a live worker"
+    finally:
+        release.set()
+
+    emitter._worker.join(TIMEOUT)
+    assert seen["close"] is seen["emit"], "emit and close ran on different threads"
+    assert seen["overlapped"] is False

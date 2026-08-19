@@ -176,7 +176,14 @@ def _redact_url(text: str, url: Optional[str]) -> str:
     """
     if not url:
         return text
-    match = re.match(r"[a-z+]+://([^/@?]*)@", url, re.IGNORECASE)
+    # `[^/?]*` rather than `[^/@?]*`, and greedy: it runs to the **last** `@`
+    # before the path. With the first `@` instead, a password containing an
+    # unencoded one — `amqp://user:p@ss@host/` — split at the wrong place and the
+    # tail of the credential (`ss`) reached the log. Such a URL is RFC-3986-invalid
+    # (userinfo `@` must be percent-encoded), which is exactly why it is worth
+    # handling: a caller who has made that mistake is the one whose password is
+    # least likely to survive the round trip intact.
+    match = re.match(r"[a-z+]+://([^/?]*)@", url, re.IGNORECASE)
     if not match or not match.group(1):
         return text
     userinfo = match.group(1)
@@ -357,7 +364,19 @@ class AMQPSink:
         def connect() -> Tuple[Any, Any]:
             pika = _import_pika()
             connection = pika.BlockingConnection(pika.URLParameters(url))
-            return connection, connection.channel()
+            try:
+                return connection, connection.channel()
+            except BaseException:
+                # A broker that accepts TCP and then refuses to open a channel is
+                # a real state, and this closure is also the *reconnect* callable —
+                # so without this the sink leaks one socket per reconnect interval
+                # for the life of the process. Closing it is guarded because the
+                # channel failure is the one worth reporting.
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                raise
 
         connection, channel = connect()
         sink = cls(

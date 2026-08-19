@@ -323,9 +323,12 @@ is worth knowing precisely:
   its own failure — `DirectSink` does exactly this when the store is down — is
   counted as delivered here. On the broker-less path, read `DirectSink.dropped`
   alongside it; on the AMQP path, `AMQPSink.dropped`.
-- **`worker_alive` is the one flag that means "this client has stopped metering".**
-  It goes false only if a sink raised a `BaseException`, which is deliberately not
-  caught. Everything else is a counted drop and the client keeps working.
+- **`worker_alive` means "the delivery worker is running".** It is `False` after
+  any `close()` — that is the normal end state, not a fault. What it diagnoses is a
+  client you have *not* closed reporting `False`: that happens only if a sink raised
+  a `BaseException`, which is deliberately not caught, and it means the client has
+  silently stopped metering. Every other failure is a counted drop and the client
+  keeps working.
 - **`dropped` includes `dropped_at_close`**, so records abandoned by a `close()`
   that timed out against a wedged sink are inside the one number worth alerting on.
 
@@ -421,6 +424,13 @@ reintroduced one attempt at a time.
 **Declaring the topology is not the adapter's job.** Exchanges, queues and bindings
 outlive any process; a library that declared them would silently own them, and fail
 confusingly the day its arguments disagreed with what is deployed.
+
+**`AMQPSink` is not thread-safe, and cannot be made so here.** An AMQP channel is
+not safe to share between threads — that is pika's constraint, not one this library
+could lift, and a lock around the counters would hide the hazard rather than remove
+it. Give each thread its own sink, or put a single `BufferedEmitter` in front: its
+worker is one thread, and it is the only thread that ever touches the sink,
+including for `close()`. That is the shape this adapter is built for.
 
 ### The broker-less path
 

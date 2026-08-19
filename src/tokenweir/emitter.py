@@ -271,6 +271,7 @@ class BufferedEmitter:
         self._flush_waiters = 0
         self._stopping = False
         self._closed = False
+        self._sink_closed = False
         self._worker_alive = True
 
         self._accepted = 0
@@ -326,25 +327,45 @@ class BufferedEmitter:
             pass
 
     def close(self, timeout: Optional[float] = None) -> None:
-        """Stop the worker, flush what is buffered, and close the sink.
+        """Stop the worker, flush what is buffered, and let it close the sink.
 
         Safe to call more than once, per the :class:`~tokenweir.sink.Sink`
         protocol, and safe to call from a thread that is emitting. Never raises —
         including when the sink's own ``close`` raises, which is common enough
         during a shutdown against a broker that has already gone away.
 
-        The final flush is **bounded** by ``timeout`` (defaulting to the
-        ``close_timeout`` given at construction). A sink wedged against a dead
-        broker must not be able to hang a process shutdown, so the wait ends and
-        the remaining records are lost — logged, and counted as
+        The wait is **bounded** by ``timeout`` (defaulting to the ``close_timeout``
+        given at construction). A sink wedged against a dead broker must not be
+        able to hang a process shutdown, so the wait ends, the remaining records
+        are lost — logged, and counted as
         :attr:`EmitterStats.dropped_at_close`, which is inside
-        :attr:`EmitterStats.dropped`. If the worker is still delivering when that happens,
-        the sink is closed underneath it; the resulting failure is guarded and
-        counted like any other.
+        :attr:`EmitterStats.dropped` — and this returns.
+
+        **The sink is closed by the worker, not here**, as the last thing the
+        worker does. That is what makes the bound above true and the sink's own
+        threading assumptions hold, and it took two goes to get right:
+
+        - Closing it on *this* thread put an unbounded call after the bounded
+          wait, so a sink whose ``close`` blocks hung the process at exit — the
+          opposite of what ``close_timeout`` advertises. On the worker, which is a
+          daemon, a blocking close cannot outlive the interpreter.
+        - It also meant that when the join timed out, this thread closed a sink the
+          worker was still inside ``emit`` on. For
+          :class:`~tokenweir.amqp.AMQPSink` that is two threads on one pika
+          connection, whose behaviour is undefined rather than merely
+          exceptional — and the adapter's documented remedy for its own
+          thread-safety constraint is *"put a `BufferedEmitter` in front"*, which
+          would have been the thing breaking it.
+
+        So exactly one thread ever touches the sink. The cost is that a worker
+        wedged past the timeout closes the sink whenever it comes back, or never,
+        and the connection is released by process exit instead — a leak bounded by
+        the process, which is the better end of the trade against corrupting a
+        connection or hanging a shutdown.
 
         Args:
-            timeout: seconds to wait for the buffer to drain. ``0`` declines to
-                wait.
+            timeout: seconds to wait for the buffer to drain and the sink to be
+                closed. ``0`` declines to wait.
         """
         wait_for = self._close_timeout if timeout is None else max(0.0, float(timeout))
 
@@ -372,13 +393,6 @@ class BufferedEmitter:
                     self._buffer.clear()
                     self._dropped_at_close += abandoned
                 self._warner.warn(_FLUSH_TIMED_OUT, exc_info=False)
-
-        try:
-            close = getattr(self._sink, "close", None)
-            if callable(close):
-                close()
-        except Exception:
-            self._warner.warn(_SINK_CLOSE_FAILED)
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -498,10 +512,16 @@ class BufferedEmitter:
             self._warner.warn(_WORKER_DIED)
             raise
         finally:
+            # Flags first, so anyone in `flush` is released without waiting on the
+            # sink's close; the close itself is the worker's last act, which is
+            # what keeps sink access single-threaded and keeps an unbounded close
+            # on a daemon thread. `close()` still observes it, because `join`
+            # waits for this whole block.
             with self._condition:
                 self._worker_alive = False
                 self._in_flight = 0
                 self._condition.notify_all()
+            self._close_sink()
 
     def _next_batch(self) -> Optional[List[UsageRecord]]:
         """Wait for work and take up to ``batch_size`` records.
@@ -563,6 +583,24 @@ class BufferedEmitter:
                 self._count_failed(1)
             else:
                 self._count_delivered(1)
+
+    def _close_sink(self) -> None:
+        """Close the sink once, from the worker thread, never raising.
+
+        Idempotent by flag rather than by trusting the sink: the protocol says a
+        sink's ``close`` is safe to call twice, but this is the guard that stops a
+        non-conforming one from being asked to prove it.
+        """
+        with self._condition:
+            if self._sink_closed:
+                return
+            self._sink_closed = True
+        try:
+            close = getattr(self._sink, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            self._warner.warn(_SINK_CLOSE_FAILED)
 
     def _count_delivered(self, n: int) -> None:
         with self._condition:

@@ -79,9 +79,11 @@ broker or network can reach the caller.
 - [x] **T017** In `tests/test_emitter.py`, test batching: `batch_size` respected, an idle client
       makes no delivery call, `emit_batch` preferred when present and per-record `emit` used when
       not (FR-004, FR-018, SC-006).
-- [x] **T018** In `tests/test_emitter.py`, test lifecycle: double `close()`, `close()` on a
-      never-started client, `close()` flushes what is buffered, context manager, sink `close()`
-      raising (SC-008, FR-010, FR-011).
+- [x] **T018** In `tests/test_emitter.py`, test lifecycle: double `close()`, `close()` flushes what
+      is buffered, context manager, sink `close()` raising (SC-008, FR-010, FR-011). The
+      "`close()` on a never-started client" clause is **not** covered and is not coverable — the
+      worker starts in `__init__`, so no such state exists; see the note on that edge case in
+      `spec.md`. Recorded rather than left ticked as though it were tested.
 - [x] **T019** In `tests/test_emitter.py`, test concurrency: 10 threads emitting deliver exactly the
       number emitted, none lost or duplicated (SC-005, FR-013).
 - [x] **T020** In `tests/test_emitter.py`, test that a failing sink produces a bounded number of log
