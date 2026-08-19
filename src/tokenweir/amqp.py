@@ -113,9 +113,21 @@ _NO_CHANNEL = (
     "tokenweir: usage record not published — the AMQP sink has no channel to publish "
     "on and cannot make one; no metering for this call"
 )
-_AWAITING_RECONNECT = (
+# Two different reasons the sink is inside its reconnect interval, and they must
+# not share a message. This module has already litigated the point once
+# (`_NO_CHANNEL` used to claim "cannot make one" during a backoff): a drop logged
+# with the wrong cause is worse than a bare count, because it sends an operator
+# after the wrong problem. Both keep the words "reconnect interval" so a reader —
+# and the tests that grep for it — can still recognise the state.
+_AWAITING_REDIAL = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
-    "after a failed attempt; no metering for this call"
+    "after a failed connection attempt; no metering for this call"
+)
+_AWAITING_PUBLISHABLE = (
+    "tokenweir: usage record not published — waiting out the reconnect interval "
+    "because two connections in a row could not publish, so re-dialling will not "
+    "help; check that the exchange and routing key exist and are permitted. No "
+    "metering for these calls"
 )
 
 
@@ -284,11 +296,15 @@ class AMQPSink:
         owns_connection: whether :meth:`close` should close ``connection``.
         warn_interval: seconds between warning lines for a repeating failure, so an
             unreachable broker cannot produce one log line per metered call.
-        reconnect_interval: minimum seconds between reconnect *attempts* after one
-            has failed. The first attempt after a connection is lost is always
-            immediate; this bounds how often a down broker is re-dialled, because
-            a blocking connect per record is a retry loop by another name. ``0``
-            attempts on every publish.
+        reconnect_interval: minimum seconds between reconnect *attempts* once the
+            sink has reason to think re-dialling will not help — a dial that
+            failed, or two connections in a row that could not publish. Losing a
+            connection that *had* been publishing is always recovered immediately,
+            and so is the first connection that fails to publish; see
+            :meth:`_invalidate` for why those two are not the same case. This
+            bounds how often a broken broker or a misconfigured exchange is
+            re-dialled, because a blocking connect per record is a retry loop by
+            another name. ``0`` attempts on every publish.
         clock: monotonic seconds source. A **test seam**, not a production knob —
             it exists so the reconnect interval can be driven deterministically
             without sleeping, and no deployment should need to pass it.
@@ -335,6 +351,10 @@ class AMQPSink:
         # or has to wait out `reconnect_interval` — see `_invalidate`.
         self._connection_published = False
         self._consecutive_unproductive = 0
+        # Which of the two causes armed `_next_reconnect_at`, so the drop it
+        # produces can name the right one. Defaults to the dial case; it is only
+        # ever read while the interval is armed, and arming always sets it.
+        self._backoff_message = _AWAITING_REDIAL
         self._warner = RateLimitedWarner(_logger, interval=warn_interval)
 
     @classmethod
@@ -489,10 +509,12 @@ class AMQPSink:
         attempt at a time. Against a broker that is down it would spend a full
         connect timeout per buffered record while the buffer fills behind it.
 
-        The *first* attempt after a connection is invalidated is always immediate:
-        the common case is a blip, and making a caller wait out an interval to
-        recover from it would trade a real fault for an invented one. The spacing
-        starts only once an attempt has actually failed.
+        **When the spacing applies is decided in** :meth:`_invalidate`, which sets
+        ``_next_reconnect_at``; this method only honours it. In short: a connection
+        that had been publishing is replaced immediately, a failed dial is spaced,
+        and a connection that never published is replaced once and then spaced. The
+        reasoning for all three is on :meth:`_invalidate`, and it is worth reading
+        before changing either.
         """
         if self._channel is not None:
             return self._channel
@@ -502,16 +524,16 @@ class AMQPSink:
             self._warner.warn(_NO_CHANNEL, exc_info=False)
             return None
         if self._clock() < self._next_reconnect_at:
-            # Backing off after a dial that failed, or after a connection that was
-            # dialled successfully and never managed to publish (see
-            # `_invalidate`). Recoverable either way, and saying so is the
-            # difference between an operator waiting and an operator paging.
-            self._warner.warn(_AWAITING_RECONNECT, exc_info=False)
+            # Backing off. Which cause armed it decides what an operator should do
+            # about it — wait, or go and look at the broker's topology — so the
+            # message is the one whichever arm set (see `_invalidate`).
+            self._warner.warn(self._backoff_message, exc_info=False)
             return None
         try:
             self._connection, self._channel = self._reconnect()
         except Exception as exc:
             self._next_reconnect_at = self._clock() + self._reconnect_interval
+            self._backoff_message = _AWAITING_REDIAL
             # `exc_info=False`, and the cause rendered by hand: a traceback would
             # carry the driver's own message, and a driver that echoes the URL it
             # could not reach would put `user:password@host` in the log through
@@ -594,6 +616,7 @@ class AMQPSink:
             self._consecutive_unproductive += 1
             if self._consecutive_unproductive > 1:
                 self._next_reconnect_at = self._clock() + self._reconnect_interval
+                self._backoff_message = _AWAITING_PUBLISHABLE
         self._release()
         self._channel = None
         self._connection = None

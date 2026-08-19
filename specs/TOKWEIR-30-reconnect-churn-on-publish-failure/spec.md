@@ -204,7 +204,11 @@ tests; this story must not quietly change what they assert.
 - **FR-005**: Behaviour for a sink with no reconnect capability (a borrowed channel) MUST be
   unchanged: no dial, no close, no interval.
 - **FR-006**: Every dropped record MUST still be counted and logged with an accurate reason,
-  rate-limited per reason, exactly as before this change.
+  rate-limited per reason. "Accurate" MUST distinguish the two ways the interval can be armed: a
+  **failed dial** and **two connections that could not publish** send an operator to different
+  places — broker reachability versus their own exchange and routing key — so one message covering
+  both would name the wrong cause half the time, which this module has already decided is worse than
+  a bare count.
 - **FR-007**: `reconnect_interval=0` MUST continue to mean "no spacing".
 - **FR-008**: The resolution of the ambiguity MUST be written into TOKWEIR-6's FR-024, which is the
   clause that was silent on it, so the two specs do not disagree — the same in-place amendment
@@ -228,8 +232,16 @@ tests; this story must not quietly change what they assert.
 - **SC-003**: The immediate-retry allowance renews per productive connection.
 - **SC-004**: Every TOKWEIR-6 AMQP test passes unchanged — no assertion is edited to accommodate
   this fix.
-- **SC-005**: Drop counts and warning behaviour are identical before and after for every failure
-  mode.
+- **SC-005**: Drop **counts** are identical before and after for every failure mode — no record
+  that used to be dropped is now kept, and none that used to be kept is now dropped.
+
+  > **Amended in fix round 1.** This first read *"Drop counts **and warning behaviour** are
+  > identical before and after"*, and the second half was never true — this story's own test proves
+  > it, since that test fails on the parent commit precisely *because* no backoff line existed
+  > there. Records inside the newly-armed window now log a backoff reason where they used to log a
+  > publish failure, and that change is the point rather than a side effect: it is what tells an
+  > operator the sink has stopped re-dialling on purpose. Writing "identical" was a criterion
+  > asserting the fix had no effect.
 - **SC-006**: The whole suite passes under the project's authoritative command.
 
 ## Assumptions

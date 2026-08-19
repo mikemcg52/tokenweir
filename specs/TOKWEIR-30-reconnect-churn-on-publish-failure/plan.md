@@ -70,9 +70,12 @@ state that class already had the natural home for.
    would spread reconnect policy across two methods, and `emit` has no business knowing about
    intervals.
 
-3. **The allowance renews per productive connection, not per sink.** `_connection_published` resets
-   when a connection is established, and `_consecutive_unproductive` resets on any successful
-   publish. So a sink that blips, recovers, publishes, and blips again gets an immediate retry both
+3. **The allowance renews per productive connection, not per sink.** Both resets live in
+   `_invalidate`, which is the single place a connection is discarded: `_connection_published`
+   clears there so the next connection starts unproven, and `_consecutive_unproductive` clears there
+   when the connection being discarded had published. (An earlier draft of this plan said the resets
+   happened in `_live_channel` and "on any successful publish" respectively — behaviourally the
+   same, but it would send a reader chasing them to the wrong function.) So a sink that blips, recovers, publishes, and blips again gets an immediate retry both
    times — the right behaviour for a flaky network — while a sink whose connections keep failing to
    publish gets one free dial and then backs off. A once-per-sink allowance would degrade a
    flaky-but-working link into a rate-limited one.

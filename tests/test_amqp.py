@@ -141,6 +141,10 @@ def fake_pika(monkeypatch):
         URLParameters=URLParameters,
     )
     module.connections = connections
+    # Kept on the fixture so a test that has swapped in a failing factory can put
+    # the working one back — "the broker comes good" is a state worth exercising,
+    # and reconstructing it inline in each test invites them to drift apart.
+    module.WorkingConnection = BlockingConnection
     monkeypatch.setitem(sys.modules, "pika", module)
     return module
 
@@ -1038,10 +1042,17 @@ def test_the_churn_bound_holds_at_one_reconnect_per_interval(fake_pika):
         now[0] += 1.0  # 300 seconds of traffic == 10 intervals
         sink.emit(_record(n))
 
-    # 10 intervals, plus the one free re-dial the first unproductive connection
-    # gets (see spec FR-002a).
-    assert len(dials) <= 12, f"{len(dials)} reconnects across 10 intervals"
-    assert len(dials) >= 5, f"only {len(dials)} reconnects — recovery stopped being attempted"
+    # Exact, not a band: the clock is injected, so this is deterministic, and a
+    # band wide enough to feel safe is also wide enough to accept a policy dialling
+    # half or twice as often.
+    #
+    # Ten, derived rather than observed. The first record publishes on the
+    # connection `from_url` opened and fails, which costs no dial (the free re-dial
+    # is available but nothing has needed it yet). The second record takes that
+    # free re-dial at t=1002; it cannot publish either, so the interval arms. From
+    # there it is one dial every 30s while traffic continues to t=1300:
+    # 1002 + 30k <= 1300 gives k = 0..9.
+    assert len(dials) == 10, f"{len(dials)} reconnects across 10 intervals"
     assert sink.dropped == 300
 
 
@@ -1222,3 +1233,130 @@ def test_a_connection_that_worked_and_then_stopped_still_bounds_its_churn(fake_p
     assert len(dials) <= 2, f"{len(dials)} reconnects after the exchange went away"
     assert sink.dropped == 50
     assert sink.published == 1
+
+
+def test_a_productive_connection_restores_the_free_redial_allowance(fake_pika):
+    """The consecutive-unproductive count must be reset by a connection that
+    publishes — FR-003's second clause, and the one a mutation test found had code
+    and no coverage: deleting the reset left the whole suite green.
+
+    It is not cosmetic bookkeeping. Without it the count only ever climbs, so a
+    long-lived sink that has been through two bad connections permanently loses its
+    immediate-retry allowance: every later cold-start blip waits out a full
+    interval, for the life of the process. That is the original defect's cousin —
+    the interval applying where it should not, rather than not applying where it
+    should.
+    """
+    now = [1000.0]
+    dials = []
+    _always_failing_publisher(fake_pika, dials)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    dials.clear()
+
+    # Burn the allowance: two connections in a row that cannot publish.
+    sink.emit(_record(1))  # the from_url connection fails; free re-dial available
+    sink.emit(_record(2))  # takes it; that one cannot publish either -> armed
+    assert len(dials) == 1
+    now[0] += 1.0
+    sink.emit(_record(3))
+    assert len(dials) == 1, "precondition: the interval must be armed"
+
+    # The broker comes good. Wait out the interval; the next dial publishes.
+    now[0] += 30.0
+    fake_pika.BlockingConnection = fake_pika.WorkingConnection
+    sink.emit(_record(4))
+    assert sink.published == 1, "precondition: this connection must be productive"
+    assert len(dials) == 1
+
+    # That productive connection drops, and its replacement cannot publish. The
+    # replacement is the *first* unproductive connection again, so it must get its
+    # own free re-dial rather than inheriting a spent allowance.
+    fake_pika.connections[-1].channel().fail_with = RuntimeError("connection reset")
+    _always_failing_publisher(fake_pika, dials)
+
+    # A publish failure invalidates but does not itself dial — the replacement is
+    # opened by the *next* record, which is what makes the counts below one behind
+    # the emits that cause them.
+    sink.emit(_record(5))  # the productive connection is lost
+    assert len(dials) == 1
+
+    sink.emit(_record(6))  # immediate re-dial, because that connection had worked
+    assert len(dials) == 2
+
+    sink.emit(_record(7))  # the free re-dial, restored by the productive connection
+    assert len(dials) == 3, (
+        "the allowance was not restored by the productive connection — the "
+        "consecutive-unproductive count is never reset, so the sink treats a "
+        "first-failure blip as though it had already spent its retry"
+    )
+
+    now[0] += 1.0
+    sink.emit(_record(8))  # and now, correctly, it is armed again
+    assert len(dials) == 3
+
+
+# --- The backoff says which of its two causes it is (Med, review 1) ----------
+
+
+def test_a_publish_backoff_does_not_blame_a_failed_connection_attempt(fake_pika, caplog):
+    """Every dial succeeded here; nothing an operator would call an "attempt"
+    failed. Telling them otherwise sends them to look at broker reachability when
+    the fault is in their exchange or routing key — the same class of mistake as
+    `_NO_CHANNEL` once claiming "cannot make one" mid-backoff."""
+    now = [1000.0]
+    _always_failing_publisher(fake_pika, [])
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/",
+        reconnect_interval=30.0,
+        warn_interval=0.0,
+        clock=lambda: now[0],
+    )
+    sink.emit(_record(1))
+    sink.emit(_record(2))  # burns the free re-dial and arms the interval
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        now[0] += 1.0
+        sink.emit(_record(3))
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert messages
+    backoff = [m for m in messages if "reconnect interval" in m]
+    assert backoff, messages
+    assert not any("failed connection attempt" in m for m in backoff), backoff
+    assert any("could not publish" in m for m in backoff), backoff
+    assert any("exchange and routing key" in m for m in backoff), backoff
+
+
+def test_a_dial_backoff_still_says_the_connection_attempt_failed(fake_pika, caplog):
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/",
+        reconnect_interval=30.0,
+        warn_interval=0.0,
+        clock=lambda: now[0],
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+
+    def refuse(parameters):
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+    sink.emit(_record(1))  # the dial fails and arms the interval
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        now[0] += 1.0
+        sink.emit(_record(2))
+
+    backoff = [
+        r.getMessage()
+        for r in caplog.records
+        if "reconnect interval" in r.getMessage()
+    ]
+    assert backoff
+    assert any("failed connection attempt" in m for m in backoff), backoff
+    assert not any("could not publish" in m for m in backoff), backoff

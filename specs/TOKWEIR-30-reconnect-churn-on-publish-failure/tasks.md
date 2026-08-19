@@ -25,8 +25,11 @@ must end with that reproduction as a test that fails on the parent commit.
       (FR-003, spec Edge Cases).
 - [x] **T004** In `AMQPSink.emit`, set `_connection_published = True` on a successful publish
       (FR-002).
-- [x] **T005** In `_live_channel`, reset `_connection_published = False` when a dial establishes a
-      new connection, so the allowance renews per connection (FR-003).
+- [x] **T005** Reset `_connection_published` when a connection is discarded, so every connection
+      starts unproven and the allowance renews per connection (FR-003). **Shipped in `_invalidate`,
+      not in `_live_channel` as this task first said**: `_invalidate` is the only path that nulls
+      `_channel`, so a reset in `_live_channel` was a second assignment that could be deleted with
+      the whole suite green. One reset point, not two agreeing ones.
 - [x] **T006** In `_invalidate`, arm `_next_reconnect_at` only when the connection being discarded
       never published (FR-001, FR-002).
 - [x] **T007** Extend the `_invalidate` / `_live_channel` docstrings to state the rule and why it is
@@ -64,7 +67,9 @@ must end with that reproduction as a test that fails on the parent commit.
 
 ## Phase 5: Verification
 
-- [x] **T018** Mutation-check both halves of the fix: revert the arming condition and revert the
-      productive flag, and confirm a test fails each time.
+- [x] **T018** Mutation-check **every** assignment the fix adds — not "both halves", which is what
+      this task first said and what the round-1 commit claimed to have done. There are three, and
+      the third (`_consecutive_unproductive = 0` on a productive connection) survived until review 1
+      pointed at it. Each is now confirmed to fail a test when reverted.
 - [x] **T019** Run the authoritative suite (`CI=true /workspace/repo/.venv/bin/pytest`, pass codes
       `[0, 5]`) and `ruff check`.
