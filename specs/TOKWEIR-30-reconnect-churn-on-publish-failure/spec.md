@@ -9,8 +9,12 @@ meant fixing a file that is not there. The same thing was done for TOKWEIR-15 of
 **Created**: 2026-08-19
 **Status**: Draft
 **Jira**: TOKWEIR-30 (Bug), `Relates` to TOKWEIR-6
-**Input**: The Jira bug, fetched with `getJiraIssue` on 2026-08-19. It was filed by the TOKWEIR-6
-run itself, as a deferred Med from that story's terminal review.
+**Input**: The Jira bug, fetched with `getJiraIssue` on 2026-08-19 and quoted verbatim below. It
+was filed by the TOKWEIR-6 run itself, as a deferred Med from that story's terminal review.
+Re-fetched and diffed against the quote in fix round 3 — the Defect, Suggested-resolution and
+Spec-ambiguity paragraphs all match. Recorded because every review of this story flagged it
+Unverified: the reviewer subagent has no Jira access, so this quote is the only acceptance text it
+can grade against, and "the implementer wrote the spec" is a fair thing to want checked.
 
 > **Defect.** `AMQPSink._invalidate()` runs on *any* publish exception, and `_live_channel()` gates
 > re-dialling on `_next_reconnect_at`, which is set **only when a dial fails** and reset to `0.0` on
@@ -235,8 +239,9 @@ tests; this story must not quietly change what they assert.
   treatment FR-020 and FR-024 already carry there.
 - **FR-009**: No public API change: `reconnect_interval`, `clock` and the counters keep their
   signatures and meanings. Two things a caller *can* observe, both stated rather than discovered:
-  the **log text changed** (one backoff message became two, and the surviving one now says "after a
-  failed **connection** attempt"), so an alert grepping the old string needs updating; and
+  the **log text changed** — the single backoff message became **three**
+  (`_AWAITING_REDIAL`, `_AWAITING_PUBLISHABLE`, `_DIAL_CEILING_REACHED`), and the first now says
+  "after a failed **connection** attempt" — so an alert grepping the old string needs updating; and
   `MAX_DIALS_PER_INTERVAL` is a new module-level constant, not a constructor argument, because a cap
   that a caller can raise is not a backstop.
 
@@ -248,9 +253,31 @@ tests; this story must not quietly change what they assert.
 
 ## Success Criteria *(mandatory)*
 
-- **SC-001**: 50 records against always-failing publishes inside one interval produce **at most 1**
-  reconnect (so at most 2 connections including the one `from_url` opened), down from 50. Asserted
-  by a test that fails on the pre-fix code.
+- **SC-001**: 50 records against always-failing publishes inside one interval, down from 50
+  reconnects — bounded at two different numbers, because there are two failure shapes and they are
+  not the same problem:
+  - **≤ 1 reconnect** when the channel raises on the *first* publish — a synchronous failure, where
+    the productivity rule sees the truth and arms the interval.
+  - **≤ `MAX_DIALS_PER_INTERVAL` (3) reconnects per interval** when the first publish on each fresh
+    channel returns and the rejection surfaces later, which is what real `pika` does for a missing
+    exchange. There the productivity rule is fooled every cycle and the cap is what holds.
+
+  Both are asserted, each against a double of the matching shape, and both fail on the pre-fix code.
+  Note also that phantom successes are **counted as published** — `sink.published` reports records
+  the broker discarded. That inaccuracy predates this story (it follows from TOKWEIR-6 not enabling
+  publisher confirms), but this story promotes it from a cosmetic counter to an input to the
+  reconnect policy, which is worth saying out loud.
+
+  > **Amended in fix round 3, and it is the third criterion in this spec to need it.** SC-001 read
+  > "at most 1 reconnect" full stop, written before FR-001a existed. Fix round 2 established that
+  > under real driver semantics the number is 3, relaxed the *test* to `<= MAX_DIALS_PER_INTERVAL`
+  > to match — and left this criterion asserting 1. Code and test agreed with each other and
+  > disagreed with the spec, which is exactly what SC-005 was amended twice for.
+  >
+  > Three times is a pattern, not an accident: each time the code changed for a good reason and the
+  > criterion it invalidated lived in a different part of the file from the one being edited. Worth
+  > carrying forward as a habit — when behaviour changes, grep the spec for every number and every
+  > "always" before committing, not after a reviewer finds them.
 - **SC-002**: A blip on a productive connection recovers on the very next record with the clock not
   advanced.
 - **SC-003**: The immediate-retry allowance renews per productive connection.

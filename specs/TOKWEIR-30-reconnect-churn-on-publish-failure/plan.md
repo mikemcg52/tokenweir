@@ -84,7 +84,7 @@ state that class already had the natural home for.
    intervals.
 
 3. **The allowance renews per productive connection, not per sink.** Both resets live in
-   `_invalidate`, which is the single place a connection is discarded: `_connection_published`
+   `_invalidate`, which is the single place a connection is discarded: `_connection_publishes`
    clears there so the next connection starts unproven, and `_consecutive_unproductive` clears there
    when the connection being discarded had published. (An earlier draft of this plan said the resets
    happened in `_live_channel` and "on any successful publish" respectively — behaviourally the
@@ -97,10 +97,12 @@ state that class already had the natural home for.
    broken exchange is bounded after its one free retry rather than churning indefinitely. It does
    not arm on the *first* failure, per decision 0.
 
-5. **`_next_reconnect_at = 0.0` on a successful dial stays.** It is now redundant, because
-   `_invalidate` decides the next gate either way — but removing it would make the reset depend
-   entirely on a code path two methods away, and it costs nothing to leave the obvious invariant
-   ("a dial that succeeded has spent the previous backoff") stated where a reader looks for it.
+5. **`_next_reconnect_at = 0.0` on a successful dial was kept, then removed.** The reason for
+   keeping it — "it costs nothing to leave the obvious invariant stated where a reader looks" — was
+   priced by a mutation test at one line deletable with the whole suite green, which is what
+   redundant state looks like from outside. Removed in fix round 2: `_invalidate` sets the gate on
+   every path that can lead to a dial, so there is one place to read rather than two that must
+   agree.
 
 ## Test approach
 

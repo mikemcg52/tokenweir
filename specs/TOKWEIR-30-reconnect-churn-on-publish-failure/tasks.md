@@ -20,12 +20,12 @@ must end with that reproduction as a test that fails on the parent commit.
 
 ## Phase 2: The fix
 
-- [x] **T003** In `src/tokenweir/amqp.py`, add `_connection_published` to `__init__`, initialised
-      `False` — including for the connection `from_url` opens, which has published nothing yet
+- [x] **T003** In `src/tokenweir/amqp.py`, add `_connection_publishes` to `__init__`, initialised
+      `0` (shipped as a **count**, not the boolean `_connection_published` this task first named) — including for the connection `from_url` opens, which has published nothing yet
       (FR-003, spec Edge Cases).
-- [x] **T004** In `AMQPSink.emit`, set `_connection_published = True` on a successful publish
+- [x] **T004** In `AMQPSink.emit`, increment `_connection_publishes` on a successful publish
       (FR-002).
-- [x] **T005** Reset `_connection_published` when a connection is discarded, so every connection
+- [x] **T005** Reset `_connection_publishes` when a connection is discarded, so every connection
       starts unproven and the allowance renews per connection (FR-003). **Shipped in `_invalidate`,
       not in `_live_channel` as this task first said**: `_invalidate` is the only path that nulls
       `_channel`, so a reset in `_live_channel` was a second assignment that could be deleted with

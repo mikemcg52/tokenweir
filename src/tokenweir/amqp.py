@@ -67,6 +67,7 @@ __all__ = [
     "CONTENT_TYPE",
     "DEFAULT_EXCHANGE",
     "DEFAULT_ROUTING_KEY",
+    "MAX_DIALS_PER_INTERVAL",
     "PERSISTENT_DELIVERY_MODE",
     "AMQPSink",
     "message_for",
@@ -113,12 +114,6 @@ _NO_CHANNEL = (
     "tokenweir: usage record not published — the AMQP sink has no channel to publish "
     "on and cannot make one; no metering for this call"
 )
-# Two different reasons the sink is inside its reconnect interval, and they must
-# not share a message. This module has already litigated the point once
-# (`_NO_CHANNEL` used to claim "cannot make one" during a backoff): a drop logged
-# with the wrong cause is worse than a bare count, because it sends an operator
-# after the wrong problem. Both keep the words "reconnect interval" so a reader —
-# and the tests that grep for it — can still recognise the state.
 #: A hard cap on dials per ``reconnect_interval``, independent of every judgement
 #: the productivity rule below makes. **This, not the productivity rule, is what
 #: makes the churn bound a guarantee**, and the reason is worth stating plainly
@@ -153,6 +148,12 @@ _DIAL_CEILING_REACHED = (
     "is accepting connections but records are not getting through. No metering "
     "for these calls"
 )
+# Three distinct reasons the sink is not publishing, and they must not share a
+# message. This module has already litigated the point once (`_NO_CHANNEL` used to
+# claim "cannot make one" during a backoff): a drop logged with the wrong cause is
+# worse than a bare count, because it sends an operator after the wrong problem.
+# The two backoff messages both keep the words "reconnect interval" so a reader —
+# and the tests that grep for it — can still recognise the state.
 _AWAITING_REDIAL = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
     "after a failed connection attempt; no metering for this call"
@@ -333,12 +334,19 @@ class AMQPSink:
         reconnect_interval: minimum seconds between reconnect *attempts* once the
             sink has reason to think re-dialling will not help — a dial that
             failed, or two connections in a row that could not publish. Losing a
-            connection that *had* been publishing is always recovered immediately,
-            and so is the first connection that fails to publish; see
-            :meth:`_invalidate` for why those two are not the same case. This
-            bounds how often a broken broker or a misconfigured exchange is
-            re-dialled, because a blocking connect per record is a retry loop by
-            another name. ``0`` attempts on every publish.
+            connection that *had* been publishing is recovered immediately, and so
+            is the first connection that fails to publish; see :meth:`_invalidate`
+            for why those two are not the same case. This bounds how often a broken
+            broker or a misconfigured exchange is re-dialled, because a blocking
+            connect per record is a retry loop by another name. ``0`` attempts on
+            every publish.
+
+            **Both immediate cases are still subject to**
+            :data:`MAX_DIALS_PER_INTERVAL`, a hard cap on dials per interval that
+            applies whatever the reasoning above concludes. It exists because that
+            reasoning infers a broker's intent from a driver whose publish is
+            asynchronous, and an inference is the wrong thing to hang a bound on;
+            see the constant for the detail.
         clock: monotonic seconds source. A **test seam**, not a production knob —
             it exists so the reconnect interval can be driven deterministically
             without sleeping, and no deployment should need to pass it.

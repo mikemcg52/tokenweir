@@ -1538,3 +1538,82 @@ def test_the_backoff_costs_records_a_recovering_broker_would_have_taken(fake_pik
     now[0] += 30.0
     sink.emit(_record(99))
     assert sink.published == 1
+
+
+def test_the_backoff_reason_switches_back_when_the_cause_does(fake_pika, caplog):
+    """The dial arm's reset of `_backoff_message` survived a mutation with the whole
+    suite green, because `_AWAITING_REDIAL` is also the initial value — so every
+    test reached it from the default and none exercised the *transition*.
+
+    The state it guards is real and reachable: an exchange that does not exist
+    (publish backoff), then the broker goes away entirely (dial backoff). Without
+    the reset the sink keeps telling an operator to check their exchange and
+    routing key while the actual problem is that nothing is answering the socket —
+    the wrong-cause failure FR-006 exists to prevent, arrived at from the other
+    direction.
+    """
+    now = [1000.0]
+    _always_failing_publisher(fake_pika, [])
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/",
+        reconnect_interval=30.0,
+        warn_interval=0.0,
+        clock=lambda: now[0],
+    )
+    sink.emit(_record(0))
+    sink.emit(_record(1))  # burns the free re-dial; arms with the publish reason
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        now[0] += 1.0
+        sink.emit(_record(2))
+    assert any(
+        "failed to publish" in r.getMessage() for r in caplog.records
+    ), "precondition: the publish reason must be armed first"
+
+    # Now the broker goes away outright. Wait out the interval so a dial is
+    # attempted, and let it fail.
+    def refuse(parameters):
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+    now[0] += 30.0
+    sink.emit(_record(3))  # the dial is attempted and fails, re-arming
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        now[0] += 1.0
+        sink.emit(_record(4))
+
+    backoff = [
+        r.getMessage() for r in caplog.records if "reconnect interval" in r.getMessage()
+    ]
+    assert backoff, [r.getMessage() for r in caplog.records]
+    assert any("failed connection attempt" in m for m in backoff), backoff
+    assert not any("failed to publish" in m for m in backoff), (
+        "the sink is still blaming the exchange after the broker stopped answering"
+    )
+
+
+def test_a_non_record_does_not_disturb_a_reconnectable_sinks_state(fake_pika):
+    """The spec's "a publish that fails for a non-record reason must not invalidate
+    anything" was only exercised on borrowed-channel sinks, which have no reconnect
+    state to disturb — structurally safe, but the assertion was vacuous where it
+    mattered."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    sink.emit(_record(0))
+    assert sink.published == 1
+    channel = fake_pika.connections[0].channel()
+
+    for value in (None, "not a record", 42, {"request_id": "r"}):
+        sink.emit(value)
+
+    assert sink.dropped == 4
+    assert len(fake_pika.connections) == 1, "a refused value caused a reconnect"
+    assert sink.channel is channel, "a refused value invalidated a working channel"
+
+    sink.emit(_record(1))  # and the sink still works
+    assert sink.published == 2
+    assert len(fake_pika.connections) == 1
