@@ -175,8 +175,13 @@ running environment.
 
 ### Edge Cases
 
-- **`close()` called twice**, or called on a client that was never started — must be a no-op the
-  second time, per the `Sink` protocol's "safe to call more than once".
+- **`close()` called twice** — must be a no-op the second time, per the `Sink` protocol's "safe to
+  call more than once". *(This case originally also read "or called on a client that was never
+  started". The worker starts unconditionally in `__init__`, so no unstarted client exists to close;
+  the criterion is **inapplicable as written** rather than covered, and is recorded that way rather
+  than quietly ticked. Deferring the thread start was considered and rejected: it buys a state whose
+  only visible effect is that `flush()` blocks until its timeout, which is a footgun, not a
+  feature.)*
 - **`close()` with records still buffered** — a final flush delivers what is buffered within a
   bounded timeout; it must not hang forever on a dead broker.
 - **Emitting after `close()`** — must not raise; the record is dropped and counted, because a
@@ -280,8 +285,27 @@ running environment.
 - **FR-023**: The adapter MUST accept a caller-supplied channel as well as opening its own from a
   URL, and MUST close only a connection it opened itself — mirroring `PostgresSource`'s ownership
   rule.
-- **FR-024**: The adapter MUST re-establish a connection it owns after a connection failure, on a
-  later publish attempt rather than by retrying inside one.
+- **FR-024**: The adapter MUST re-establish a connection **it is able to re-establish** — one it
+  opened itself from a URL — after a connection failure, on a later publish attempt rather than by
+  retrying inside one. Attempts MUST be rate-limited (`reconnect_interval`), with the first attempt
+  after a lost connection immediate.
+
+  > **Amended during implementation (fix round 3), for the same reason FR-020 was.** This clause
+  > first read *"MUST re-establish a connection it owns"*, and "owns" is the wrong test. Ownership
+  > decides *closing*; it does not confer the ability to re-open. Only `from_url` supplies the
+  > callable that can build a new connection, so the documented public shape
+  > `AMQPSink(channel, connection=conn, owns_connection=True)` **owned** a connection it could never
+  > re-establish. Implemented literally, the clause made that sink close its connection on the first
+  > publish failure and then have nothing to replace it with — permanently dead, and strictly worse
+  > than the borrowed case it was modelled on, where the caller can at least repair the channel out
+  > of band. The gate is therefore capability, not ownership.
+  >
+  > The rate limit is not in the original clause at all, and is an addition rather than a
+  > correction (review round 3, Med). "On a later attempt rather than inside one" bounds the wait
+  > per *publish*, but says nothing about the wait per *record* — and `pika.BlockingConnection`
+  > blocks for a full connect timeout, on the emitter's delivery worker. Without spacing, a down
+  > broker cost one connect timeout per buffered record, which is the retry loop this design
+  > refuses, reassembled out of single attempts.
 - **FR-025**: The record→message mapping MUST be a pure function, testable with no `pika` installed
   and no broker running.
 

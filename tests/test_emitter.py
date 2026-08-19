@@ -222,14 +222,20 @@ def test_a_non_record_is_refused_before_the_sink_sees_it():
     assert stats.accepted == 0
 
 
-def test_emitting_after_close_is_a_counted_drop_not_a_raise():
+def test_emitting_after_close_is_a_counted_drop_not_a_raise(caplog):
     sink = RecordingSink()
     emitter = BufferedEmitter(sink, linger=0.0)
     emitter.close()
-    emitter.emit(_record(1))  # must not raise
+    with caplog.at_level(logging.WARNING, logger="tokenweir.emitter"):
+        emitter.emit(_record(1))  # must not raise
     stats = emitter.stats()
     assert stats.dropped_closed == 1
     assert sink.records == []
+    # FR-008 says *every* drop is logged. This reason had the counter and not the
+    # log, and could be silenced with the suite still green.
+    assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+        "a record dropped after close vanished without a warning"
+    )
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
@@ -844,7 +850,7 @@ def test_a_healthy_client_reports_a_live_worker():
 # --- Records abandoned by a close timeout are accounted for (Low #2) ---------
 
 
-def test_records_abandoned_by_a_close_timeout_are_counted():
+def test_records_abandoned_by_a_close_timeout_are_counted(caplog):
     """`close()` is bounded so a dead broker cannot hang a shutdown, and the
     records still buffered when the wait ends are lost. They used to land in no
     `dropped_*` counter at all — an operator alerting on `stats().dropped`, which
@@ -857,7 +863,11 @@ def test_records_abandoned_by_a_close_timeout_are_counted():
         for n in range(1, 11):
             emitter.emit(_record(n))
 
-        emitter.close(timeout=0.2)
+        with caplog.at_level(logging.WARNING, logger="tokenweir.emitter"):
+            emitter.close(timeout=0.2)
+        assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+            "ten abandoned records produced no warning"
+        )
 
         stats = emitter.stats()
         assert stats.dropped_at_close == 10, stats
@@ -934,3 +944,122 @@ def test_a_base_exception_on_the_calling_thread_still_propagates():
                 emitter.emit(None)  # a refused record warns, and the handler bites
     finally:
         logger.removeHandler(handler)
+
+
+# --- The linger actually expires (High #1a) ----------------------------------
+
+
+class SignallingSink(RecordingSink):
+    """Sets an event on every delivery, so a test can wait for one *without*
+    calling `flush()` — which is the whole difficulty below."""
+
+    def __init__(self):
+        super().__init__()
+        self.delivered = threading.Event()
+
+    def emit(self, record):
+        super().emit(record)
+        self.delivered.set()
+
+
+def test_a_partial_batch_is_delivered_when_the_linger_expires():
+    """FR-004's "maximum wait", which nothing pinned.
+
+    Every other delivery assertion in this module reaches the sink via `flush()`
+    or `close()`, and **both cut the linger short by design** — so all of them
+    would still pass if the linger never expired at all. Confirmed: replacing the
+    deadline with an unbounded `wait()` left the entire suite green. The failure
+    that hides behind that is a low-traffic service whose records sit in the buffer
+    until shutdown, which is the opposite of what the knob is for.
+
+    So this test must wait on the *sink*, not on the client.
+    """
+    sink = SignallingSink()
+    # batch_size far above what is emitted: the only thing that can trigger
+    # delivery here is the linger deadline.
+    emitter = BufferedEmitter(sink, linger=0.05, batch_size=1000)
+    try:
+        emitter.emit(_record(1))
+        assert sink.delivered.wait(TIMEOUT), (
+            "a partial batch was never delivered — the linger did not expire"
+        )
+        assert [r.request_id for r in sink.records] == ["req-1"]
+    finally:
+        emitter.close()
+
+
+def test_the_linger_bounds_the_wait_rather_than_merely_ending_it():
+    """A partial batch must arrive on the order of the linger, not eventually."""
+    sink = SignallingSink()
+    emitter = BufferedEmitter(sink, linger=0.05, batch_size=1000)
+    try:
+        started = time.monotonic()
+        emitter.emit(_record(1))
+        assert sink.delivered.wait(TIMEOUT)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"the partial batch took {elapsed:.2f}s for a 0.05s linger"
+    finally:
+        emitter.close()
+
+
+# --- The batch path is guarded too (High #1b) --------------------------------
+
+
+class RaisingBatchSink:
+    """Batch-capable and non-conforming — the combination nothing exercised.
+
+    `RecordingBatchSink` never raises and `DirectSink` swallows its own failures,
+    so no double in this suite made `emit_batch` throw. Unguarded, that exception
+    travels out of `_deliver` into the worker's `except BaseException: raise` and
+    kills it permanently — precisely the state `_deliver`'s docstring says it
+    exists to prevent.
+    """
+
+    def __init__(self, fail_times=None):
+        self.calls = 0
+        self.records = []
+        self.fail_times = fail_times
+
+    def emit_batch(self, records):
+        self.calls += 1
+        if self.fail_times is None or self.calls <= self.fail_times:
+            raise RuntimeError("the batch sink is non-conforming")
+        self.records.extend(records)
+
+    def emit(self, record):  # pragma: no cover - the batch path is preferred
+        raise AssertionError("emit_batch should have been used")
+
+    def close(self):
+        return None
+
+
+def test_a_batch_sink_that_raises_never_reaches_the_caller():
+    sink = RaisingBatchSink()
+    assert isinstance(sink, BatchSink)
+    with BufferedEmitter(sink, linger=0.0) as emitter:
+        for n in range(5):
+            emitter.emit(_record(n))  # must not raise
+        assert emitter.flush(timeout=TIMEOUT)
+        stats = emitter.stats()
+    assert stats.failed == 5
+    assert stats.delivered == 0
+
+
+def test_a_batch_sink_that_raises_does_not_kill_the_worker():
+    """The consequence that makes this High rather than cosmetic: an unguarded
+    batch failure does not merely lose that batch, it stops the client metering for
+    the life of the process."""
+    sink = RaisingBatchSink(fail_times=1)
+    with BufferedEmitter(sink, linger=0.0, batch_size=1) as emitter:
+        emitter.emit(_record(1))
+        assert emitter.flush(timeout=TIMEOUT)
+        assert emitter.stats().worker_alive is True, "the worker died on a batch failure"
+
+        emitter.emit(_record(2))
+        assert emitter.flush(timeout=TIMEOUT)
+        stats = emitter.stats()
+
+    assert [r.request_id for r in sink.records] == ["req-2"], "delivery never resumed"
+    assert stats.failed == 1
+    assert stats.delivered == 1
+    assert stats.worker_alive is True

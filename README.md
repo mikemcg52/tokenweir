@@ -350,8 +350,10 @@ The worker is a **daemon** thread, so metering can never be the reason a process
 will not exit. The cost, stated rather than hidden: records buffered at a hard exit
 are lost. `close()` — or the context manager — is the supported way to not lose
 them, and an `atexit` hook makes a bounded best-effort attempt for callers who
-forget. This client is not durable; surviving a consumer outage is what a broker is
-for.
+forget. That bound is **per client**: *n* forgotten clients whose sinks are all
+wedged against a dead broker delay interpreter exit by up to *n* × `close_timeout`.
+Exit is still bounded rather than hung, but if you hold many clients, close them.
+This client is not durable; surviving a consumer outage is what a broker is for.
 
 ## Choosing a transport
 

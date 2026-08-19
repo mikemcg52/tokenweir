@@ -190,6 +190,10 @@ broker or network can reach the caller.
       a test double. The two real-driver tests skip in the first and pass in the second, and the
       dependency-light subprocess assertions pass in both — which is stronger evidence with `pika`
       installed than without, because then the import genuinely could happen and does not.
+- [x] **T046** Close the three test holes review round 4 found by mutation — the linger deadline,
+      the guarded `emit_batch` path, and the WARNING on the two close-related drop reasons — each
+      verified by re-running the mutation and watching it fail (FR-004, FR-005, FR-008, FR-018).
+
 - [x] **T045** Run `ruff check` against the new modules for the lint rules
       `pyproject.toml` declares (`E`, `F`, `I`, `N`, `W`, line length 100) — clean.
       **`ruff format` is not this project's gate** and was not applied: 19 files already

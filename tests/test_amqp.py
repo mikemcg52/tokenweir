@@ -847,3 +847,62 @@ def test_a_real_pika_sink_publishes_persistent_json_to_a_channel_double():
     assert UsageRecord.from_json(published["body"]).input_tokens == 120
     assert published["properties"].delivery_mode == PERSISTENT_DELIVERY_MODE
     assert published["properties"].content_type == CONTENT_TYPE
+
+
+# --- The drop reason has to be the true one (Low #1) -------------------------
+
+
+def test_backing_off_does_not_claim_the_sink_is_unrecoverable(fake_pika, caplog):
+    """A drop logged with the wrong cause is worse than a bare count. This branch
+    told an operator the sink "has no channel to publish on and cannot make one"
+    while it was merely inside its reconnect interval and about to recover on its
+    own — an accurate counter under a false explanation."""
+    now = [1000.0]
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+
+    def refuse(parameters):
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+    sink.emit(_record(1))  # the one real dial attempt; fails and starts the backoff
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        now[0] += 1.0
+        sink.emit(_record(2))  # inside the window
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages, "the drop was silent"
+    assert not any("cannot make one" in m for m in messages), messages
+    assert any("reconnect interval" in m for m in messages), messages
+
+
+def test_a_sink_that_truly_cannot_reconnect_still_says_so(caplog):
+    sink = AMQPSink(None, properties=FakeProperties())
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        sink.emit(_record(1))
+    assert any("cannot make one" in r.getMessage() for r in caplog.records)
+
+
+def test_one_drop_produces_one_warning_on_the_dial_path(fake_pika, caplog):
+    """`_live_channel` logs the dial failure; `emit` must not log a second line for
+    the same lost record."""
+    sink = AMQPSink.from_url("amqp://guest:guest@rabbit/", warn_interval=0.0)
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+    caplog.clear()
+
+    def refuse(parameters):
+        raise RuntimeError("connection refused")
+
+    fake_pika.BlockingConnection = refuse
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        sink.emit(_record(1))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert "re-establish" in warnings[0]

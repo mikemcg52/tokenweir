@@ -113,6 +113,10 @@ _NO_CHANNEL = (
     "tokenweir: usage record not published — the AMQP sink has no channel to publish "
     "on and cannot make one; no metering for this call"
 )
+_AWAITING_RECONNECT = (
+    "tokenweir: usage record not published — waiting out the reconnect interval "
+    "after a failed attempt; no metering for this call"
+)
 
 
 def _import_pika() -> Any:
@@ -278,7 +282,9 @@ class AMQPSink:
             immediate; this bounds how often a down broker is re-dialled, because
             a blocking connect per record is a retry loop by another name. ``0``
             attempts on every publish.
-        clock: monotonic seconds source, for testing the interval without sleeping.
+        clock: monotonic seconds source. A **test seam**, not a production knob —
+            it exists so the reconnect interval can be driven deterministically
+            without sleeping, and no deployment should need to pass it.
 
     Raises:
         ImportError: ``pika`` is not installed and no ``properties`` were given,
@@ -403,16 +409,16 @@ class AMQPSink:
             self._warner.warn(_SINK_CLOSED, exc_info=False)
             return
 
+        # `_live_channel` logs its own failure reasons — there are three of them
+        # and they are only distinguishable inside it. FR-008 wants every drop
+        # logged, but a drop logged with the wrong cause is worse than a bare
+        # count: "cannot make one" told an operator their sink was unrecoverable
+        # when it was merely inside its backoff window and about to recover on its
+        # own. Re-deriving the reason out here is what produced both that lie and a
+        # second warning for one lost record.
         channel = self._live_channel()
         if channel is None:
             self._dropped += 1
-            # `_live_channel` warns when a *reconnect* failed, but says nothing
-            # when there was nothing to reconnect — a borrowed channel that has
-            # been invalidated, or a sink built over `channel=None`. FR-008 has no
-            # exception for a drop that is the caller's fault: dropping every
-            # record in silence is the failure mode the counters and the log exist
-            # to make impossible.
-            self._warner.warn(_NO_CHANNEL, exc_info=False)
             return
 
         try:
@@ -465,8 +471,12 @@ class AMQPSink:
         if self._reconnect is None:
             # A channel this sink cannot re-make — borrowed, or absent entirely.
             # Not ours to replace; whoever owns it owns its liveness.
+            self._warner.warn(_NO_CHANNEL, exc_info=False)
             return None
         if self._clock() < self._next_reconnect_at:
+            # Backing off after a failed dial. Recoverable, and saying so is the
+            # difference between an operator waiting and an operator paging.
+            self._warner.warn(_AWAITING_RECONNECT, exc_info=False)
             return None
         try:
             self._connection, self._channel = self._reconnect()

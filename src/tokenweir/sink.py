@@ -112,6 +112,9 @@ _NOT_A_RECORD = (
 _SINK_CLOSED = (
     "tokenweir: refusing to emit through a closed sink; no metering for these calls"
 )
+_SOURCE_CLOSE_FAILED = (
+    "tokenweir: the store raised while closing; releasing it anyway"
+)
 _DIRECT_WRITE_FAILED = (
     "tokenweir: usage records not written — the store failed; no metering for these calls"
 )
@@ -315,13 +318,24 @@ class DirectSink:
         closing something handed to us would surprise whoever else holds it. The closed
         flag is set before the source is closed, so a ``close`` that raises is not
         retried into a double-close by a caller who calls again.
+
+        **Never raises**, matching :meth:`tokenweir.amqp.AMQPSink.close`. A store that
+        has already gone away routinely makes a close raise, and a shutdown path is the
+        worst place to turn that into an exception — a caller using this sink bare, with
+        no :class:`~tokenweir.emitter.BufferedEmitter` in front to absorb it, would
+        otherwise get an exception out of the last call they make. The failure is logged;
+        nothing is lost by it, because ``write`` commits per batch and a close has no
+        data left to flush.
         """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
         if self._owns_source:
-            self._source.close()
+            try:
+                self._source.close()
+            except Exception:
+                self._warner.warn(_SOURCE_CLOSE_FAILED)
 
 
 

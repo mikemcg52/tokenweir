@@ -383,3 +383,36 @@ def test_a_batch_of_only_non_records_opens_no_transaction():
     sink.emit_batch([None, None])
     assert source.writes == []
     assert sink.dropped == 2
+
+
+# --- close() never raises, as AMQPSink.close() does not (Low #2) -------------
+
+
+def test_close_survives_a_source_that_raises():
+    """A store that has already gone away routinely makes a close raise, and a
+    shutdown path is the worst place to turn that into an exception. `AMQPSink`
+    already guaranteed this; the asymmetry was undocumented and unintended."""
+
+    class RaisingOnClose:
+        def write(self, records):
+            return len(list(records))
+
+        def close(self):
+            raise RuntimeError("the store went away first")
+
+    sink = DirectSink(RaisingOnClose(), owns_source=True)
+    sink.close()  # must not raise
+    sink.close()  # and stays idempotent
+
+
+def test_a_source_close_failure_is_logged(caplog):
+    class RaisingOnClose:
+        def write(self, records):
+            return 0
+
+        def close(self):
+            raise RuntimeError("the store went away first")
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.sink"):
+        DirectSink(RaisingOnClose(), owns_source=True).close()
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
