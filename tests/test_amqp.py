@@ -613,3 +613,63 @@ def test_a_publish_failure_does_not_silence_a_refused_record(fake_pika, caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert any("the AMQP channel failed" in m for m in messages), messages
     assert any("non-UsageRecord" in m for m in messages), messages
+
+
+def test_repeated_reconnect_failures_are_rate_limited_despite_varying_text(
+    fake_pika, caplog
+):
+    """The reconnect warning is the one message in this package that interpolates —
+    the exception type and its text go into the line. Rate limiting keys on the
+    message by default, so without an explicit `key=` every varying error string is
+    a distinct reason and the limiting is defeated entirely: one WARNING per publish
+    attempt against a broker that is down, which is precisely the FR-008 failure
+    mode. A driver that includes an attempt number, a port or a timestamp in its
+    message is not exotic; it is the normal case."""
+    sink = AMQPSink.from_url("amqp://guest:guest@rabbit/", warn_interval=3600.0)
+    fake_pika.connections[0].channel().fail_with = RuntimeError("connection reset")
+    sink.emit(_record(0))
+    caplog.clear()
+
+    attempts = iter(range(1, 100))
+
+    def refuse(parameters):
+        raise RuntimeError(f"connect attempt {next(attempts)} refused at 17:0{next(attempts)}")
+
+    fake_pika.BlockingConnection = refuse
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        for n in range(1, 40):
+            sink.emit(_record(n))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) <= 2, (
+        f"{len(warnings)} warnings for 39 reconnect failures — the varying error "
+        "text defeated rate limiting"
+    )
+    assert sink.dropped == 40
+
+
+def test_a_sink_with_no_channel_drops_loudly_rather_than_silently(caplog):
+    """A drop with no counter and no log is the one outcome the whole design is
+    arranged to prevent. This branch had the counter and not the log."""
+    sink = AMQPSink(None, properties=FakeProperties())
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        for n in range(5):
+            sink.emit(_record(n))  # must not raise
+
+    assert sink.dropped == 5
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "5 records vanished without a single warning"
+    assert any("no channel" in m for m in warnings), warnings
+
+
+def test_an_invalidated_borrowed_channel_keeps_reporting(fake_pika, caplog):
+    """A borrowed channel is never reconnected — the caller owns its liveness — so
+    the sink must keep saying so rather than going quiet after the first line."""
+    channel = RecordingChannel(fail_with=RuntimeError("connection reset"))
+    sink = AMQPSink(channel, connection=RecordingConnection(channel), warn_interval=0.0)
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        for n in range(3):
+            sink.emit(_record(n))
+    assert sink.dropped == 3
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]

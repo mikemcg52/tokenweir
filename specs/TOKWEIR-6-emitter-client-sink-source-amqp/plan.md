@@ -82,6 +82,7 @@ src/tokenweir/
 ├── contract.py          # untouched
 ├── sink.py              # + BatchSink protocol, + DirectSink
 ├── emitter.py           # NEW — BufferedEmitter, EmitterStats
+├── _ratelimit.py        # NEW — RateLimitedWarner, private, shared by the three emit-side modules
 ├── amqp.py              # NEW — AMQPSink, message_for(); pika deferred
 ├── source.py            # untouched
 ├── postgres.py          # untouched
@@ -113,12 +114,19 @@ than reverse-engineer from the diff.
    way to not lose them, and an `atexit` hook gives a best-effort bounded flush for callers who
    forget.
 
-2. **`deque` + `threading.Condition`, not `queue.Queue`.** `Queue` has no "drop the newest when
-   full" mode — `put_nowait` raises `Full`, which would mean an exception on the metered path to be
-   caught per call, and `put` blocks, which is worse. A `deque` under a `Condition` gives the drop
-   decision, batch draining, and the flush predicate in one lock. Drop-newest rather than
-   drop-oldest: the records already accepted were accepted, and evicting them to make room for a
-   newer one converts a bounded loss into an unbounded reshuffling of which records survive.
+2. **A plain `list` under a `threading.Condition`, not `queue.Queue`.** `Queue` has no "drop the
+   newest when full" mode — `put_nowait` raises `Full`, which would mean an exception on the metered
+   path to be caught per call, and `put` blocks, which is worse. A sequence under a `Condition`
+   gives the drop decision, batch draining, and the flush predicate in one lock. Drop-newest rather
+   than drop-oldest: the records already accepted were accepted, and evicting them to make room for
+   a newer one converts a bounded loss into an unbounded reshuffling of which records survive.
+
+   *This plan first specified a `deque`, and the code shipped a `list`.* The deciding difference is
+   how a **batch** leaves the buffer: `list` takes one `self._buffer[:size]` slice and one
+   `del self._buffer[:size]` under the lock, where a `deque` needs a `popleft()` loop. Both are
+   O(batch), but the slice holds the lock for one bytecode-level operation instead of *n*, and the
+   lock here is the one every emitting thread contends for. `deque`'s advantage — O(1) `popleft`
+   and `appendleft` — buys nothing when records only ever enter at one end and leave in slices.
 
 3. **No retry (FR-005).** ADR-0001 says "swallows failures". A retry in front of a down broker
    fills the bounded buffer and turns record loss into *more* record loss plus latency; a poison
@@ -139,11 +147,24 @@ than reverse-engineer from the diff.
    `NullHandler` in `__init__.py` was added for. First occurrence logs; subsequent ones are counted
    and logged on a decaying/periodic basis with the suppressed count.
 
-7. **`pika` deferred, not module-level (FR-020).** Required, not stylistic: `tests/test_contract.py`
-   sweeps every module in the package with an AST check and fails an import-time third-party
-   import. The same sweep also requires a deferred import to correspond to a declared extra — which
-   `amqp = ["pika>=1.3"]` already does. It also makes `message_for()` testable with no `pika`
-   installed (FR-025), the same rationale `postgres.py` gives for `row_for()`.
+7. **`pika` deferred to construction, not module-level (FR-020).** Keeping it out of module import
+   is required, not stylistic: `tests/test_contract.py` sweeps every module in the package with an
+   AST check and fails an import-time third-party import. The same sweep also requires a deferred
+   import to correspond to a declared extra — which `amqp = ["pika>=1.3"]` already does. It also
+   makes `message_for()` testable with no `pika` installed (FR-025), the same rationale
+   `postgres.py` gives for `row_for()`.
+
+   **Where it stops being deferred is the load-bearing part**, and this plan originally got it
+   wrong by saying "into the connect path". See the amendment on FR-020: deferring past construction
+   puts the import on the publish path, which may not raise, turning a missing driver into a silent
+   permanent drop rather than an error. The rule is "defer to the last point that can still report
+   failure", and that is `AMQPSink.__init__`.
+
+8. **The rate limiter lives in its own private module, `tokenweir/_ratelimit.py`.** It was planned
+   as a helper inside `emitter.py`, but `DirectSink` (in `sink.py`) and `AMQPSink` need the same
+   thing, and the alternatives are both worse: three copies, or two modules reaching into a third's
+   privates. A leading-underscore module name says it is not API while letting the class inside have
+   an ordinary name. It is stdlib-only, so the AST sweep covers it at no cost.
 
 ## Test approach
 
@@ -151,9 +172,12 @@ Every new test runs with no broker, no database and no `pika`, because that is t
 project's authoritative test command actually runs in:
 
 - **AMQP** — the pure `message_for()` mapping directly; publishing against a recording channel
-  double asserting exchange, routing key, body and `delivery_mode`. `pika`-dependent paths
-  (`from_url`) are exercised by monkeypatching `sys.modules["pika"] = None` to assert the
-  `ImportError` names the extra, the same technique `test_postgres_source.py` uses for psycopg.
+  double asserting exchange, routing key, body and `delivery_mode`. Constructing a sink needs a
+  `pika` module object (see decision 7), so the publish tests get one of two ways: `properties=`,
+  the documented escape hatch, which needs no `pika` in any form; or a `fake_pika` fixture that
+  injects a minimal module into `sys.modules`, which is the only way to cover `from_url` and the
+  default properties at all. The missing-driver path uses `sys.modules["pika"] = None`, the same
+  technique `test_postgres_source.py` uses for psycopg.
 - **Direct** — `MemorySource`, plus a raising source for containment and a counting source for
   "one `write` per batch, not one per record".
 - **Client** — deterministic tests over a synchronous drain where possible (drive the worker's

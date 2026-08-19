@@ -108,6 +108,10 @@ _NOT_A_RECORD = (
 _SINK_CLOSED = (
     "tokenweir: refusing to publish through a closed AMQP sink; no metering for this call"
 )
+_NO_CHANNEL = (
+    "tokenweir: usage record not published — the AMQP sink has no channel to publish "
+    "on and cannot make one; no metering for this call"
+)
 
 
 def _import_pika() -> Any:
@@ -386,6 +390,13 @@ class AMQPSink:
         channel = self._live_channel()
         if channel is None:
             self._dropped += 1
+            # `_live_channel` warns when a *reconnect* failed, but says nothing
+            # when there was nothing to reconnect — a borrowed channel that has
+            # been invalidated, or a sink built over `channel=None`. FR-008 has no
+            # exception for a drop that is the caller's fault: dropping every
+            # record in silence is the failure mode the counters and the log exist
+            # to make impossible.
+            self._warner.warn(_NO_CHANNEL, exc_info=False)
             return
 
         try:

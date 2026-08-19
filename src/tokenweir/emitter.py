@@ -109,9 +109,16 @@ _FLUSH_TIMED_OUT = (
 )
 
 #: Clients that are still open, so :func:`_close_all_at_exit` can make a
-#: best-effort final flush. A :class:`weakref.WeakSet` because the registry must
-#: not be the reason a client outlives its owner — an emitter that is garbage
-#: has no buffer worth flushing.
+#: best-effort final flush. A :class:`weakref.WeakSet` so that *this registry* is
+#: never the thing keeping a client alive.
+#:
+#: Be precise about what that does and does not buy, because the obvious reading is
+#: wrong: an unclosed client is **not** collectable anyway. Its worker thread holds
+#: a strong reference to the bound ``self._run``, and a running thread is a GC root,
+#: so dropping every reference you hold frees nothing — the client, its buffer and
+#: its thread live until :meth:`BufferedEmitter.close` or interpreter exit. The
+#: weak registry means only that closing a client is enough to make it collectable;
+#: it does not make forgetting to close one free.
 _LIVE: "weakref.WeakSet[BufferedEmitter]" = weakref.WeakSet()
 
 

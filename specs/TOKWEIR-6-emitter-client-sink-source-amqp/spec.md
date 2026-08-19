@@ -240,8 +240,28 @@ running environment.
 
 - **FR-019**: The library MUST provide an AMQP sink under the `amqp` extra that publishes each
   record as its JSON wire form.
-- **FR-020**: The adapter MUST NOT import `pika` at module import time; the import MUST be deferred
-  to the point a connection is opened, matching how `tokenweir.migrations` defers `psycopg`.
+- **FR-020**: The adapter MUST NOT import `pika` at module import time. The import MUST happen when
+  an `AMQPSink` is **constructed** — no later.
+
+  > **Amended during implementation (fix round 1), and the original is worth keeping visible.**
+  > This clause first read *"the import MUST be deferred to the point a connection is opened,
+  > matching how `tokenweir.migrations` defers `psycopg`"*. Implemented literally, it was a High
+  > finding in review 1: the properties every message carries are a `pika` object, so "as late as
+  > possible" put the import on the **publish** path — inside the guard that FR-002 forbids from
+  > raising. A missing driver was therefore not an error at all. It was a caught exception, a
+  > counted drop, and a permanent 100% loss of metering for the life of the process, in the one code
+  > path whose whole job is never to complain.
+  >
+  > The analogy to `tokenweir.migrations` is what misled the clause. There, the deferred import sits
+  > in `connect()` — a function that **may raise**, because opening a connection is wiring-time work.
+  > The property worth copying was never "defer as far as possible"; it was "defer to the last point
+  > that can still report failure". For this adapter that point is construction.
+  >
+  > What the original clause was protecting is unchanged and still asserted: a bare
+  > `pip install tokenweir` carries no AMQP library, importing `tokenweir.amqp` imports no `pika`,
+  > and `message_for` stays pure and testable with none installed (FR-025, FR-026). The cost is
+  > that a caller with a channel of their own must pass `properties=` — the one thing the driver is
+  > needed for — or install `pika`. That is stated in FR-021's error text and in the README.
 - **FR-021**: When `pika` is missing, the raised `ImportError` MUST name `tokenweir[amqp]`.
 - **FR-022**: The adapter MUST publish persistent messages with a JSON content type, so a broker
   restart does not discard buffered metering.

@@ -259,9 +259,19 @@ class DirectSink:
             return
         if not batch:
             return
-        if self._closed:
-            with self._lock:
+        # The flag is read under the same lock that guards the counters. It was
+        # read outside it at first, which left a window where a concurrent
+        # `close()` landed between the check and the `write` — harmless, because
+        # the failure is caught and counted, but an asymmetry that reads as an
+        # oversight rather than a decision, and one that would stop being harmless
+        # the moment anything here stopped being guarded.
+        with self._lock:
+            if self._closed:
                 self._dropped += len(batch)
+                closed = True
+            else:
+                closed = False
+        if closed:
             self._warner.warn(_SINK_CLOSED, exc_info=False)
             return
         try:
@@ -283,9 +293,10 @@ class DirectSink:
         flag is set before the source is closed, so a ``close`` that raises is not
         retried into a double-close by a caller who calls again.
         """
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         if self._owns_source:
             self._source.close()
 

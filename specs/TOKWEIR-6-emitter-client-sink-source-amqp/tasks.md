@@ -45,8 +45,9 @@ broker or network can reach the caller.
 - [x] **T005** In `emitter.py`, add `EmitterStats` — a frozen snapshot carrying accepted,
       delivered, dropped-buffer-full, dropped-not-a-record and failed counts (FR-007).
 - [x] **T006** In `emitter.py`, add `BufferedEmitter.__init__(sink, *, max_buffer, batch_size,
-      flush_interval, ...)` with validated arguments, the `deque`, the `Condition`, and the counters
-      (FR-001, FR-003, FR-004).
+      linger, close_timeout, warn_interval, name)` with validated arguments, the buffer, the
+      `Condition`, and the counters (FR-001, FR-003, FR-004). **Shipped with a `list`, not the
+      planned `deque`** — see plan decision 2 for why slice-removal under the lock won.
 - [x] **T007** In `emitter.py`, add the worker thread: daemon, started lazily or on construction,
       draining up to `batch_size` under the lock and delivering outside it (FR-001, FR-012).
 - [x] **T008** In `emitter.py`, add `emit(record)`: type-check, append, drop-newest when full,
@@ -55,8 +56,13 @@ broker or network can reach the caller.
 - [x] **T009** In `emitter.py`, add delivery: prefer `emit_batch` when the sink offers it, else
       per-record `emit`; guard both, count failures, never retry, never let the worker die
       (FR-005, FR-018).
-- [x] **T010** In `emitter.py`, add the rate-limited warning helper so a systematically broken sink
-      cannot log once per metered record, reporting the suppressed count (FR-008).
+- [x] **T010** Add the rate-limited warning helper so a systematically broken sink cannot log once
+      per metered record, reporting the suppressed count (FR-008). **Shipped as its own private
+      module, `src/tokenweir/_ratelimit.py`, not inside `emitter.py`** — `DirectSink` and `AMQPSink`
+      need the same thing, and the alternatives were three copies or cross-module private access
+      (plan decision 8). Review round 1 then made the window **per reason** rather than per warner:
+      a shared window silences a new failure mode for a whole interval and misattributes the
+      suppressed count to whichever message gets through next.
 - [x] **T011** In `emitter.py`, add `flush(timeout=None) -> bool` blocking until drained or timed
       out, reporting which (FR-009).
 - [x] **T012** In `emitter.py`, add `close(timeout=…)`: stop, bounded final flush, close the sink
@@ -114,10 +120,16 @@ broker or network can reach the caller.
       `pika` import, the ownership rule and the reconnect policy (FR-020, FR-023, FR-024).
 - [x] **T028** In `amqp.py`, add the pure `message_for(record) -> bytes` mapping and the publish
       properties helper, both usable with no `pika` installed (FR-019, FR-022, FR-025).
-- [x] **T029** In `amqp.py`, add `AMQPSink(channel, *, exchange, routing_key, ...)` taking a
-      caller-supplied channel, with `emit` and `emit_batch` that never raise (FR-019, FR-023).
-- [x] **T030** In `amqp.py`, add `AMQPSink.from_url(...)` deferring `import pika` into the call and
-      raising an `ImportError` that names `tokenweir[amqp]` (FR-020, FR-021).
+- [x] **T029** In `amqp.py`, add `AMQPSink(channel, *, exchange, routing_key, properties, ...)`
+      taking a caller-supplied channel, with an `emit` that never raises (FR-019, FR-023).
+      **No `emit_batch`, deliberately**: AMQP has no batch publish, so one here would be a loop
+      wearing a costume, and leaving it off is what exercises the emitter's per-record fallback
+      (FR-018). The task as written said to add one; not writing it is the decision.
+- [x] **T030** In `amqp.py`, add `AMQPSink.from_url(...)` and raise an `ImportError` naming
+      `tokenweir[amqp]` when the driver is absent (FR-020, FR-021). **The import lands in
+      `__init__`, not in `from_url` alone** — deferring past construction puts it on the publish
+      path, which may not raise, so a missing driver became a silent permanent drop (review round 1,
+      High). See the FR-020 amendment in `spec.md`.
 - [x] **T031** In `amqp.py`, add reconnection for a connection the sink owns: re-establish on a
       later publish attempt, not by retrying inside one (FR-024).
 - [x] **T032** In `amqp.py`, add `close()` honouring the ownership rule and never raising (FR-023).
@@ -142,9 +154,11 @@ broker or network can reach the caller.
       core module leaves `pika` out of `sys.modules` (SC-002, FR-026).
 - [x] **T039** In `tests/test_amqp.py`, assert `AMQPSink` is not exported from the `tokenweir`
       namespace, mirroring the store's treatment (FR-027).
-- [x] **T040** Confirm the existing AST sweep in `tests/test_contract.py` covers the two new modules
-      with no change needed — `emitter.py` must be stdlib-only and `amqp.py`'s deferred `pika` must
-      map to the declared `amqp` extra (FR-020).
+- [x] **T040** Extend the AST sweep's anti-vacuity guard in `tests/test_contract.py` to name
+      `emitter.py`, `amqp.py` and `_ratelimit.py`. The sweep's `rglob` already covered them, which
+      is what this task originally concluded — but the explicit set exists precisely so a glob that
+      silently stopped matching would fail rather than make the hygiene check vacuously pass, and
+      leaving the newest modules out of it defeated that (review round 1, Med).
 
 ---
 

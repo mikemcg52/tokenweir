@@ -142,6 +142,10 @@ def test_a_sink_that_raises_never_reaches_the_caller():
     assert stats.accepted == 5
     assert stats.failed == 5
     assert stats.delivered == 0
+    # FR-005 stated directly rather than inferred: five records, five attempts.
+    # A retry loop would satisfy every assertion above — the failure count would
+    # still be per record — and only this one says the batch was not tried again.
+    assert sink.calls == 5, f"the sink was called {sink.calls} times for 5 records"
 
 
 def test_a_sink_that_raises_does_not_stop_the_worker():
