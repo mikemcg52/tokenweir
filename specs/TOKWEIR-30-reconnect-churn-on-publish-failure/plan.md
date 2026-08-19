@@ -50,6 +50,19 @@ state that class already had the natural home for.
 
 ## Key design decisions
 
+-1. **The bound is structural, not inferential.** Everything below reasons about *why* a publish
+   failed by asking whether the connection had published before. Review 2 established from pika's
+   source that this inference is unsound for the ticket's headline case: without publisher confirms,
+   the first publish to a nonexistent exchange **returns normally**, so every fresh connection hands
+   the rule a phantom success and the churn is unchanged. The measurement was unambiguous — 24
+   reconnects for 50 records, byte-identical to the unfixed code.
+
+   `MAX_DIALS_PER_INTERVAL` is therefore the clause that actually delivers this story, and the
+   productivity rule is a refinement on top of it that keeps recovery instant in the cases it reads
+   correctly. The lesson worth keeping: a guarantee resting on a heuristic about a *driver's error
+   semantics*, in a project with no broker to test against, is a guarantee resting on nothing. The
+   structural cap costs three lines and holds whatever the driver does.
+
 0. **One free re-dial before the interval arms** — see the FR-002a amendment in `spec.md`. The
    first draft armed on any unproductive connection and broke a TOKWEIR-6 test that was correct;
    "never published" cannot distinguish a reset-before-first-publish from a bad exchange, and one

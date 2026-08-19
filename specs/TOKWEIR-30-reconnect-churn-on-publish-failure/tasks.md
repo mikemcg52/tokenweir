@@ -65,7 +65,22 @@ must end with that reproduction as a test that fails on the parent commit.
 
 ---
 
-## Phase 5: Verification
+## Phase 5 (fix round 2): the bound made structural
+
+- [x] **T020** Add `MAX_DIALS_PER_INTERVAL`, an unconditional cap on dials per interval, after
+      review 2 showed the productivity rule is defeated by pika's asynchronous channel-close: the
+      first publish to a missing exchange returns normally, so the rule is handed a phantom success
+      every cycle and the fix was a measured no-op (FR-001a).
+- [x] **T021** Add a channel double shaped like the real driver — first publish returns, later ones
+      raise — and assert the bound against it. Every other double in this suite raises on the first
+      call, which is the one shape pika will *not* produce for a 404, so nothing in the suite
+      constrained the behaviour that mattered.
+- [x] **T022** Pin SC-005's availability cost with a recovering-broker test, and amend the criterion
+      for the second time — the first amendment fixed one half of a two-part false claim.
+
+---
+
+## Phase 6: Verification
 
 - [x] **T018** Mutation-check **every** assignment the fix adds — not "both halves", which is what
       this task first said and what the round-1 commit claimed to have done. There are three, and

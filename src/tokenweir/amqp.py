@@ -119,15 +119,49 @@ _NO_CHANNEL = (
 # with the wrong cause is worse than a bare count, because it sends an operator
 # after the wrong problem. Both keep the words "reconnect interval" so a reader —
 # and the tests that grep for it — can still recognise the state.
+#: A hard cap on dials per ``reconnect_interval``, independent of every judgement
+#: the productivity rule below makes. **This, not the productivity rule, is what
+#: makes the churn bound a guarantee**, and the reason is worth stating plainly
+#: because it took a review to see it.
+#:
+#: ``pika``'s ``BlockingChannel.basic_publish`` does not wait for the broker unless
+#: publisher confirms are on, which this adapter does not enable: ``_flush_output()``
+#: is called with no waiters and returns once the socket write is flushed. So a
+#: publish to a **nonexistent exchange returns normally**, and the broker's
+#: ``channel.close`` arrives a round trip later, surfacing on a *later* publish.
+#: The first success on a fresh channel is therefore unfalsifiable — it is the same
+#: call whether the exchange exists or not.
+#:
+#: That is fatal to a rule built only on "has this connection published?", because a
+#: broken exchange hands it a fresh "this one works" every cycle. The obvious repair
+#: — demand two publishes before trusting a connection — was tried and rejected: it
+#: breaks a TOKWEIR-6 guarantee that a connection which published once and then
+#: dropped recovers immediately, which is a legitimate property and not one this
+#: story is entitled to take away.
+#:
+#: So the productivity rule stays as the thing that gets the *common* case right and
+#: keeps recovery instant, and this cap is what holds when the rule is fooled.
+#: Structural rather than inferential: however many times the rule concludes "this
+#: one deserves an immediate re-dial", dialling is capped. Three is small enough to
+#: bound churn hard and large enough that a genuine recovery burst — lose, recover,
+#: lose again — never reaches it.
+MAX_DIALS_PER_INTERVAL = 3
+
+_DIAL_CEILING_REACHED = (
+    "tokenweir: usage record not published — the AMQP sink has hit its cap of "
+    f"{MAX_DIALS_PER_INTERVAL} reconnects per interval and is waiting; the broker "
+    "is accepting connections but records are not getting through. No metering "
+    "for these calls"
+)
 _AWAITING_REDIAL = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
     "after a failed connection attempt; no metering for this call"
 )
 _AWAITING_PUBLISHABLE = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
-    "because two connections in a row could not publish, so re-dialling will not "
-    "help; check that the exchange and routing key exist and are permitted. No "
-    "metering for these calls"
+    "after two connections in a row failed to publish anything; if this persists, "
+    "check that the exchange and routing key exist and are permitted. No metering "
+    "for these calls"
 )
 
 
@@ -345,12 +379,17 @@ class AMQPSink:
         self._clock = clock
         self._reconnect_interval = max(0.0, float(reconnect_interval))
         self._next_reconnect_at = 0.0
-        # Whether the connection currently held has ever successfully published,
-        # and how many connections in a row have been discarded without doing so.
-        # Together they decide whether a publish failure earns an immediate re-dial
-        # or has to wait out `reconnect_interval` — see `_invalidate`.
-        self._connection_published = False
+        # How many records the connection currently held has published, and how
+        # many connections in a row have been discarded without proving
+        # themselves. Together they decide whether a publish failure earns an
+        # immediate re-dial or has to wait out `reconnect_interval` — see
+        # `_invalidate` for why the threshold is *more than one*.
+        self._connection_publishes = 0
         self._consecutive_unproductive = 0
+        # The backstop: dials are capped per interval whatever the productivity
+        # bookkeeping concludes. See `_live_channel`.
+        self._dial_window_ends = 0.0
+        self._dials_in_window = 0
         # Which of the two causes armed `_next_reconnect_at`, so the drop it
         # produces can name the right one. Defaults to the dial case; it is only
         # ever read while the interval is armed, and arming always sets it.
@@ -479,9 +518,7 @@ class AMQPSink:
             self._warner.warn(_PUBLISH_FAILED)
             return
         self._published += 1
-        # This connection has now done its job at least once, which is what buys
-        # it an immediate re-dial if it later drops. See `_invalidate`.
-        self._connection_published = True
+        self._connection_publishes += 1
 
     def close(self) -> None:
         """Release resources. Safe to call more than once, and never raises.
@@ -529,6 +566,9 @@ class AMQPSink:
             # message is the one whichever arm set (see `_invalidate`).
             self._warner.warn(self._backoff_message, exc_info=False)
             return None
+        if not self._may_dial():
+            self._warner.warn(_DIAL_CEILING_REACHED, exc_info=False)
+            return None
         try:
             self._connection, self._channel = self._reconnect()
         except Exception as exc:
@@ -546,14 +586,40 @@ class AMQPSink:
                 exc_info=False,
             )
             return None
-        self._next_reconnect_at = 0.0
-        # `_connection_published` is deliberately *not* reset here. `_invalidate`
-        # is the only path that nulls `_channel`, and it clears the flag as it
-        # goes, so a connection reached from here always starts unproven — one
-        # reset point rather than two agreeing ones. A mutation test found the
-        # second assignment could be deleted with the whole suite green, which is
-        # what redundant state looks like from the outside.
+        # Nothing to reset here. `_next_reconnect_at` is only ever read as
+        # `clock() < it`, and a dial happens only when that is already false, so
+        # clearing it would be writing a value that is by definition already spent
+        # — it was kept for one round as "the obvious invariant, stated where a
+        # reader looks", and a mutation test showed it could be deleted with the
+        # whole suite green, which is what that costs. `_connection_publishes` is
+        # cleared by `_invalidate`, the only path that nulls `_channel`, so a
+        # connection reached from here always starts unproven: one reset point
+        # rather than two that have to agree.
         return self._channel
+
+    def _may_dial(self) -> bool:
+        """Whether the per-interval dial cap still has room, counting this dial.
+
+        The backstop described on :data:`MAX_DIALS_PER_INTERVAL`. Everything above
+        this is a judgement about *why* a connection failed, inferred from a
+        driver whose error semantics this project cannot exercise against a real
+        broker. This is the part that does not depend on getting that judgement
+        right: however many times the productivity rule concludes "this one
+        deserves an immediate re-dial", dialling is capped per interval.
+
+        A zero ``reconnect_interval`` disables it, as it disables the interval
+        itself — that setting means "no spacing", and a cap would be spacing.
+        """
+        if not self._reconnect_interval:
+            return True
+        now = self._clock()
+        if now >= self._dial_window_ends:
+            self._dial_window_ends = now + self._reconnect_interval
+            self._dials_in_window = 0
+        if self._dials_in_window >= MAX_DIALS_PER_INTERVAL:
+            return False
+        self._dials_in_window += 1
+        return True
 
     def _invalidate(self) -> None:
         """Drop a failed connection so the next publish re-establishes it.
@@ -607,10 +673,15 @@ class AMQPSink:
         """
         if self._reconnect is None:
             return
-        if self._connection_published:
-            # A productive connection was lost. That is what re-dialling is for,
-            # and the allowance renews here rather than once per sink, so a flaky
-            # link that keeps working between drops recovers instantly every time.
+        if self._connection_publishes:
+            # A connection that had been publishing was lost. That is what
+            # re-dialling is for, and the allowance renews here rather than once
+            # per sink, so a flaky link that keeps working between drops recovers
+            # instantly every time.
+            #
+            # One publish is taken as evidence even though, without confirms, it is
+            # not conclusive — see `MAX_DIALS_PER_INTERVAL` for why that is the
+            # right trade and what covers the case where this is wrong.
             self._consecutive_unproductive = 0
         else:
             self._consecutive_unproductive += 1
@@ -620,10 +691,10 @@ class AMQPSink:
         self._release()
         self._channel = None
         self._connection = None
-        # The single reset point for this flag (see `_live_channel`): a connection
-        # discarded here is the only way a new one comes to be dialled, so clearing
-        # it now is what makes every fresh connection start unproven.
-        self._connection_published = False
+        # The single reset point for this counter (see `_live_channel`): a
+        # connection discarded here is the only way a new one comes to be dialled,
+        # so clearing it now is what makes every fresh connection start unproven.
+        self._connection_publishes = 0
 
     def _release(self) -> None:
         """Close an owned connection, swallowing whatever it says about it."""

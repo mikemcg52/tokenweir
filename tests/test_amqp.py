@@ -38,6 +38,7 @@ from tokenweir.amqp import (
     CONTENT_TYPE,
     DEFAULT_EXCHANGE,
     DEFAULT_ROUTING_KEY,
+    MAX_DIALS_PER_INTERVAL,
     PERSISTENT_DELIVERY_MODE,
     AMQPSink,
     message_for,
@@ -1104,14 +1105,21 @@ def test_the_immediate_recovery_allowance_renews_per_productive_connection(fake_
     """Granting it once per sink would degrade a flaky-but-working link into a
     rate-limited one after its first drop."""
     now = [1000.0]
+    interval = 60.0
     sink = AMQPSink.from_url(
-        "amqp://guest:guest@rabbit/", reconnect_interval=3600.0, clock=lambda: now[0]
+        "amqp://guest:guest@rabbit/", reconnect_interval=interval, clock=lambda: now[0]
     )
     for cycle in range(4):
         sink.emit(_record(cycle * 10))  # publishes: this connection is productive
         fake_pika.connections[-1].channel().fail_with = RuntimeError("connection reset")
         sink.emit(_record(cycle * 10 + 1))  # fails, invalidates
-        # No clock movement: recovery must be immediate every cycle.
+        # The clock does **not** move across that failure and the recovery below,
+        # which is what proves the recovery is immediate. It moves *between*
+        # cycles, past the interval, so the four recoveries fall in four separate
+        # dial windows — otherwise this would be asserting that a sink may dial
+        # four times with zero elapsed time, which `MAX_DIALS_PER_INTERVAL` refuses
+        # on purpose and no real workload asks for.
+        now[0] += interval + 1.0
     sink.emit(_record(99))
 
     assert sink.published == 5, f"only {sink.published} published across 4 blips"
@@ -1326,7 +1334,7 @@ def test_a_publish_backoff_does_not_blame_a_failed_connection_attempt(fake_pika,
     backoff = [m for m in messages if "reconnect interval" in m]
     assert backoff, messages
     assert not any("failed connection attempt" in m for m in backoff), backoff
-    assert any("could not publish" in m for m in backoff), backoff
+    assert any("failed to publish" in m for m in backoff), backoff
     assert any("exchange and routing key" in m for m in backoff), backoff
 
 
@@ -1359,4 +1367,174 @@ def test_a_dial_backoff_still_says_the_connection_attempt_failed(fake_pika, capl
     ]
     assert backoff
     assert any("failed connection attempt" in m for m in backoff), backoff
-    assert not any("could not publish" in m for m in backoff), backoff
+    assert not any("failed to publish" in m for m in backoff), backoff
+
+
+# --- The bound must hold under the real driver's error semantics -------------
+#
+# Everything above drives publish failures through a channel that raises on the
+# *first* call. Real pika will not do that for a missing exchange, and reviewing
+# this story is what surfaced it. `BlockingChannel.basic_publish` calls
+# `_flush_output()` with no waiters unless publisher confirms are enabled — which
+# `from_url` does not enable — so it returns as soon as the socket write is
+# flushed. The broker's 404 `channel.close` arrives a round trip later and surfaces
+# on a *subsequent* publish.
+#
+# So every fresh channel grants one phantom success. A reconnect policy that reads
+# that as "this connection works" is handed a clean slate every cycle and never
+# backs off at all — which is the original defect, wearing the fix as a disguise.
+
+
+class _DriverShapedChannel:
+    """First publish returns; every later one raises, as pika does for a 404."""
+
+    def __init__(self, published):
+        self._published = published
+        self._calls = 0
+
+    def basic_publish(self, exchange, routing_key, body, properties=None):
+        self._calls += 1
+        if self._calls == 1:
+            # The write reaches the socket and the call returns. The broker has
+            # not answered yet, and pika is not waiting for it to.
+            self._published.append(body)
+            return
+        raise RuntimeError("ChannelClosedByBroker: (404) NO_ROUTE - no exchange")
+
+    def close(self):
+        return None
+
+
+def _driver_shaped_publisher(fake_pika, dials, published):
+    class Conn:
+        def __init__(self, parameters):
+            dials.append(parameters)
+            self._channel = _DriverShapedChannel(published)
+
+        def channel(self):
+            return self._channel
+
+        def close(self):
+            return None
+
+    fake_pika.BlockingConnection = Conn
+
+
+def test_the_churn_bound_holds_when_the_first_publish_only_appears_to_succeed(
+    fake_pika,
+):
+    """The story's headline claim, against the driver's real error shape.
+
+    Before the dial cap this was a straight no-op: the productivity rule saw a
+    success on every fresh connection, cleared the count every cycle, and dialled
+    once per two records — the same order of churn as the unfixed code.
+    """
+    now = [1000.0]
+    dials, published = [], []
+    _driver_shaped_publisher(fake_pika, dials, published)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    dials.clear()
+
+    for n in range(50):
+        now[0] += 0.01  # half a second: one interval
+        sink.emit(_record(n))
+
+    assert len(dials) <= MAX_DIALS_PER_INTERVAL, (
+        f"{len(dials)} reconnects for 50 records — the bound does not hold when "
+        "the first publish on each connection only appears to succeed"
+    )
+    # The phantom successes are still counted as published, because that is what
+    # the driver reported. Recording it here so the number is not mistaken for a
+    # claim that the broker stored them; see TOKWEIR-6's no-confirms decision.
+    assert sink.published == len(dials) + 1
+
+
+def test_the_cap_reopens_with_each_interval(fake_pika):
+    """A cap that never reopened would turn a transient fault into a permanent
+    outage — the opposite failure, and a worse one."""
+    now = [1000.0]
+    dials, published = [], []
+    _driver_shaped_publisher(fake_pika, dials, published)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    dials.clear()
+
+    for n in range(600):
+        now[0] += 1.0  # 600 seconds == 20 intervals
+        sink.emit(_record(n))
+
+    assert len(dials) > MAX_DIALS_PER_INTERVAL, "the cap never reopened"
+    assert len(dials) <= 20 * MAX_DIALS_PER_INTERVAL
+
+
+def test_the_cap_is_disabled_by_a_zero_interval(fake_pika):
+    """`reconnect_interval=0` means "no spacing", and a cap is spacing."""
+    now = [1000.0]
+    dials, published = [], []
+    _driver_shaped_publisher(fake_pika, dials, published)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=0.0, clock=lambda: now[0]
+    )
+    dials.clear()
+    for n in range(20):
+        sink.emit(_record(n))
+    assert len(dials) > MAX_DIALS_PER_INTERVAL
+
+
+def test_hitting_the_cap_says_so(fake_pika, caplog):
+    now = [1000.0]
+    dials, published = [], []
+    _driver_shaped_publisher(fake_pika, dials, published)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/",
+        reconnect_interval=30.0,
+        warn_interval=0.0,
+        clock=lambda: now[0],
+    )
+    with caplog.at_level(logging.WARNING, logger="tokenweir.amqp"):
+        for n in range(40):
+            now[0] += 0.01
+            sink.emit(_record(n))
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("cap of" in m and "reconnects per interval" in m for m in messages), (
+        "the sink stopped dialling without saying why"
+    )
+    assert sink.dropped > 0
+
+
+def test_the_backoff_costs_records_a_recovering_broker_would_have_taken(fake_pika):
+    """SC-005's cost, pinned rather than left implicit.
+
+    Backing off is not free: a broker that comes good *during* the window has its
+    records dropped where the old per-record dialling would have stumbled into a
+    working connection and published them. That trade is the whole point — the
+    dialling is what was harming the metered system — but it is a real cost and a
+    test should hold it still, so that changing the window is a visible decision
+    rather than a silent one.
+    """
+    now = [1000.0]
+    dials = []
+    _always_failing_publisher(fake_pika, dials)
+    sink = AMQPSink.from_url(
+        "amqp://guest:guest@rabbit/", reconnect_interval=30.0, clock=lambda: now[0]
+    )
+    sink.emit(_record(0))
+    sink.emit(_record(1))  # burns the free re-dial; the interval arms
+
+    # The broker comes good immediately, but the sink has stopped looking.
+    fake_pika.BlockingConnection = fake_pika.WorkingConnection
+    for n in range(2, 12):
+        now[0] += 1.0  # ten records, all inside the 30s window
+        sink.emit(_record(n))
+
+    assert sink.published == 0, "the window is not actually holding anything back"
+    assert sink.dropped == 12
+
+    # And it is a *window*, not a cliff: once it elapses, metering resumes.
+    now[0] += 30.0
+    sink.emit(_record(99))
+    assert sink.published == 1

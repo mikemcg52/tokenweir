@@ -431,8 +431,24 @@ re-dialling plausibly help?**
 That last row is the one to know about if you are debugging a silent metering
 outage: a routing key or exchange that does not exist means every publish fails,
 every record is dropped and counted, and the sink deliberately stops re-dialling
-rather than opening a connection per metered call. The `WARNING` says which of the
-three cases you are in.
+rather than opening a connection per metered call. The two *waiting* cases log
+distinct `WARNING`s naming which one you are in; an immediate recovery logs the
+ordinary publish failure and nothing more, because there is nothing to wait for.
+
+Underneath all of it there is a hard cap of `tokenweir.amqp.MAX_DIALS_PER_INTERVAL`
+dials per interval, which applies no matter what the rules above conclude. It is
+there because those rules infer *why* a publish failed from whether the connection
+had published before, and that inference is not always available: `pika` does not
+wait for the broker on publish unless confirms are enabled, so the first publish to
+a missing exchange returns normally and the rejection surfaces on the next one. The
+cap is what makes the bound a guarantee rather than a good guess. It is a module
+constant rather than a constructor argument on purpose — a backstop a caller can
+raise is not a backstop.
+
+Backing off has a cost worth knowing: a broker that recovers *during* a window has
+those records dropped, where dialling per record would have stumbled into a working
+connection. That is the trade — the dialling is the thing that was hurting the
+metered service — and the window bounds it.
 
 The allowance renews per *working* connection, so a flaky link that keeps
 publishing between drops recovers instantly every time rather than degrading into a

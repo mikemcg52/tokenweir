@@ -175,6 +175,26 @@ tests; this story must not quietly change what they assert.
 - **FR-001**: When **two or more consecutive connections** are discarded without either having
   published a record, the reconnect interval MUST be armed, so subsequent records do not each
   trigger a dial.
+- **FR-001a**: Dials MUST be capped per interval **unconditionally**, whatever FR-001's and
+  FR-002's reasoning about productivity concludes.
+
+  > **Added in fix round 2, and it is now the clause that carries the story.** FR-001 and FR-002
+  > infer *why* a connection failed from whether it had published. Review 2 established from pika's
+  > source that the inference is unsound for the very case the ticket names: without publisher
+  > confirms, `BlockingChannel.basic_publish` calls `_flush_output()` with no waiters and returns on
+  > the socket write, so a publish to a **nonexistent exchange returns normally** and the broker's
+  > 404 surfaces a publish later. Every fresh connection therefore hands the rule one phantom
+  > success, it concludes "this one works" every cycle, and the churn is *unchanged* — 24 reconnects
+  > for 50 records, identical to the unfixed code.
+  >
+  > Requiring two publishes before trusting a connection was tried and rejected: it breaks a
+  > TOKWEIR-6 guarantee that a connection which published once and then dropped recovers
+  > immediately. That is a legitimate property and not one this story may take away, and the
+  > existing test failing is what said so.
+  >
+  > So the productivity rule stays — it gets the synchronous case right and keeps recovery instant —
+  > and the bound is made **structural** instead of inferential. A heuristic about a driver's error
+  > semantics, in a project that cannot run a broker, is the wrong thing to hang a guarantee on.
 - **FR-002**: A publish failure on a connection that **has** successfully published at least one
   record MUST NOT arm the interval — the next record re-dials immediately.
 - **FR-002a**: The **first** unproductive connection in a run MUST also get an immediate re-dial.
@@ -213,8 +233,12 @@ tests; this story must not quietly change what they assert.
 - **FR-008**: The resolution of the ambiguity MUST be written into TOKWEIR-6's FR-024, which is the
   clause that was silent on it, so the two specs do not disagree — the same in-place amendment
   treatment FR-020 and FR-024 already carry there.
-- **FR-009**: No public API change. `reconnect_interval`, `clock`, the counters and the log messages
-  keep their meanings; a caller upgrading sees only less churn.
+- **FR-009**: No public API change: `reconnect_interval`, `clock` and the counters keep their
+  signatures and meanings. Two things a caller *can* observe, both stated rather than discovered:
+  the **log text changed** (one backoff message became two, and the surviving one now says "after a
+  failed **connection** attempt"), so an alert grepping the old string needs updating; and
+  `MAX_DIALS_PER_INTERVAL` is a new module-level constant, not a constructor argument, because a cap
+  that a caller can raise is not a backstop.
 
 ### Key Entities
 
@@ -232,16 +256,22 @@ tests; this story must not quietly change what they assert.
 - **SC-003**: The immediate-retry allowance renews per productive connection.
 - **SC-004**: Every TOKWEIR-6 AMQP test passes unchanged — no assertion is edited to accommodate
   this fix.
-- **SC-005**: Drop **counts** are identical before and after for every failure mode — no record
-  that used to be dropped is now kept, and none that used to be kept is now dropped.
+- **SC-005**: The change **costs availability, boundedly, and that cost is stated**: once the
+  interval or the dial cap is armed, records offered during the window are dropped that the previous
+  code would have published on an opportunistically-successful re-dial. The bound is the window;
+  the benefit is that the dialling stops. No record is dropped for any *other* reason than before.
 
-  > **Amended in fix round 1.** This first read *"Drop counts **and warning behaviour** are
-  > identical before and after"*, and the second half was never true — this story's own test proves
-  > it, since that test fails on the parent commit precisely *because* no backoff line existed
-  > there. Records inside the newly-armed window now log a backoff reason where they used to log a
-  > publish failure, and that change is the point rather than a side effect: it is what tells an
-  > operator the sink has stopped re-dialling on purpose. Writing "identical" was a criterion
-  > asserting the fix had no effect.
+  > **Amended twice, and the second time for the same reason as the first.** It first read *"Drop
+  > counts **and warning behaviour** are identical before and after"*. Fix round 1 removed the
+  > warning half — never true, since records inside the newly-armed window log a backoff reason
+  > where they used to log a publish failure — and left the drop-count half standing. Review 2
+  > showed that half is false too: against a broker that recovers mid-window, the old code
+  > published 10 of 12 records where the new code drops all 12.
+  >
+  > That trade is exactly what FR-001 asks for and what FR-002a's amendment weighs, so the code is
+  > right and the criterion was wrong — twice, in the same way, having been rewritten once by
+  > someone (me) who had just finished writing that "identical" was *"a criterion asserting the fix
+  > had no effect"*. Half a criterion amended is a criterion still asserting the wrong thing.
 - **SC-006**: The whole suite passes under the project's authoritative command.
 
 ## Assumptions
