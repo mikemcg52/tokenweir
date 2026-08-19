@@ -1346,7 +1346,13 @@ def test_a_publish_backoff_does_not_blame_a_failed_connection_attempt(fake_pika,
     assert backoff, messages
     assert not any("failed connection attempt" in m for m in backoff), backoff
     assert any("failed to publish" in m for m in backoff), backoff
-    assert any("exchange and routing key" in m for m in backoff), backoff
+    # The topology hint deliberately does **not** live here. Reaching this arm needs
+    # the *first* publish on two fresh channels to raise synchronously, which a
+    # missing exchange does not do — so sending an operator to check their exchange
+    # from this line would be the wrong-cause failure FR-006 forbids, arrived at by
+    # putting good advice in the wrong place.
+    assert not any("exchange and routing key" in m for m in backoff), backoff
+    assert any("points at the connection" in m for m in backoff), backoff
 
 
 def test_a_dial_backoff_still_says_the_connection_attempt_failed(fake_pika, caplog):
@@ -1477,8 +1483,12 @@ def test_the_cap_reopens_with_each_interval(fake_pika):
         now[0] += 1.0  # 600 seconds == 20 intervals
         sink.emit(_record(n))
 
-    assert len(dials) > MAX_DIALS_PER_INTERVAL, "the cap never reopened"
-    assert len(dials) <= 20 * MAX_DIALS_PER_INTERVAL
+    # Derived, not observed: 600 records at one second each is 600s, which is twenty
+    # 30-second windows, each admitting `MAX_DIALS_PER_INTERVAL` dials.
+    assert len(dials) == 20 * MAX_DIALS_PER_INTERVAL, (
+        f"{len(dials)} dials across 20 intervals; the cap is not reopening at the "
+        "rate it claims"
+    )
 
 
 def test_the_cap_is_disabled_by_a_zero_interval(fake_pika):
@@ -1511,9 +1521,13 @@ def test_hitting_the_cap_says_so(fake_pika, caplog):
             sink.emit(_record(n))
 
     messages = [r.getMessage() for r in caplog.records]
-    assert any("cap of" in m and "reconnects per interval" in m for m in messages), (
-        "the sink stopped dialling without saying why"
-    )
+    ceiling = [m for m in messages if "cap of" in m and "reconnects per interval" in m]
+    assert ceiling, "the sink stopped dialling without saying why"
+    # This is the line an operator sees when an exchange is missing — the
+    # productivity rule reads the phantom first publish as success, so the "could
+    # not publish" arm never fires and this is the only place the guidance can
+    # usefully live.
+    assert any("exchange and routing key" in m for m in ceiling), ceiling
     assert sink.dropped > 0
 
 

@@ -428,15 +428,27 @@ re-dialling plausibly help?**
 | The dial itself | **Spaced.** A broker that refused the connection will refuse the next one too. |
 | A publish, on a connection that never published | **One free re-dial, then spaced.** A reset before the first publish looks identical to a bad exchange, so one retry settles it: if a fresh connection also cannot publish, the fault is not the connection. |
 
-That last row is the one to know about if you are debugging a silent metering
-outage: a routing key or exchange that does not exist means every publish fails,
-every record is dropped and counted, and the sink deliberately stops re-dialling
-rather than opening a connection per metered call. The two *waiting* cases log
-distinct `WARNING`s naming which one you are in; an immediate recovery logs the
-ordinary publish failure and nothing more, because there is nothing to wait for.
+**If you are debugging a silent metering outage, start with the cap.** The obvious
+guess — that a missing exchange lands in the third row — is wrong, and wrong in a way
+worth knowing. `pika` does not wait for the broker on publish unless confirms are
+enabled, so the *first* publish to an exchange that does not exist **returns
+normally** and the 404 surfaces on the next one. That first apparent success makes
+the connection look productive, so it takes **row 1** and is re-dialled immediately;
+what stops it is the cap below, not the third row. The third row is for a channel
+that fails on its very first publish — a socket already gone, not a topology
+mistake.
+
+So the line to look for is the cap's: it names the exchange and routing key as the
+thing to check, and the underlying broker error is on the publish-failure warning
+beside it (logged with a traceback). The two *waiting* cases log distinct `WARNING`s
+naming which one you are in; an immediate recovery logs the ordinary publish failure
+and nothing more, because there is nothing to wait for.
 
 Underneath all of it there is a hard cap of `tokenweir.amqp.MAX_DIALS_PER_INTERVAL`
-dials per interval, which applies no matter what the rules above conclude. It is
+dials per interval, which applies no matter what the rules above conclude — unless
+you set `reconnect_interval=0`, which disables the spacing and the cap together and
+hands back unbounded per-record dialling. That is a supported setting, not a default
+worth reaching for. It is
 there because those rules infer *why* a publish failed from whether the connection
 had published before, and that inference is not always available: `pika` does not
 wait for the broker on publish unless confirms are enabled, so the first publish to

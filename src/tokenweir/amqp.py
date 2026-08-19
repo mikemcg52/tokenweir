@@ -156,11 +156,18 @@ _NO_CHANNEL = (
 #: which is not a trade worth making.
 MAX_DIALS_PER_INTERVAL = 3
 
+# This is the line an operator actually sees when an exchange does not exist, which
+# is not where the guidance first went. Without publisher confirms the first publish
+# on each fresh channel returns, so such a connection is recorded as productive, is
+# granted an immediate re-dial, and is stopped by the cap — never by the
+# "two connections could not publish" arm below, which needs a *synchronous* first
+# failure and therefore points at the connection instead.
 _DIAL_CEILING_REACHED = (
     "tokenweir: usage record not published — the AMQP sink has hit its cap of "
-    f"{MAX_DIALS_PER_INTERVAL} reconnects per interval and is waiting; the "
-    "connection is being lost and re-made faster than this sink will keep chasing "
-    "it. No metering for these calls"
+    f"{MAX_DIALS_PER_INTERVAL} reconnects per interval and is waiting; records are "
+    "not reaching the broker and the connection keeps being replaced. Check that "
+    "the exchange and routing key exist and are permitted; the underlying error is "
+    "on the publish-failure warning. No metering for these calls"
 )
 # Three distinct reasons the sink is not publishing, and they must not share a
 # message. This module has already litigated the point once (`_NO_CHANNEL` used to
@@ -177,11 +184,20 @@ _AWAITING_REDIAL = (
 # apart are still consecutive as far as this counter is concerned. That matches
 # FR-001 as written and costs at most one interval of guidance pointed slightly the
 # wrong way; what it must not do is state a number it has not checked.
+#
+# It points at the connection rather than the topology, and that is not a hedge.
+# Reaching this arm requires the *first* publish on two fresh channels to raise
+# synchronously — which a missing exchange does not do (see
+# `MAX_DIALS_PER_INTERVAL`), because the broker's 404 arrives a round trip later.
+# What does raise on a first publish is a channel that is already gone: a socket
+# reset, a connection torn down between the dial and the publish. So the topology
+# hint lives on `_DIAL_CEILING_REACHED`, which is the line that actually fires when
+# an exchange is missing.
 _AWAITING_PUBLISHABLE = (
     "tokenweir: usage record not published — waiting out the reconnect interval "
-    "after two or more connections in a row failed to publish anything; if this "
-    "persists, check that the exchange and routing key exist and are permitted. No "
-    "metering for these calls"
+    "after two or more connections in a row failed to publish anything on their "
+    "first attempt, which points at the connection or the channel rather than at "
+    "what was being published. No metering for these calls"
 )
 
 
@@ -314,7 +330,11 @@ class AMQPSink:
     channel passed in stays the caller's and :meth:`close` leaves it open; one
     opened by :meth:`from_url` is closed by :meth:`close`.
 
-    **Not thread-safe**, and deliberately not made so. An AMQP channel is not safe
+    **Not thread-safe**, and deliberately not made so. That now covers the reconnect
+    bookkeeping as well as the counters — ``_consecutive_unproductive``,
+    ``_connection_publishes`` and the dial-window fields are all read-modify-written
+    without a lock, so two threads sharing a sink would corrupt the churn bound as
+    readily as the publish counts. An AMQP channel is not safe
     to share between threads — that is pika's constraint, not one this class could
     lift, and a lock here would protect only the counters while leaving the actual
     hazard in place, which is worse than saying so. Give each thread its own sink,
@@ -635,7 +655,12 @@ class AMQPSink:
         deserves an immediate re-dial", dialling is capped per interval.
 
         A zero ``reconnect_interval`` disables it, as it disables the interval
-        itself — that setting means "no spacing", and a cap would be spacing.
+        itself — that setting means "no spacing", and a cap would be spacing. Worth
+        being blunt about the consequence, since this is the story's only
+        *structural* guarantee: ``reconnect_interval=0`` gives back the unbounded
+        per-record dialling this whole mechanism exists to prevent. It is a
+        supported setting for a caller who wants it (and the tests use it to reach
+        paths the cap would otherwise hide), not a default anyone should reach for.
         """
         if not self._reconnect_interval:
             return True

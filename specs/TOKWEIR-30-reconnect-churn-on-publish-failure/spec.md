@@ -186,7 +186,10 @@ tests; this story must not quietly change what they assert.
   fixed rather than sliding, so the rate is per interval asymptotically while a span of one
   interval's length can straddle a boundary and contain up to `2 * MAX_DIALS_PER_INTERVAL - 1` dials.
   Both are deliberate, and both must be stated wherever immediacy is promised — including
-  TOKWEIR-6's FR-024, which FR-008 covers.
+  TOKWEIR-6's FR-024, which FR-008 covers. `reconnect_interval=0` disables the cap along with the
+  spacing, per FR-007, which means the story's only structural guarantee has an off switch: that is
+  a supported setting rather than an oversight, and it must be documented as such wherever the cap
+  is described.
 
   > **Added in fix round 2, and it is now the clause that carries the story.** FR-001 and FR-002
   > infer *why* a connection failed from whether it had published. Review 2 established from pika's
@@ -225,10 +228,17 @@ tests; this story must not quietly change what they assert.
   >
   > The bound this story exists to deliver is unchanged: one dial per interval instead of one per
   > record, plus a single one-off retry at the start.
-- **FR-003**: The state MUST be per connection — "has this connection published" reset on each new
-  connection, and the consecutive-unproductive count reset by any successful publish — so the
-  immediate-retry allowance is renewed for each productive connection rather than granted once per
-  sink.
+- **FR-003**: The state MUST be per connection: the publish count reset on each new connection, and
+  the consecutive-unproductive count reset when a connection that *had* published is discarded — so
+  the immediate-retry allowance is renewed for each productive connection rather than granted once
+  per sink.
+
+  > **Reworded in fix round 5.** This said the count is "reset by any successful publish". It is
+  > reset at invalidation of a productive connection instead — behaviourally the same, since
+  > `_invalidate` is the only writer of `self._channel = None` and so the only route to a new dial,
+  > but it sends a reader chasing the reset to the wrong function. `plan.md` recorded the move; this
+  > clause did not, which is the fourth instance in this spec of code moving and a statement about
+  > it staying put.
 - **FR-004**: Behaviour when the **dial itself** fails MUST be unchanged: the interval is armed, one
   attempt per interval, with the existing redacted warning.
 - **FR-005**: Behaviour for a sink with no reconnect capability (a borrowed channel) MUST be
