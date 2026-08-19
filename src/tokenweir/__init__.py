@@ -6,11 +6,16 @@ stable seams the gateway's usage pipeline is being pulled into:
 - ``contract``  — the versioned, serializable usage-record contract
 - ``sink``      — the emit-side interface (fire-and-forget, off the critical path),
   plus the guarded seam (``emit_usage`` and its halves) that keeps record
-  construction off a metered request's critical path too
+  construction off a metered request's critical path too, the optional
+  ``BatchSink`` capability, and ``DirectSink`` — the broker-less path
+- ``emitter``   — ``BufferedEmitter``, the client that actually *discharges* the
+  fire-and-forget contract: buffers, returns immediately, swallows failures
 - ``source``    — the write-side interface (persists records to a store)
 
-Transport adapters (e.g. AMQP) live behind optional extras (``tokenweir[amqp]``)
-so the core carries no wire dependencies.
+Transport adapters live behind optional extras and are reached by their own import
+path, never from this namespace, so ``import tokenweir`` carries no wire
+dependency: ``tokenweir.amqp`` (``tokenweir[amqp]``) is the homelab's broker path,
+and ``DirectSink`` over a ``Source`` is the broker-less one.
 """
 
 import logging
@@ -23,7 +28,10 @@ from tokenweir.contract import (
     UsageRecord,
     usage_record_json_schema,
 )
+from tokenweir.emitter import BufferedEmitter, EmitterStats
 from tokenweir.sink import (
+    BatchSink,
+    DirectSink,
     NullSink,
     Sink,
     build_record,
@@ -54,7 +62,11 @@ __all__ = [
     "PricingMode",
     "usage_record_json_schema",
     "Sink",
+    "BatchSink",
     "NullSink",
+    "DirectSink",
+    "BufferedEmitter",
+    "EmitterStats",
     "build_record",
     "emit_record",
     "emit_usage",
