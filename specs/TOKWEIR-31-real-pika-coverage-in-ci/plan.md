@@ -56,7 +56,7 @@ would split one concept across two files.
 
 The *tests* get their own file rather than joining `test_amqp.py`. What they assert is a property
 of the suite and the repository — the same category as `test_repo_hygiene.py`, and deliberately not
-scoped to AMQP, since the record covers four drivers.
+scoped to AMQP, since the record covers five entries.
 
 ## Key design decisions
 
@@ -72,14 +72,27 @@ scoped to AMQP, since the record covers four drivers.
    FR-047 requires the note regardless of the run's shape, and a driver's importability is a fact
    about the environment that holds whether or not a single test ran.
 
-   `except Exception` on the probe, not `except ImportError` — FR-046 says the note must not raise
-   even for a package that is installed but explodes on import, and such a package is exactly as
-   unable to prove FR-022 as a missing one.
+   `except (Exception, SystemExit)` on the probe, not `except ImportError` — FR-046 says the note
+   must not raise even for a package that is installed but explodes on import, and such a package is
+   exactly as unable to prove FR-022 as a missing one. `SystemExit` is in there because a module
+   that calls `sys.exit()` at import time is real and does not inherit from `Exception`;
+   `KeyboardInterrupt` is deliberately left out, so Ctrl-C still stops a run.
 
 3. **`pytest_terminal_summary`, not a print at collection time.** It runs once, after the results,
    for every invocation including a failed or interrupted one, and it writes through the terminal
-   reporter so it respects `-q` and capture. It cannot influence exit status, which is what makes
-   FR-046 true by construction rather than by care.
+   reporter so it respects `-q` and capture, and it cannot fail or error a test.
+
+   **It does not make FR-046 true by construction, and this paragraph used to claim it did.** The
+   hook cannot *report* a failure, but it can still *raise* one: reviews 2 and 3 both found a way
+   out, first an unguarded `Exception` from a predicate (an `INTERNALERROR` and a non-zero exit) and
+   then a `SystemExit` that took the run's exit code with it. Containment is a `try/except` in the
+   hook and a test per escape route — care, not construction. Recorded plainly because the earlier
+   claim is exactly the kind of thing that stops anyone looking.
+
+   **The note fires only when `tests/` is collected**, since that is where the conftest lives — so
+   `pytest src/` prints nothing and exits 5. That is a run of no tests rather than a run that proved
+   something, so there is nothing to disclose about it; noted because the interaction is otherwise
+   invisible, and because 5 is in this project's `pass_exit_codes`.
 
 4. **The consistency check is bidirectional, and that is the load-bearing test.** Finding the
    `importorskip` calls across `tests/` and requiring the set to equal the record's gated entries
@@ -155,5 +168,5 @@ present-driver half, and its absence is what let this gap exist in the first pla
 ## Complexity Tracking
 
 No constitutional deviations. The one judgement worth flagging for review is the widening from
-`pika` alone to the four-driver family, argued in the spec's Context: it is one table rather than a
+`pika` alone to the five-entry driver family, argued in the spec's Context: it is one table rather than a
 second mechanism, and a `pika`-only version would be a half-truth about what a bare install omits.

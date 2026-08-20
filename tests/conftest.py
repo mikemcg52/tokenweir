@@ -240,6 +240,17 @@ def _driver_is_importable(module_name: str) -> bool:
         return False
     return True
 
+    # One known quirk, deliberately not "fixed" (review 3, Low-1). A same-named
+    # *directory* on `sys.path` is an implicit namespace package and imports
+    # cleanly, so running `python -m pytest` from the repository root — where a
+    # gitignored `build/` may sit — makes the `build` entry look satisfied. That
+    # is not a divergence to correct: `pytest.importorskip` imports too and is
+    # fooled identically, so the note goes on agreeing with the gate it reports
+    # on, and the test then fails loudly rather than passing vacuously. Making
+    # the probe stricter than the gate would produce the worse failure — a note
+    # claiming a forfeit for a check that actually ran. The authoritative command
+    # invokes `.venv/bin/pytest`, which does not put the cwd on `sys.path`.
+
 
 def _postgres_suite_can_run() -> bool:
     """Exactly the condition `postgres_dsn` and `psycopg_module` impose above.
@@ -390,8 +401,16 @@ def pytest_terminal_summary(terminalreporter) -> None:
 
     A report about the environment must never be the reason a run fails. If this
     cannot render, it says so in one line and gets out of the way — the run's
-    verdict is not the disclosure's to change. `KeyboardInterrupt` still
-    propagates, being no `Exception`, for the reason FR-046 records.
+    verdict is not the disclosure's to change.
+
+    `SystemExit` is caught alongside `Exception` for the same reason the probe
+    catches it, and review 3 found it missing here after review 2 added it there:
+    a predicate raising `SystemExit(3)` skipped the summary entirely and set the
+    run's exit status to 3, on a run whose tests had all passed. Guarding the
+    probe and not the report left the hole one level out.
+
+    `KeyboardInterrupt` still propagates, being neither, for the reason FR-046
+    records: finishing a report is not worth ignoring Ctrl-C.
     """
     try:
         lines = disclosure_lines(missing_optional_drivers())
@@ -401,7 +420,7 @@ def pytest_terminal_summary(terminalreporter) -> None:
         terminalreporter.write_sep("=", "not proven by this run", yellow=True)
         for line in lines:
             terminalreporter.write_line(line)
-    except Exception as exc:  # pragma: no cover - exercised via subprocess
+    except (Exception, SystemExit) as exc:  # pragma: no cover - exercised via subprocess
         terminalreporter.write_line(
             f"could not report what this run did not prove: {exc!r} "
             "(tests/conftest.py, OPTIONAL_DRIVERS)"

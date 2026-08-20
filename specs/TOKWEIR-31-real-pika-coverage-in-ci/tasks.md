@@ -157,3 +157,37 @@ the consistency check are all rendered from or keyed to it.
       on the branch that failed to collect. The conftest is imported normally with a load-by-path
       fallback, and the tests patch the module object rather than the string `"conftest"`.
 - [x] **T038** *(Low-5)* Refresh the stale counts recorded above.
+
+## Phase 9 (fix round 3): what review 3 found
+
+- [x] **T039** *(Med-1)* Catch `SystemExit` in the hook's guard, not just in the probe. Review 2
+      closed this at the probe and review 3 found it one level out: a predicate raising
+      `SystemExit(3)` skipped the summary entirely and set the run's exit status to 3, on a run whose
+      tests had all passed. The raising-predicate test is now parametrized over both escape routes.
+      (FR-046, FR-046a)
+- [x] **T040** *(Med-2)* Assert each README marker appears **exactly once**, not merely somewhere.
+      FR-050 has required uniqueness since round 2 and nothing enforced it — `marker in text` passes
+      on a match anywhere, which is precisely how two markers came to guard nothing in the first
+      place. Verified by adding a second occurrence: the guard now fails.
+- [x] **T041** *(Low-2)* Check the record-versus-README agreement in the other direction too. A row
+      for a driver nobody discloses could sit in the table indefinitely; the record-versus-suite
+      check has been bidirectional from the start for exactly this reason.
+- [x] **T042** *(Low-3)* Inject a synthetic record into the subprocess tests so they stop skipping on
+      a provisioned machine. The three checks FR-047 rests on were unexercised for any developer with
+      `.[dev]` installed — a property of the hook should not be provable only on an
+      under-provisioned machine. A complete-environment case was added the same way, so the silent
+      path is now covered end to end everywhere too.
+- [x] **T043** Add a check that every entry naming an `importorskip` gate is judged by that import,
+      which holds on any machine. `psycopg` is exempted by name, since being judged on more than its
+      gate is the whole point of FR-043a.
+- [x] **T044** *(Low-4)* Correct plan.md in four places: the driver count (four → five), the probe's
+      `except` clause, and above all the claim that FR-046 held "by construction rather than by
+      care". Two reviews found ways out of it; it holds by a guard and a test per escape route.
+- [x] **T045** *(Low-5)* Record that the note fires only when `tests/` is collected, so `pytest src/`
+      prints nothing and exits 5 — a pass code for this project.
+- [x] **T046** *(Low-1)* Note that a same-named directory on `sys.path` (the gitignored `build/`)
+      satisfies the probe, and why that is left alone: `importorskip` is fooled identically, so the
+      note goes on agreeing with the gate it reports on. A stricter probe would claim a forfeit for a
+      check that actually ran, which is the worse failure.
+- [x] **T047** *(Low-6)* No action: a dynamically-named gate is invisible to the scan, already
+      accepted and recorded in plan.md.

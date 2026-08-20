@@ -326,6 +326,31 @@ def test_the_postgres_entry_does_not_claim_the_driver_is_missing():
     assert "not installed" not in OPTIONAL_DRIVERS["psycopg"].label
 
 
+@pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
+def test_each_entry_agrees_with_the_gate_it_names(name):
+    """The real record, not a stub, and on any machine.
+
+    Every other check of the shipped entries either stubs the predicate or
+    depends on what this environment happens to have. This one holds everywhere:
+    an entry that names an `importorskip` gate must be judged by that import, so
+    the note cannot drift from the tests it reports on.
+
+    `psycopg` is the deliberate exception and the reason `available` exists at
+    all — the real-store suite needs a server as well as a driver, so its entry is
+    judged by more than its gate. Exempted by name rather than by a rule, so
+    adding a second exception has to be a decision someone makes here.
+    """
+    driver = OPTIONAL_DRIVERS[name]
+    if name == "psycopg":
+        pytest.skip("judged on driver-and-server by design; see FR-043a")
+
+    assert driver.gate is not None
+    assert driver.available() == _driver_is_importable(driver.gate), (
+        f"{name}'s entry disagrees with the import its tests are gated on, so the note would "
+        "report a forfeit the suite did not make, or miss one it did."
+    )
+
+
 # --- The record against the suite, in both directions -------------------------
 #
 # The check that keeps the note honest as the suite grows. It found `jsonschema`
@@ -550,18 +575,60 @@ _spec = importlib.util.spec_from_file_location("_tokenweir_conftest", {path!r})
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 
+{record}
+
 pytest_terminal_summary = _module.pytest_terminal_summary
 '''
 
-
-def _write_conftest(directory: Path) -> None:
-    (directory / "conftest.py").write_text(
-        _CONFTEST_TEMPLATE.format(path=str(TESTS_DIR / "conftest.py")), encoding="utf-8"
+#: A record with one entry no environment can satisfy, injected into the
+#: temporary conftest so these tests prove the hook on **every** machine.
+#:
+#: They used to read the real record and skip when it was complete, which meant
+#: the three checks that FR-047 rests on — that the note reaches a passing run, a
+#: failing run, and a run with nothing selected — were silently unexercised for
+#: any developer with `.[dev]` installed (review 3, Low-3). A property of the hook
+#: should not be provable only on an under-provisioned machine.
+_ABSENT_RECORD = '''
+_module.OPTIONAL_DRIVERS = {
+    "definitely_absent_alpha": _module.OptionalDriver(
+        label="definitely_absent_alpha is not installed",
+        claim="a claim no environment can prove, so the note always has something to say",
+        gate=None,
+        available=lambda: False,
     )
+}
+'''
+
+#: Predicates that fail rather than answer. `ValueError` for the ordinary case;
+#: `SystemExit` because it is not an `Exception` and escaped the hook's guard
+#: until review 3 (Med-1) — it skipped the summary and set the run's exit status
+#: to its own code, on a run whose tests had all passed.
+_RAISING_RECORD = '''
+def _explode():
+    raise {exception}
 
 
-def _run_pytest_in(directory: Path, *extra: str) -> subprocess.CompletedProcess:
-    _write_conftest(directory)
+_module.OPTIONAL_DRIVERS = {{
+    "broken": _module.OptionalDriver(
+        label="broken is not installed",
+        claim="a claim whose availability predicate raises instead of answering",
+        gate=None,
+        available=_explode,
+    )
+}}
+'''
+
+#: The label of the entry `_ABSENT_RECORD` injects; what these runs look for.
+ABSENT_LABEL = "definitely_absent_alpha is not installed"
+
+
+def _run_pytest_in(
+    directory: Path, *extra: str, record: str = _ABSENT_RECORD
+) -> subprocess.CompletedProcess:
+    (directory / "conftest.py").write_text(
+        _CONFTEST_TEMPLATE.format(path=str(TESTS_DIR / "conftest.py"), record=record),
+        encoding="utf-8",
+    )
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-q", *extra, str(directory)],
         capture_output=True,
@@ -571,22 +638,14 @@ def _run_pytest_in(directory: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
-def _absent_entry() -> str:
-    missing = missing_optional_drivers()
-    if not missing:
-        pytest.skip("this environment can satisfy every entry; there is no note to observe")
-    return OPTIONAL_DRIVERS[missing[0]].label
-
-
 def test_the_note_reaches_the_output_of_a_passing_run(tmp_path):
-    label = _absent_entry()
     (tmp_path / "test_passes.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
     result = _run_pytest_in(tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Whatever this run reported" in result.stdout, result.stdout
-    assert label in result.stdout, result.stdout
+    assert ABSENT_LABEL in result.stdout, result.stdout
 
 
 def test_a_red_run_still_says_what_it_did_not_prove(tmp_path):
@@ -594,7 +653,6 @@ def test_a_red_run_still_says_what_it_did_not_prove(tmp_path):
     exactly when the output mattered most would be worse than none. This also
     pins the half of FR-046 that matters: the note rides along with an exit
     status it did not cause."""
-    label = _absent_entry()
     (tmp_path / "test_fails.py").write_text(
         "def test_not_ok():\n    assert False\n", encoding="utf-8"
     )
@@ -603,21 +661,53 @@ def test_a_red_run_still_says_what_it_did_not_prove(tmp_path):
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert "Whatever this run reported" in result.stdout, result.stdout
-    assert label in result.stdout, result.stdout
+    assert ABSENT_LABEL in result.stdout, result.stdout
 
 
 def test_the_note_does_not_depend_on_any_test_having_run(tmp_path):
     """Absence is a fact about the environment, decided by asking the record
     rather than by watching which tests skipped. A skip census would report
     nothing here — and nothing under `-k`, `-x` or a collection error either."""
-    _absent_entry()
     (tmp_path / "test_none_selected.py").write_text(
         "def test_ok():\n    assert True\n", encoding="utf-8"
     )
 
     result = _run_pytest_in(tmp_path, "-k", "matches_nothing_at_all")
 
-    assert "Whatever this run reported" in result.stdout, result.stdout
+    assert ABSENT_LABEL in result.stdout, result.stdout
+
+
+def test_a_complete_environment_gets_no_note_in_a_real_run(tmp_path):
+    """The silent case end to end, and on any machine — the counterpart to the
+    three above. An empty record stands in for an environment that can satisfy
+    every entry, which is otherwise only observable with the full dev extra
+    installed."""
+    (tmp_path / "test_passes.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    result = _run_pytest_in(tmp_path, record="_module.OPTIONAL_DRIVERS = {}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not proven by this run" not in result.stdout, result.stdout
+    assert "Whatever this run reported" not in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("exception", ["ValueError('the predicate is broken')", "SystemExit(3)"])
+def test_a_predicate_that_raises_does_not_take_the_run_down(tmp_path, exception):
+    """Only the import probe was guarded at first, so any *other* predicate that
+    raised escaped into pytest — `ValueError` as an INTERNALERROR with a non-zero
+    exit, and `SystemExit` more quietly still, skipping the summary and handing
+    the run its own exit code. Both on runs whose tests had all passed. The
+    `psycopg` entry is already a non-import predicate, so this was never far from
+    live."""
+    (tmp_path / "test_passes.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    result = _run_pytest_in(tmp_path, record=_RAISING_RECORD.format(exception=exception))
+
+    assert result.returncode == 0, (
+        "a broken disclosure predicate changed the run's verdict:\n" + result.stdout + result.stderr
+    )
+    assert "INTERNALERROR" not in result.stdout + result.stderr
+    assert "could not report what this run did not prove" in result.stdout, result.stdout
 
 
 # --- The README carries the decision ------------------------------------------
@@ -653,9 +743,25 @@ def _readme_text() -> str:
 
 @pytest.mark.parametrize("marker", README_MARKERS)
 def test_the_readme_records_the_decision(marker):
-    assert marker in _readme_text(), (
+    """Exactly once, not merely somewhere.
+
+    FR-050 requires each marker to be unique to the section it guards, and until
+    fix round 3 nothing enforced it — `marker in text` is satisfied by a match
+    anywhere. That is not a hypothetical: two of these markers used to be strings
+    occurring three times in this README, which is how the sentences they were
+    named for became deletable with the suite green. Prose added elsewhere could
+    silently re-disarm any of them the same way.
+    """
+    occurrences = _readme_text().count(marker)
+
+    assert occurrences, (
         f"README.md no longer records {marker!r} — the choice to accept this coverage gap has to "
         "stay written down, or it reverts to looking like an oversight."
+    )
+    assert occurrences == 1, (
+        f"{marker!r} now appears {occurrences} times in README.md, so it no longer pins the "
+        "sentence it was chosen for: the guarded text could be deleted and this test would still "
+        "pass on the other occurrence. Pick a substring unique to the section."
     )
 
 
@@ -685,6 +791,29 @@ def test_the_readme_lists_every_disclosed_driver(name):
     assert f"`{name}`" in _develop_section(), (
         f"README.md's 'Develop' section does not mention {name}, which tests/conftest.py "
         "discloses. The table and the run's own note have to agree."
+    )
+
+
+def test_the_readme_table_lists_nothing_the_record_does_not():
+    """The other direction, which was missing until fix round 3.
+
+    The record-versus-suite check is bidirectional precisely because a one-way
+    check lets a list rot into historical claims; the record-versus-README check
+    was one-way, so a row for a driver nobody discloses any more could sit in the
+    table indefinitely telling readers about a forfeit that no longer exists.
+    """
+    rows = [
+        line
+        for line in _develop_section().splitlines()
+        if line.startswith("|") and not set(line) <= set("| -:")
+    ]
+    # The header row is not a driver.
+    driver_rows = [row for row in rows if "What goes unchecked" not in row]
+
+    assert len(driver_rows) == len(OPTIONAL_DRIVERS), (
+        f"README.md's table has {len(driver_rows)} driver rows but tests/conftest.py discloses "
+        f"{len(OPTIONAL_DRIVERS)}. The table and the run's own note have to agree in both "
+        "directions, or one of them is describing a suite that no longer exists."
     )
 
 
@@ -749,65 +878,6 @@ def test_the_amqp_adapter_still_imports_without_pika():
     assert importlib.util.find_spec("tokenweir.amqp") is not None
 
     import tokenweir.amqp  # noqa: F401
-
-
-# --- The report can never be the reason a run fails (review 2, Med-2) ---------
-
-
-def test_a_predicate_that_raises_does_not_take_the_run_down(tmp_path):
-    """Only the import probe was guarded, so any *other* predicate that raised
-    escaped into pytest as an INTERNALERROR with a non-zero exit — on a run whose
-    tests had all passed. The `psycopg` entry is already a non-import predicate,
-    so this was one entry away from being live rather than hypothetical.
-
-    Run in a subprocess against a record whose predicate raises, because what is
-    being asserted is the exit status of a real pytest invocation.
-    """
-    (tmp_path / "test_passes.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    (tmp_path / "conftest.py").write_text(
-        textwrap.dedent(
-            f'''
-            import importlib.util
-
-            _spec = importlib.util.spec_from_file_location(
-                "_tokenweir_conftest", {str(TESTS_DIR / "conftest.py")!r}
-            )
-            _module = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_module)
-
-
-            def _explode():
-                raise ValueError("the predicate is broken")
-
-
-            _module.OPTIONAL_DRIVERS = {{
-                "broken": _module.OptionalDriver(
-                    label="broken is not installed",
-                    claim="a claim whose availability predicate raises",
-                    gate=None,
-                    available=_explode,
-                )
-            }}
-
-            pytest_terminal_summary = _module.pytest_terminal_summary
-            '''
-        ),
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", str(tmp_path)],
-        capture_output=True,
-        text=True,
-        cwd=str(tmp_path),
-        timeout=120,
-    )
-
-    assert result.returncode == 0, (
-        "a broken disclosure predicate changed the run's verdict:\n" + result.stdout + result.stderr
-    )
-    assert "INTERNALERROR" not in result.stdout + result.stderr
-    assert "could not report what this run did not prove" in result.stdout, result.stdout
 
 
 # --- Documentation checks skip rather than fail (FR-054, review 2 Med-3) ------
