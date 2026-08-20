@@ -452,7 +452,15 @@ def pytest_terminal_summary(terminalreporter) -> None:
         for line in lines:
             terminalreporter.write_line(line)
     except (Exception, SystemExit) as exc:  # pragma: no cover - exercised via subprocess
-        terminalreporter.write_line(
-            f"could not report what this run did not prove: {exc!r} "
-            "(tests/conftest.py, OPTIONAL_DRIVERS)"
-        )
+        try:
+            terminalreporter.write_line(
+                f"could not report what this run did not prove: {exc!r} "
+                "(tests/conftest.py, OPTIONAL_DRIVERS)"
+            )
+        except (Exception, SystemExit):
+            # The reporter itself is what failed — a closed or broken stream. There
+            # is nowhere left to say so, and FR-046a's requirement is that nothing
+            # here reaches the run's exit status, not that the note always arrives.
+            # Guarded rather than argued: "contained by construction" was the claim
+            # twice before, and was wrong both times (review 6, Low-2).
+            pass

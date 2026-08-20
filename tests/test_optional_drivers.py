@@ -81,6 +81,7 @@ _importable_driver = conftest._importable_driver
 _postgres_suite_can_run = conftest._postgres_suite_can_run
 disclosure_lines = conftest.disclosure_lines
 missing_optional_drivers = conftest.missing_optional_drivers
+DSN_ENV_VAR = conftest.DSN_ENV_VAR
 
 #: A stand-in record, so the renderer's behaviour is checked against something
 #: fixed rather than against whatever this machine happens to have installed.
@@ -171,6 +172,14 @@ def test_the_pika_entry_names_the_requirement_it_forfeits():
     assert "pika.BasicProperties" in claim
     assert "test double" in claim
 
+    # Pinned, not merely derived. The README row is held to whatever this entry's
+    # `anchors` happen to say, so anchors that named nothing in particular would
+    # disarm that guard without touching it — set every entry to `("a",)` and the
+    # forfeit column could go back to placeholder text (review 6, Med-1). For the
+    # one entry this story was filed about, the anchors are named here.
+    assert "FR-022" in OPTIONAL_DRIVERS["pika"].anchors
+    assert "pika.BasicProperties" in OPTIONAL_DRIVERS["pika"].anchors
+
 
 @pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
 def test_every_entry_states_a_consequence_not_just_a_name(name):
@@ -186,6 +195,16 @@ def test_every_entry_states_a_consequence_not_just_a_name(name):
     assert driver.anchors, (
         f"{name} declares no anchors, so nothing would hold its README row to describing this "
         "forfeit. Name the identifiers the entry is about — a requirement id, a file, a library."
+    )
+    # A floor, not a proof of meaning. It stops the cheap disarm — `("a",)` is
+    # both non-empty and trivially present in any claim — while leaving the
+    # wording itself to review, which is where the spec's Assumptions already put
+    # it: no mechanism can tell that "FR-022 goes unchecked" is the *right* thing
+    # to say about a missing module.
+    stunted = [anchor for anchor in driver.anchors if len(anchor) < 5]
+    assert not stunted, (
+        f"{name}'s anchors {stunted} are too short to identify anything, so its README row "
+        "would be held to nothing in particular. Name a requirement id, a file or a library."
     )
     absent = [anchor for anchor in driver.anchors if anchor not in driver.claim]
     assert not absent, (
@@ -378,6 +397,66 @@ def test_each_entry_agrees_with_the_gate_it_names(name):
     assert driver.available() == _driver_is_importable(driver.gate), (
         f"{name}'s entry disagrees with the import its tests are gated on, so the note would "
         "report a forfeit the suite did not make, or miss one it did."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
+def test_every_entry_actually_consults_the_imports_it_depends_on(name, monkeypatch):
+    """The check above, made to discriminate on a machine that has nothing.
+
+    `available() == _driver_is_importable(gate)` compares two values that are both
+    `False` in a bare environment, so it passes for an entry hardwired to
+    `lambda: False` and only fails where the driver is installed — which is not
+    the environment the authoritative command runs in (review 6, Med-2). An entry
+    that always claims a forfeit is FR-045's failure mode and is exactly what
+    review 1 caught the first draft doing: "pika is not installed" printed on a
+    machine with pika 1.4.4.
+
+    So the imports are stubbed both ways and the entry is required to follow them.
+    That holds everywhere, and it needs no driver to be present to mean something.
+    `psycopg` is included: with a DSN unset, all-importable satisfies its
+    driver-and-server condition through `pgserver`, and none-importable fails it
+    at the driver.
+    """
+    driver = OPTIONAL_DRIVERS[name]
+    monkeypatch.delenv(DSN_ENV_VAR, raising=False)
+
+    monkeypatch.setattr(conftest, "_driver_is_importable", lambda module: True)
+    assert driver.available() is True, (
+        f"{name}'s entry reports a forfeit even where every driver imports, so the note would "
+        "claim the suite skipped something it ran. Its `available` is not consulting the import."
+    )
+
+    monkeypatch.setattr(conftest, "_driver_is_importable", lambda module: False)
+    assert driver.available() is False, (
+        f"{name}'s entry reports no forfeit even where nothing imports, so the note would stay "
+        "silent about a claim the suite could not prove. Its `available` is not consulting the "
+        "import."
+    )
+
+
+def test_the_psycopg_entry_itself_needs_a_server_and_not_just_a_driver(monkeypatch):
+    """FR-043a's condition, checked against the record rather than the predicate.
+
+    `_postgres_suite_can_run` is tested directly above, but nothing bound the
+    shipped entry to it: `test_each_entry_agrees_with_the_gate_it_names` skips
+    `psycopg` by name, and the both-ways stub above cannot separate "driver and
+    server" from "driver" because it moves them together. So `available` could be
+    reverted to the pre-FR-043a `lambda: _driver_is_importable("psycopg")` and the
+    suite stayed green in *every* environment — bare, postgres-only and full —
+    while a machine with the driver and no server had the largest forfeit in the
+    suite silently dropped from its note (review 6, High-1).
+
+    The discriminating case is the one FR-043a was written for: the driver
+    imports, and there is no server to be had.
+    """
+    monkeypatch.delenv(DSN_ENV_VAR, raising=False)
+    monkeypatch.setattr(conftest, "_driver_is_importable", lambda module: module == "psycopg")
+
+    assert "psycopg" in missing_optional_drivers(), (
+        "the psycopg entry went quiet with the driver importable and no server reachable, so "
+        "the real-Postgres suite would skip in full while the run said nothing. FR-043a requires "
+        "this entry to be judged on driver *and* server; `available` is judging the import alone."
     )
 
 
