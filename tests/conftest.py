@@ -221,6 +221,21 @@ class OptionalDriver:
     #: Whether this environment can prove the claim. Called, never cached: an
     #: environment variable can change between collection and the summary.
     available: Callable[[], bool]
+    #: The identifiers this entry's forfeit is *about* — the requirement id, the
+    #: file, the library whose absence is the point. Every one must appear both in
+    #: `claim` above and in the entry's README row, which is what stops the two
+    #: from being gutted independently.
+    #:
+    #: Prose cannot be checked and is left to review (see `claim`), but these are
+    #: not prose. Until fix round 4 the README's "what goes unchecked" column was
+    #: guarded only by its *length*, so review 5 replaced every cell with eighty
+    #: characters of `TBD` — deleting `FR-022` from the row this story exists for —
+    #: and the suite stayed green. A length threshold measures typing, not meaning.
+    #:
+    #: Defaulted only so the suite's own stub records stay readable; every entry in
+    #: `OPTIONAL_DRIVERS` must declare some, and a test asserts exactly that — an
+    #: entry with none would opt its row out of the check entirely.
+    anchors: tuple[str, ...] = ()
 
 
 def _driver_is_importable(module_name: str) -> bool:
@@ -274,13 +289,16 @@ def _postgres_suite_can_run() -> bool:
     return bool(postgres_dsn_or_none()) or _driver_is_importable("pgserver")
 
 
-def _importable_driver(module_name: str, claim: str) -> OptionalDriver:
+def _importable_driver(
+    module_name: str, claim: str, anchors: tuple[str, ...] = ()
+) -> OptionalDriver:
     """The ordinary case: gated by `importorskip`, present iff it imports."""
     return OptionalDriver(
         label=f"{module_name} is not installed",
         claim=claim,
         gate=module_name,
         available=lambda: _driver_is_importable(module_name),
+        anchors=anchors,
     )
 
 
@@ -307,6 +325,11 @@ OPTIONAL_DRIVERS: dict[str, OptionalDriver] = {
         "pika",
         "FR-022 (persistent messages with a JSON content type) was checked only against the "
         "test double, not against a real pika.BasicProperties",
+        # Both halves of FR-043's requirement for this entry: the requirement id,
+        # and the fact that what stood in for the driver was a double. Review 5
+        # (Low-1) found the second half guarded nowhere, so it could have been
+        # deleted from the note in silence.
+        anchors=("FR-022", "pika.BasicProperties"),
     ),
     # Found by the consistency check rather than by hand, which is the whole
     # argument for having it: `test_schema.py` already carried a comment saying
@@ -316,6 +339,7 @@ OPTIONAL_DRIVERS: dict[str, OptionalDriver] = {
         "jsonschema",
         "the published schema in schema/usage-record.v1.json was not run against a JSON Schema "
         "engine — payload validity was checked only by this package's own code",
+        anchors=("schema/usage-record.v1.json", "JSON Schema"),
     ),
     # Not an `_importable_driver`: the suite needs a server as well as a driver,
     # and disclosing this on the import alone would go silent while the whole
@@ -329,16 +353,23 @@ OPTIONAL_DRIVERS: dict[str, OptionalDriver] = {
         ),
         gate="psycopg",
         available=_postgres_suite_can_run,
+        # What the forfeit *is*, not what the condition for it is. The condition
+        # ($TOKENWEIR_TEST_DSN or pgserver) lives in the README table's first
+        # column and in `label`; these anchors hold the second column, which is
+        # the one review 5 showed could be filled with placeholder text.
+        anchors=("real-Postgres suite", "writer", "migrations"),
     ),
     "pglast": _importable_driver(
         "pglast",
         "the migration SQL was not parsed by libpg_query, the server's own parser — only the "
         "checks that need no parser ran",
+        anchors=("libpg_query",),
     ),
     "build": _importable_driver(
         "build",
         "SC-001 was checked only against the packaging declaration, not by building a wheel and "
         "looking inside it for the migrations",
+        anchors=("SC-001", "wheel"),
     ),
 }
 

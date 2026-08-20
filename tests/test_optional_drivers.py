@@ -161,7 +161,15 @@ def test_the_pika_entry_names_the_requirement_it_forfeits():
     the reader to work out what that costs, which is the position they were in
     before."""
     assert "pika" in OPTIONAL_DRIVERS
-    assert "FR-022" in OPTIONAL_DRIVERS["pika"].claim
+    claim = OPTIONAL_DRIVERS["pika"].claim
+
+    assert "FR-022" in claim
+    # FR-043 asks for both halves: the requirement, *and* that what stood in for
+    # the driver was a double. Only the first was guarded until fix round 4
+    # (review 5, Low-1), so the half that explains why the run proves less could
+    # have been deleted without a test noticing.
+    assert "pika.BasicProperties" in claim
+    assert "test double" in claim
 
 
 @pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
@@ -171,6 +179,19 @@ def test_every_entry_states_a_consequence_not_just_a_name(name):
     assert len(driver.claim) > 40, f"{name}'s entry is too terse to tell anyone anything"
     assert driver.claim.strip() == driver.claim
     assert driver.label.strip() == driver.label
+
+    # The anchors are the README guard's whole basis, so an entry that declared
+    # none would silently opt its row out of being checked at all — the same
+    # escape the length threshold provided, one level up.
+    assert driver.anchors, (
+        f"{name} declares no anchors, so nothing would hold its README row to describing this "
+        "forfeit. Name the identifiers the entry is about — a requirement id, a file, a library."
+    )
+    absent = [anchor for anchor in driver.anchors if anchor not in driver.claim]
+    assert not absent, (
+        f"{name}'s anchors {absent} do not appear in its own claim, so the note and the README "
+        "row are being held to different words and only one of them can be right."
+    )
 
 
 # --- The probe ----------------------------------------------------------------
@@ -344,7 +365,16 @@ def test_each_entry_agrees_with_the_gate_it_names(name):
     if name == "psycopg":
         pytest.skip("judged on driver-and-server by design; see FR-043a")
 
-    assert driver.gate is not None
+    if driver.gate is None:
+        # Not an exemption by name — there is simply no import to agree with.
+        # This used to be `assert driver.gate is not None`, which made FR-051's
+        # escape hatch unusable: adding the `gate=None` entry the spec requires
+        # the record to be *able* to hold reddened this test, so the hatch could
+        # only be used by first editing the check that forbade it (review 5,
+        # Med-2). The bidirectional check in `_gated_in_record` is what covers
+        # these entries; there is nothing for this one to say about them.
+        pytest.skip(f"{name} is gated by something other than an import; see FR-051")
+
     assert driver.available() == _driver_is_importable(driver.gate), (
         f"{name}'s entry disagrees with the import its tests are gated on, so the note would "
         "report a forfeit the suite did not make, or miss one it did."
@@ -394,15 +424,22 @@ def _gated_modules(directory: Path = TESTS_DIR) -> set[str]:
     return found
 
 
-def _gated_in_record() -> set[str]:
+def _gated_in_record(record: dict[str, OptionalDriver] | None = None) -> set[str]:
     """The entries claiming to be gated by `importorskip`.
 
     Entries with `gate=None` are gated some other way and are deliberately out of
     scope for the comparison — without that escape hatch the record could not
     hold one, which is exactly the corner Med-2's fix would have been painted
     into.
+
+    Takes an optional record for the same reason `missing_optional_drivers` does:
+    while every shipped entry names a gate, a test that only reads the global
+    cannot demonstrate the hatch works. Review 5 (Med-2) deleted the `is not None`
+    filter below and the whole file stayed green, because nothing ever fed this a
+    record where the filter had anything to do.
     """
-    return {driver.gate for driver in OPTIONAL_DRIVERS.values() if driver.gate is not None}
+    drivers = OPTIONAL_DRIVERS if record is None else record
+    return {driver.gate for driver in drivers.values() if driver.gate is not None}
 
 
 # There is deliberately no "skip if there are no test sources" guard on the two
@@ -425,11 +462,16 @@ def test_every_gated_driver_is_disclosed():
     )
 
 
-def test_every_disclosed_driver_is_actually_gated():
+def test_every_disclosed_driver_is_actually_gated(record=None):
     """The other direction. A record that only ever grows becomes a list of
     historical claims, and the note starts reporting forfeits that no longer
-    exist."""
-    stale = _gated_in_record() - _gated_modules()
+    exist.
+
+    `record` defaults to the shipped one; the escape-hatch test below passes a
+    record of its own so the `gate=None` case is exercised by this check rather
+    than by a restatement of it.
+    """
+    stale = _gated_in_record(record) - _gated_modules()
 
     assert not stale, (
         f"{sorted(stale)} are disclosed in OPTIONAL_DRIVERS but nothing in tests/ gates on them "
@@ -468,17 +510,29 @@ def test_a_stale_disclosure_is_actually_detected(monkeypatch):
 
 
 def test_an_entry_gated_some_other_way_is_not_called_stale():
-    """The escape hatch Med-2 needed. An entry with `gate=None` is disclosed but
-    is not claimed to be an `importorskip`, so the consistency check must leave it
-    alone rather than demanding it be removed."""
+    """The escape hatch FR-051 requires, run through the check it must survive.
+
+    An entry with `gate=None` is disclosed but is not claimed to be an
+    `importorskip`, so the staleness check must leave it alone rather than
+    demanding it be removed.
+
+    This used to assert `None not in _gated_in_record()`, which was vacuous while
+    every shipped entry names a gate — review 5 (Med-2) deleted the filter that
+    makes the hatch work and this test did not notice. It now builds a record that
+    actually contains such an entry and runs the real check against it, so the
+    hatch is demonstrated rather than described.
+    """
     otherwise_gated = OptionalDriver(
         label="no network was available",
         claim="a claim gated by something other than an import",
         gate=None,
         available=lambda: False,
+        anchors=("network",),
     )
+    record = dict(OPTIONAL_DRIVERS) | {"otherwise_gated": otherwise_gated}
 
-    assert otherwise_gated.gate not in _gated_in_record()
+    # Would raise if the entry were mistaken for a stale `importorskip` claim.
+    test_every_disclosed_driver_is_actually_gated(record)
 
 
 def test_the_scanner_reads_real_importorskip_calls(tmp_path):
@@ -823,12 +877,24 @@ def test_the_readme_says_what_each_omission_forfeits(name):
     absence costs, and until fix round 2 nothing guarded it. Review 2 replaced
     every "What goes unchecked" cell in the table with "TBD" and the suite stayed
     green — the column the section exists for could be gutted in silence."""
+    driver = OPTIONAL_DRIVERS[name]
     cells = [cell.strip() for cell in _table_row_for(name).strip().strip("|").split("|")]
 
     assert len(cells) == 2, f"the {name} row is not a two-column table row: {cells}"
     assert len(cells[1]) > 60, (
         f"README.md's table says nothing substantive about what losing {name} costs: "
         f"{cells[1]!r}. FR-048 requires the forfeited coverage to be named, not just the driver."
+    )
+
+    # The part a length threshold cannot see. Review 5 (Med-1) replaced every cell
+    # in this column with eighty characters of "TBD" — `FR-022` gone from the row
+    # this story was filed about — and the file reported 74 passed. Length measures
+    # typing; these anchors measure whether the row is still about the thing.
+    missing = [anchor for anchor in driver.anchors if anchor not in cells[1]]
+    assert not missing, (
+        f"README.md's row for {name} no longer names {missing}, so the table and the run's own "
+        f"note now describe different forfeits. FR-050 requires the guard to cover what each "
+        "omission costs, not merely that the driver is mentioned."
     )
 
 
