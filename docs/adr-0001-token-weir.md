@@ -109,10 +109,29 @@ Ownership of `gateway_usage` and its forward-only migrations (001–006) moves i
 
 ## Action Items
 
-1. [ ] Create the new Token-Weir Jira/software project (admin action — needs a project key from Mike; e.g. `WEIR`/`TW`).
-2. [ ] File the extraction epic + stories in the new project (contract, emitter client, writer+migrations, transport adapters, subscription hook adapter).
+1. [x] Create the new Token-Weir Jira/software project — done, key `TOKWEIR`.
+2. [x] File the extraction epic + stories in the new project (contract, emitter client, writer+migrations, transport adapters, subscription hook adapter).
 3. [ ] Rewrite MADO-216 story 1: target the cloud-edge / `tokenweir` consumer instead of assuming the homelab gateway; add the reconciliation note and the AIGWAY-003 dependency.
 4. [ ] Refactor AI Gateway to consume `tokenweir` (move schema/migrations out; pin a version).
 5. [ ] Build the subscription capture adapter: `Stop` hook → transcript delta → `tokenweir` emitter; orchestrator injects `MADO_*` env per iteration.
 6. [ ] Verify subscription vs API-key transcript token parity (the `Unverified` check) before trusting Max numbers.
 7. [ ] Defer: %-of-limit capacity model; OSS license selection.
+
+### Landed in the library so far
+
+Recorded here because Pillar 2 is the pillar most easily claimed and least easily
+checked, and these are the commits that make it true rather than stated:
+
+- **TOKWEIR-4** — the versioned `UsageRecord` contract and its published JSON Schema.
+- **TOKWEIR-15** — the guarded seam (`build_record` / `emit_record` / `emit_usage`),
+  which keeps record *construction* off a metered request's critical path.
+- **TOKWEIR-5** — schema ownership: the migrations, `PostgresSource`, and the
+  report-time pricing view.
+- **TOKWEIR-6** — `BufferedEmitter`, the client that actually discharges the
+  fire-and-forget contract; `DirectSink`, the broker-less path this ADR names as
+  Pillar 2's consequence; and `tokenweir.amqp`, the homelab's transport, under the
+  `tokenweir[amqp]` extra with no `pika` in the core.
+
+Still outstanding on the consumer side: item 4 (the gateway consumes `tokenweir`)
+and item 5 (the subscription `Stop`-hook adapter). Both now have a client to adopt
+rather than an interface to re-implement.

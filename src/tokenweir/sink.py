@@ -50,15 +50,48 @@ package attaches a ``NullHandler`` to the ``tokenweir`` logger (see
 given a traceback per metered request on its stderr by ``logging.lastResort``.
 The return value remains the signal that always reaches the caller regardless of
 logging configuration.
+
+Batch delivery, and the broker-less path
+----------------------------------------
+
+TOKWEIR-6 adds two things here, neither of which changes :class:`Sink`.
+
+:class:`BatchSink` is an **optional** capability a sink may additionally offer:
+``emit_batch`` for the case where delivering a batch is cheaper, or more atomic,
+than delivering the records one at a time. It is a separate protocol rather than a
+method on :class:`Sink` because the majority of adapters have nothing to gain from
+it — an AMQP publish is per-message however you slice it — and growing the
+interface every adapter must satisfy in order to serve the minority that benefits
+is how a small protocol stops being one. :class:`~tokenweir.emitter.BufferedEmitter`
+prefers ``emit_batch`` when a sink has it and falls back to per-record ``emit``
+when it does not, so an existing sink keeps working untouched.
+
+:class:`DirectSink` is the **broker-less** path ADR-0001 Pillar 2 names as the
+consequence of a transport-agnostic core — *"the EKS cloud-edge can drop the
+broker entirely and write direct/in-process"*. It adapts a
+:class:`~tokenweir.source.Source` to the :class:`Sink` interface, and it is
+batch-capable precisely so that a batch stays one ``Source.write`` call: that is
+the one-transaction-per-batch guarantee :class:`~tokenweir.postgres.PostgresSource`
+documents, and delivering record-by-record would quietly throw it away in favour of
+a transaction per row.
+
+Note the asymmetry it has to absorb. ``Source.write`` *may* raise — deliberately,
+because the write side is off the critical path and a caller that can retry needs
+to know it must. ``Sink.emit`` may **not**. :class:`DirectSink` sits exactly on that
+seam, so it is the place where a store failure stops being an exception and becomes
+a counted, logged drop.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Mapping
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Iterable, Optional, Protocol, runtime_checkable
 
+from tokenweir._ratelimit import RateLimitedWarner
 from tokenweir.contract import UsageRecord
+from tokenweir.source import Source
 
 _logger = logging.getLogger(__name__)
 
@@ -76,6 +109,15 @@ _EMISSION_FAILED = (
 _NOT_A_RECORD = (
     "tokenweir: refusing to emit a non-UsageRecord; no metering for this call"
 )
+_SINK_CLOSED = (
+    "tokenweir: refusing to emit through a closed sink; no metering for these calls"
+)
+_SOURCE_CLOSE_FAILED = (
+    "tokenweir: the store raised while closing; releasing it anyway"
+)
+_DIRECT_WRITE_FAILED = (
+    "tokenweir: usage records not written — the store failed; no metering for these calls"
+)
 
 
 @runtime_checkable
@@ -92,6 +134,34 @@ class Sink(Protocol):
         ...
 
 
+@runtime_checkable
+class BatchSink(Protocol):
+    """Optional extension of :class:`Sink` for a sink that can take a whole batch.
+
+    A sink that implements this is still a :class:`Sink` and is still bound by every
+    part of that contract — in particular ``emit_batch`` MUST NOT raise, for the same
+    reason ``emit`` may not.
+
+    Implement it only when a batch is genuinely better than a loop: fewer round trips,
+    or — the case this exists for — one transaction instead of *n*. Where it buys
+    nothing, leave it off and get the per-record fallback, which is what
+    :class:`~tokenweir.emitter.BufferedEmitter` does when the capability is absent.
+    :class:`~tokenweir.amqp.AMQPSink` deliberately does not implement it: AMQP has no
+    batch publish, so an ``emit_batch`` there would be a loop wearing a costume.
+
+    ``runtime_checkable`` gives ``isinstance`` a structural check for the method's
+    presence, which is the question the emitter actually asks once, at construction.
+    """
+
+    def emit_batch(self, records: Iterable[UsageRecord]) -> None:
+        """Accept a batch for delivery. Fire-and-forget; never raises.
+
+        The batch is a materialized sequence, not a lazily-consumed iterator, so an
+        implementation may traverse it more than once.
+        """
+        ...
+
+
 class NullSink:
     """A Sink that drops everything. The safe default and a test double."""
 
@@ -100,6 +170,173 @@ class NullSink:
 
     def close(self) -> None:  # noqa: D102
         return None
+
+
+class DirectSink:
+    """A :class:`Sink` that writes straight to a :class:`~tokenweir.source.Source`.
+
+    The broker-less path (ADR-0001 Pillar 2). A deployment with no RabbitMQ — the EKS
+    cloud-edge — points the emitter at one of these over a
+    :class:`~tokenweir.postgres.PostgresSource` and gets the same emit-side guarantees
+    with no transport in the picture::
+
+        with BufferedEmitter(DirectSink(PostgresSource(conn))) as emitter:
+            emit_usage(emitter, fields)
+
+    **It is batch-capable on purpose.** ``PostgresSource.write`` puts a whole batch in
+    one transaction, and that guarantee is only worth having if a batch actually
+    arrives as a batch — so :meth:`emit_batch` is one ``write`` call, not *n*.
+    :meth:`emit` is the degenerate case of a batch of one, and a caller that emits
+    record-by-record through this sink genuinely does get a transaction per record;
+    putting a :class:`~tokenweir.emitter.BufferedEmitter` in front is what turns that
+    into batches, and is the supported way to use this.
+
+    **It converts store failures into drops**, because it is a ``Sink`` and
+    ``Sink.emit`` must not raise. That is the opposite of what
+    ``Source.write`` does, and both are right: the ``Source`` contract faces a
+    consumer that can retry, and this one faces a request that cannot be failed.
+    The consequence is worth being plain about — records that reach *this* sink and
+    cannot be stored are **gone**, not queued for retry. A deployment that needs
+    durability across a store outage wants the broker path, which is what a broker is
+    for.
+
+    Failures are counted (:attr:`written`, :attr:`dropped`) and logged, rate-limited so
+    an unreachable store does not produce one line per metered call.
+
+    Ownership follows :class:`~tokenweir.postgres.PostgresSource`'s rule: a source
+    passed in stays the caller's and :meth:`close` leaves it open; pass
+    ``owns_source=True`` to hand it over.
+    """
+
+    def __init__(
+        self,
+        source: Source,
+        *,
+        owns_source: bool = False,
+        warn_interval: float = 60.0,
+    ) -> None:
+        self._source = source
+        self._owns_source = owns_source
+        self._closed = False
+        self._lock = threading.Lock()
+        self._written = 0
+        self._dropped = 0
+        self._warner = RateLimitedWarner(_logger, interval=warn_interval)
+
+    @property
+    def source(self) -> Source:
+        """The underlying source, for a caller that must reach past this."""
+        return self._source
+
+    @property
+    def written(self) -> int:
+        """Records this sink has handed to the store successfully."""
+        with self._lock:
+            return self._written
+
+    @property
+    def dropped(self) -> int:
+        """Records lost — refused, unstorable, or offered after :meth:`close`."""
+        with self._lock:
+            return self._dropped
+
+    def emit(self, record: UsageRecord) -> None:
+        """Write one record. Never raises."""
+        self.emit_batch((record,))
+
+    def emit_batch(self, records: Iterable[UsageRecord]) -> None:
+        """Write a batch in a single :meth:`~tokenweir.source.Source.write` call.
+
+        Never raises. Two different rules apply to two different kinds of bad input,
+        and the difference is deliberate:
+
+        - A value that is **not a** :class:`~tokenweir.contract.UsageRecord` is
+          filtered out and counted, and the rest of the batch is written. It could
+          never have been stored, so dropping it costs the good records nothing.
+        - A record the **store** cannot take loses the batch **whole**. That is
+          ``rows_for``'s documented behaviour and the reason it validates before
+          opening a transaction: a partially written batch is worse than a wholly
+          dropped one for a consumer that acks on the call returning.
+        """
+        try:
+            offered = list(records)
+        except Exception:
+            # A generator that raises while being drained. Nothing was written and
+            # there is no count to attribute it to, so it is one drop event.
+            self._warner.warn(_DIRECT_WRITE_FAILED)
+            return
+        # Non-records are refused here rather than handed to the store, matching
+        # what `AMQPSink` does at the same seam. Both adapters sit downstream of
+        # `build_record`, which returns `None` on a construction drop, and a
+        # `Source` is under no obligation to notice: `MemorySource` would store the
+        # `None`, and `PostgresSource.rows_for` would raise — losing the whole
+        # batch around it rather than the one bad value.
+        #
+        # Filtered rather than refusing the batch whole, which is the one place
+        # this deliberately differs from `rows_for`. That rule exists so a batch is
+        # never *half* written; dropping a value that could never have been written
+        # at all costs the good records nothing, and salvaging them is strictly
+        # better than losing them to a producer's `None`.
+        batch = [record for record in offered if isinstance(record, UsageRecord)]
+        refused = len(offered) - len(batch)
+        if refused:
+            with self._lock:
+                self._dropped += refused
+            self._warner.warn(_NOT_A_RECORD, exc_info=False)
+        if not batch:
+            return
+        # The flag is read under the same lock that guards the counters. It was
+        # read outside it at first, which left a window where a concurrent
+        # `close()` landed between the check and the `write` — harmless, because
+        # the failure is caught and counted, but an asymmetry that reads as an
+        # oversight rather than a decision, and one that would stop being harmless
+        # the moment anything here stopped being guarded.
+        with self._lock:
+            if self._closed:
+                self._dropped += len(batch)
+                closed = True
+            else:
+                closed = False
+        if closed:
+            self._warner.warn(_SINK_CLOSED, exc_info=False)
+            return
+        try:
+            self._source.write(batch)
+        except Exception:
+            with self._lock:
+                self._dropped += len(batch)
+            self._warner.warn(_DIRECT_WRITE_FAILED)
+            return
+        with self._lock:
+            self._written += len(batch)
+
+    def close(self) -> None:
+        """Release resources. Safe to call more than once.
+
+        A no-op for a borrowed source, exactly as
+        :meth:`~tokenweir.postgres.PostgresSource.close` is for a borrowed connection —
+        closing something handed to us would surprise whoever else holds it. The closed
+        flag is set before the source is closed, so a ``close`` that raises is not
+        retried into a double-close by a caller who calls again.
+
+        **Never raises**, matching :meth:`tokenweir.amqp.AMQPSink.close`. A store that
+        has already gone away routinely makes a close raise, and a shutdown path is the
+        worst place to turn that into an exception — a caller using this sink bare, with
+        no :class:`~tokenweir.emitter.BufferedEmitter` in front to absorb it, would
+        otherwise get an exception out of the last call they make. The failure is logged;
+        nothing is lost by it, because ``write`` commits per batch and a close has no
+        data left to flush.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if self._owns_source:
+            try:
+                self._source.close()
+            except Exception:
+                self._warner.warn(_SOURCE_CLOSE_FAILED)
+
 
 
 def _warn_dropped(message: str, *, exc_info: bool = True) -> None:

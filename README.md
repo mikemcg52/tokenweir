@@ -11,15 +11,25 @@ The core defines three seams and nothing about the wire:
 - **`tokenweir.sink`** — the emit side (`Sink`). Fire-and-forget, off the
   critical path; a metering outage never affects the metered system. Also home to
   the [guarded seam](#metering-on-a-request-path) that keeps record *construction*
-  off that critical path too.
+  off that critical path too, and to
+  [`DirectSink`](#the-broker-less-path), the broker-less write-through.
 - **`tokenweir.source`** — the write side (`Source`). Persists records to a store.
+
+and one client that makes the emit side's promise true rather than merely stated:
+
+- **`tokenweir.emitter`** — [`BufferedEmitter`](#the-emitter-client). Buffers,
+  returns immediately, delivers from a background worker, swallows failures.
 
 Transport lives in optional adapters so the core stays dependency-light:
 
 ```bash
 pip install tokenweir           # core only
-pip install 'tokenweir[amqp]'   # + AMQP adapter
+pip install 'tokenweir[amqp]'   # + AMQP adapter (tokenweir.amqp)
+pip install 'tokenweir[postgres]'  # + the Postgres store (tokenweir.postgres)
 ```
+
+An adapter is reached by its own import path and is never exported from the
+`tokenweir` namespace, so `import tokenweir` can never drag in a wire or a driver.
 
 ## The usage-record contract
 
@@ -245,11 +255,260 @@ Two things the guard deliberately does *not* do:
 `KeyboardInterrupt` and `SystemExit` are not caught. A metering guard that
 swallowed Ctrl-C would be a worse bug than the one it fixes.
 
-> **Adoption is in progress.** `tokenweir` ships the seam; the AI Gateway
-> (TOKWEIR-10) and the emitter client (TOKWEIR-6) are being moved onto it. Until
-> then, a consumer constructing records inline should call `emit_usage` itself —
-> and should watch the return value, since a producer that gets a field name
-> wrong drops *every* record, not some of them.
+> **Adoption is in progress.** `tokenweir` ships the seam and, since TOKWEIR-6,
+> the [emitter client](#the-emitter-client) that consumes it. The AI Gateway
+> (TOKWEIR-10) is still being moved onto both. A consumer constructing records
+> inline should call `emit_usage` itself — and should watch the return value, since
+> a producer that gets a field name wrong drops *every* record, not some of them.
+
+## The emitter client
+
+`Sink.emit` promises to buffer, return immediately and never raise. `BufferedEmitter`
+is what **discharges** that promise, so an adapter does not have to.
+
+That distinction is the whole reason this exists. Without it every adapter
+re-implements a buffer, a worker, a bound and a drop policy — the guarantee written
+four times and wrong once — and the natural way to write an AMQP sink is a blocking
+`basic_publish`, which satisfies "never raises" and violates "off the critical path"
+without ever looking wrong.
+
+```python
+from tokenweir import BufferedEmitter, emit_usage
+from tokenweir.amqp import AMQPSink
+
+with BufferedEmitter(AMQPSink.from_url("amqp://guest:guest@rabbit/")) as emitter:
+    emit_usage(emitter, fields)          # appends and returns; never raises
+```
+
+The client is itself a `Sink`, so it composes with the guarded seam with nothing in
+between: `emit_usage(emitter, fields)` is the one call a metered request path makes,
+and both the construction guard and the delivery guard are behind it.
+
+### Two policies to read before adopting
+
+**The buffer is bounded, and a full buffer drops the newest record.** An unbounded
+buffer is not a safety mechanism; it is a memory leak that takes down the metered
+service exactly when the broker is down — the precise failure the design exists to
+prevent. Blocking the caller instead would be worse, since that *is* the critical
+path. Records already accepted stay accepted: evicting the oldest to make room would
+turn a bounded, countable loss into an unbounded reshuffle of which records survive.
+
+**Delivery is never retried.** A retry loop in front of a down broker fills the
+bounded buffer and turns record loss into *more* record loss plus latency, and a
+poison record retried forever blocks everything behind it. A failed batch is dropped
+and counted. What actually recovers from an outage is reconnection, which belongs to
+the adapter and happens on a later delivery attempt.
+
+Neither drop is silent. Both are counted, and both log a rate-limited `WARNING` so a
+systematically broken sink cannot produce one log line per metered request. The
+window is **per reason**: a chatty broker failure never suppresses a first sighting
+of an unrelated one, and a suppressed count is never reported against a cause that
+did not produce it.
+
+```python
+stats = emitter.stats()
+stats.accepted, stats.delivered, stats.failed
+stats.dropped_buffer_full, stats.dropped_not_a_record, stats.dropped_closed
+stats.dropped_at_close   # abandoned when close() hit its timeout
+stats.dropped        # every record the client took on and did not deliver
+stats.buffered, stats.worker_alive
+```
+
+`stats()` is the signal to alert on: it is a consistent snapshot, richer than a
+return value, and it reaches you regardless of logging configuration. Two things it
+is worth knowing precisely:
+
+- **`delivered` counts hand-off, not persistence.** It means the sink accepted the
+  record without raising. A conforming sink cannot raise, so a sink that swallows
+  its own failure — `DirectSink` does exactly this when the store is down — is
+  counted as delivered here. On the broker-less path, read `DirectSink.dropped`
+  alongside it; on the AMQP path, `AMQPSink.dropped`.
+- **`worker_alive` means "the delivery worker is running".** It is `False` after
+  any `close()` — that is the normal end state, not a fault. What it diagnoses is a
+  client you have *not* closed reporting `False`: that happens only if a sink raised
+  a `BaseException`, which is deliberately not caught, and it means the client has
+  silently stopped metering. Every other failure is a counted drop and the client
+  keeps working.
+- **`dropped` includes `dropped_at_close`**, so records abandoned by a `close()`
+  that timed out against a wedged sink are inside the one number worth alerting on.
+
+### Knobs
+
+| Argument | Default | What it decides |
+|---|---|---|
+| `max_buffer` | `10_000` | The bound on records *waiting*. Reaching it drops rather than blocking or growing. A batch already in flight is outside it, so peak retention is `max_buffer + batch_size`. |
+| `batch_size` | `100` | The most records handed to the sink at once. |
+| `linger` | `0.2` | How long the worker waits for a partial batch to fill. `flush()` and `close()` both cut it short, so it never delays a shutdown. |
+| `close_timeout` | `5.0` | Bound on `close()`'s final flush. A wedged sink must not hang a process exit. |
+| `warn_interval` | `60.0` | Seconds between warning lines for a repeating failure, **per reason**. |
+
+### Lifecycle
+
+`flush(timeout)` blocks until the buffer is drained and reports whether it got
+there — it is the synchronization point to use instead of a sleep. `close()` stops
+the worker, flushes within `close_timeout`, closes the sink, is safe to call more
+than once, and never raises even if the sink's own `close` does.
+
+The worker is a **daemon** thread, so metering can never be the reason a process
+will not exit. The cost, stated rather than hidden: records buffered at a hard exit
+are lost. `close()` — or the context manager — is the supported way to not lose
+them, and an `atexit` hook makes a bounded best-effort attempt for callers who
+forget. That bound is **per client**: *n* forgotten clients whose sinks are all
+wedged against a dead broker delay interpreter exit by up to *n* × `close_timeout`.
+Exit is still bounded rather than hung, but if you hold many clients, close them.
+This client is not durable; surviving a consumer outage is what a broker is for.
+
+## Choosing a transport
+
+ADR-0001 Pillar 2 keeps the wire out of the core, which is what lets the two
+deployments differ without the library knowing:
+
+| Deployment | Sink | Why |
+|---|---|---|
+| homelab | `tokenweir.amqp.AMQPSink` | RabbitMQ is already there: gateway → AMQP → writer, and the broker absorbs a writer outage |
+| cloud-edge | `tokenweir.sink.DirectSink` | no broker to run; write in-process to the store |
+
+### The AMQP path
+
+```python
+from tokenweir.amqp import AMQPSink
+
+sink = AMQPSink.from_url("amqp://guest:guest@rabbit/", routing_key="tokenweir.usage")
+sink = AMQPSink(channel, exchange="metering", routing_key="usage.gateway")
+```
+
+Each record is published as its JSON wire form, persistent (`delivery_mode=2`) with
+a JSON content type — metering that evaporated on a broker restart would make the
+broker path pointless.
+
+`pika` is never imported at module import, so a bare `pip install tokenweir` carries
+no AMQP library and the record→message mapping (`message_for`) is usable and testable
+with none installed. It *is* imported when a sink is **constructed** — wiring time,
+where a missing driver raises an `ImportError` naming `tokenweir[amqp]` while
+somebody is still watching.
+
+That last part is deliberate rather than incidental. Deferring the import further,
+to the first publish, looks tidier and is a trap: the publish path may not raise, so
+a missing driver discovered there is not an error at all — it is a silent 100% drop
+of every record, for the life of the process, in the one code path whose whole job
+is never to complain.
+
+To build a sink over a channel of your own with no `pika` installed at all, pass
+`properties=` — the driver is only needed to construct the message properties:
+
+```python
+sink = AMQPSink(channel, properties=my_basic_properties)
+```
+
+Nothing this library writes to a log carries the URL's credentials: a reconnect
+failure is redacted before it is logged, the same rule `tokenweir.migrations`
+applies to a Postgres DSN. `from_url` still raises the driver's own exception
+unredacted, because you supplied the URL and may be catching pika's exception type.
+
+**Being able to reconnect decides reconnection** — not ownership, which is a
+different question. A sink built by `from_url` knows how to re-dial, so on a publish
+failure it drops the connection and re-establishes on the *next* attempt, never by
+retrying inside the current one. A channel you hand in is never re-made, whoever
+owns it: this object does not know how it was built, and guessing would replace your
+TLS context, credentials or pooling with its own. Such a channel is left exactly as
+it was, so publishing resumes the moment you repair it, with no cooperation needed
+here. `close()` still closes only a connection the sink opened itself.
+
+Reconnect *attempts* are spaced by `reconnect_interval` (default 5s). Without it, a
+`BlockingConnection` dial per buffered record would block the emitter's worker for a
+full connect timeout each time — the retry loop this design refuses, reassembled out
+of single attempts.
+
+When an attempt is free and when it waits comes down to one question: **can
+re-dialling plausibly help?**
+
+| What failed | Next attempt |
+|---|---|
+| A connection that had been publishing | **Immediate.** Something outside the process broke, and re-dialling is exactly what fixes it. Waiting out an interval here would trade a real fault for an invented one. |
+| The dial itself | **Spaced.** A broker that refused the connection will refuse the next one too. |
+| A publish, on a connection that never published | **One free re-dial, then spaced.** A reset before the first publish looks identical to a bad exchange, so one retry settles it: if a fresh connection also cannot publish, the fault is not the connection. |
+
+**If you are debugging a silent metering outage, start with the cap.** The obvious
+guess — that a missing exchange lands in the third row — is wrong, and wrong in a way
+worth knowing. `pika` does not wait for the broker on publish unless confirms are
+enabled, so the *first* publish to an exchange that does not exist **returns
+normally** and the 404 surfaces on the next one. That first apparent success makes
+the connection look productive, so it takes **row 1** and is re-dialled immediately;
+what stops it is the cap below, not the third row. The third row is for a channel
+that fails on its very first publish — a socket already gone, not a topology
+mistake.
+
+So the line to look for is the cap's: it names the exchange and routing key as the
+thing to check, and the underlying broker error is on the publish-failure warning
+beside it (logged with a traceback). The two *waiting* cases log distinct `WARNING`s
+naming which one you are in; an immediate recovery logs the ordinary publish failure
+and nothing more, because there is nothing to wait for.
+
+Underneath all of it there is a hard cap of `tokenweir.amqp.MAX_DIALS_PER_INTERVAL`
+dials per interval, which applies no matter what the rules above conclude — unless
+you set `reconnect_interval=0`, which disables the spacing and the cap together and
+hands back unbounded per-record dialling. That is a supported setting, not a default
+worth reaching for. It is
+there because those rules infer *why* a publish failed from whether the connection
+had published before, and that inference is not always available: `pika` does not
+wait for the broker on publish unless confirms are enabled, so the first publish to
+a missing exchange returns normally and the rejection surfaces on the next one. The
+cap is what makes the bound a guarantee rather than a good guess. It is a module
+constant rather than a constructor argument on purpose — a backstop a caller can
+raise is not a backstop.
+
+Backing off has a cost worth knowing: a broker that recovers *during* a window has
+those records dropped, where dialling per record would have stumbled into a working
+connection. That is the trade — the dialling is the thing that was hurting the
+metered service — and the window bounds it.
+
+The allowance renews per *working* connection, so a flaky link that keeps publishing
+between drops recovers instantly rather than degrading into a rate-limited one —
+up to `MAX_DIALS_PER_INTERVAL` recoveries per interval. A link dropping more often
+than that inside one window has the excess refused and its records dropped until the
+window turns over, because the cap above overrides every immediacy rule here. That
+is the intended order of precedence: a link failing that often is not one the sink
+should keep re-dialling.
+
+**Declaring the topology is not the adapter's job.** Exchanges, queues and bindings
+outlive any process; a library that declared them would silently own them, and fail
+confusingly the day its arguments disagreed with what is deployed.
+
+**`AMQPSink` is not thread-safe, and cannot be made so here.** An AMQP channel is
+not safe to share between threads — that is pika's constraint, not one this library
+could lift, and a lock around the counters would hide the hazard rather than remove
+it. Give each thread its own sink, or put a single `BufferedEmitter` in front: its
+worker is one thread, and it is the only thread that ever touches the sink,
+including for `close()`. That is the shape this adapter is built for.
+
+### The broker-less path
+
+`DirectSink` adapts a `Source` to the `Sink` interface:
+
+```python
+from tokenweir import BufferedEmitter, DirectSink
+from tokenweir.postgres import PostgresSource
+
+with BufferedEmitter(DirectSink(PostgresSource(connection))) as emitter:
+    emit_usage(emitter, fields)
+```
+
+It is **batch-capable on purpose**: a batch stays one `Source.write` call, which is
+what preserves `PostgresSource`'s one-transaction-per-batch guarantee instead of
+degrading to a transaction per row. That capability is the optional `BatchSink`
+protocol — a sink may offer `emit_batch`, and `BufferedEmitter` prefers it when
+present and falls back to per-record `emit` when it does not. `AMQPSink`
+deliberately does not implement it: AMQP has no batch publish, so an `emit_batch`
+there would be a loop wearing a costume.
+
+`DirectSink` sits exactly where the two halves' failure rules meet, so it is the
+place where a store failure stops being an exception and becomes a counted, logged
+drop (`sink.written`, `sink.dropped`). Be plain about what that means: records that
+reach this sink and cannot be stored are **gone**, not queued for retry. A
+deployment that needs durability across a store outage wants the broker path.
+
+Ownership follows `PostgresSource`'s rule — a source passed in stays yours and
+`close()` leaves it open; pass `owns_source=True` to hand it over.
 
 ## The store — schema, migrations and the writer
 
@@ -378,7 +637,9 @@ A batch is validated **whole, before any statement is sent**, so one unwritable
 record cannot half-write the batch around it — and because the batch is one
 transaction, a consumer can ack after `write` returns knowing that either all of
 it is durable or none of it is. Batching *policy* (how many, how long to wait, what
-to do with a redelivery) belongs to the consumer that owns the broker, not here.
+to do with a redelivery) belongs to the consumer that owns the broker, not here —
+on the [broker-less path](#the-broker-less-path) that consumer is `BufferedEmitter`,
+whose `batch_size` and `linger` are exactly that policy.
 
 A record with no `ts` is stamped by the **database**, not the client, so records
 written from different hosts share one clock.
