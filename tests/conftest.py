@@ -27,6 +27,27 @@ Each test gets its own Postgres **schema**, created and dropped around it, with
 `search_path` pointed at it. So the DSN may point at any scratch database: the
 suite cannot collide with — or destroy — an existing `gateway_usage`, which
 matters because the obvious database to hand it is the one that already has one.
+
+---
+
+**Second concern, same subject: saying out loud what the skips cost (TOKWEIR-31).**
+
+Everything above is about *skipping well*. `OPTIONAL_DRIVERS` below is about the
+other half — that a run which skips well still reports a bare "81 skipped", and a
+reader takes green to mean "everything passed" because that is what green normally
+means.
+
+The case that prompted it: `tests/test_amqp.py`'s two real-`pika` tests are gated
+the same way these fixtures are, and the authoritative install for this project is
+`pip install -e . pytest` — no extras. So under CI, FR-022 was proven only against
+`FakeProperties`, a dict wrapper that accepts any kwargs at all, and nothing in the
+run said so.
+
+The skip is not the bug and is not being removed: the core is transport-free by
+contract (ADR-0001 Pillar 2), so a plain install legitimately has no `pika`, and a
+test that cannot be evaluated must not turn that install red. What is being fixed
+is the silence. The run now ends by naming each absent driver and the claim it
+therefore did not test.
 """
 
 import os
@@ -156,3 +177,126 @@ def migrated(connection):
 
     apply(connection)
     return connection
+
+
+# --- What this environment could not prove (TOKWEIR-31) -----------------------
+#
+# The record, the probe, the renderer and the hook. One record with three
+# consumers — the terminal note below, the README paragraph under "Develop", and
+# the consistency check in `tests/test_optional_drivers.py` — because the failure
+# being fixed is a log and a document disagreeing about what was tested, and two
+# records would reintroduce it one refactor later.
+
+#: Importable module → the claim the suite cannot check without it.
+#:
+#: Keys are exactly the modules the suite gates on with `pytest.importorskip`,
+#: and `test_optional_drivers.py` enforces that equality in both directions: a new
+#: gate nobody disclosed fails, and a disclosed driver nothing gates on fails too.
+#: One-directional would let this decay into a list of historical claims.
+#:
+#: Values are prose and are nobody's to derive — no mechanism can infer "FR-022
+#: goes unproven" from the absence of a module. So the *set* is checked and the
+#: descriptions are left to review, which catches the drift that happens by
+#: accident and not the entry that was always wrong.
+OPTIONAL_DRIVERS: dict[str, str] = {
+    # The entry this story was filed for. `FakeProperties` in test_amqp.py accepts
+    # any kwargs at all, so without real pika nothing would notice
+    # `publish_properties()` emitting a key `pika.BasicProperties` rejects.
+    "pika": (
+        "FR-022 (persistent messages with a JSON content type) was checked only against the "
+        "test double, not against a real pika.BasicProperties"
+    ),
+    # Found by the consistency check below rather than by hand, which is the whole
+    # argument for having it: `test_schema.py` already carried a comment saying
+    # these skip on the stream plan's install, and the disclosure would have
+    # shipped without them anyway.
+    "jsonschema": (
+        "the published schema in schema/usage-record.v1.json was not run against a JSON Schema "
+        "engine — payload validity was checked only by this package's own code"
+    ),
+    # Named for the driver rather than the server: `pgserver` supplies a server
+    # when no DSN is set, but neither is any use without psycopg, and the skip
+    # reason above already explains both halves to whoever hits it.
+    "psycopg": (
+        "the real-Postgres suite did not run — the writer, the source and the migrations were "
+        f"not exercised against a server (set ${DSN_ENV_VAR}, or install the dev extra for an "
+        "embedded one via pgserver)"
+    ),
+    "pglast": (
+        "the migration SQL was not parsed by libpg_query, the server's own parser — only the "
+        "checks that need no parser ran"
+    ),
+    "build": (
+        "SC-001 was checked only against the packaging declaration, not by building a wheel and "
+        "looking inside it for the migrations"
+    ),
+}
+
+
+def _driver_is_importable(module_name: str) -> bool:
+    """Whether `module_name` can be imported at all.
+
+    Any exception counts as "no", not just `ImportError`: a package that is
+    installed but explodes on import is exactly as unable to prove FR-022 as a
+    missing one, and this runs inside a reporting hook that must never raise.
+    """
+    import importlib
+
+    try:
+        importlib.import_module(module_name)
+    except Exception:
+        return False
+    return True
+
+
+def missing_optional_drivers(drivers: dict[str, str] | None = None) -> list[str]:
+    """The absent drivers, in the record's order.
+
+    Absence is decided by importing, not by watching which tests skipped. That is
+    deliberate: a skip census depends on which tests were selected, breaks under
+    `-k`, `-x` and `xdist`, and reports nothing at all when a run dies early —
+    while importability is a fact about the environment that holds whether or not
+    a single test ran.
+    """
+    drivers = OPTIONAL_DRIVERS if drivers is None else drivers
+    return [name for name in drivers if not _driver_is_importable(name)]
+
+
+def disclosure_lines(missing: list[str], drivers: dict[str, str] | None = None) -> list[str]:
+    """The note, or nothing at all when the environment is complete.
+
+    Pure, so the note can be tested for drivers that are in fact installed —
+    otherwise the "nothing is missing" case would only be checkable on a machine
+    that happened to have all four, which is the environment this repository
+    demonstrably does not run in.
+    """
+    drivers = OPTIONAL_DRIVERS if drivers is None else drivers
+    if not missing:
+        return []
+
+    lines = [
+        "Not proven by this run — optional drivers absent from this environment.",
+        "A green result above does not cover the following:",
+    ]
+    lines.extend(f"  {name} is not installed: {drivers[name]}" for name in missing)
+    lines.append("  Install them with `pip install -e '.[dev]'`; see README.md under \"Develop\".")
+    return lines
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """Say what the run did not test, after saying what it did.
+
+    `pytest_terminal_summary` rather than a print at collection time: it fires once
+    per invocation — including a failed or interrupted one, whose reader needs this
+    no less — writes through the terminal reporter so it honours `-q` and capture,
+    and structurally cannot influence the exit status. That last property is what
+    makes "a forfeited claim is a reporting fact, not a failure" true by
+    construction rather than by care.
+    """
+    lines = disclosure_lines(missing_optional_drivers())
+    if not lines:
+        return
+
+    terminalreporter.write_sep("=", "not proven by this run", yellow=True)
+    for line in lines:
+        terminalreporter.write_line(line)

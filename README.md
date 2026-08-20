@@ -706,4 +706,38 @@ pytest
 ruff check .
 ```
 
+### What a bare install does not cover
+
+Use the `dev` extra above. A plain `pip install -e .` runs the suite too, and it will be **green** —
+but it is green over less, and the difference is deliberate rather than accidental.
+
+The core is dependency-light and transport-free by contract (ADR-0001 Pillar 2): `tokenweir` itself
+must install with no broker library and no database driver, so the tests that need one **skip**
+rather than fail. That is the right behaviour — a test that cannot be evaluated must not turn an
+ordinary install red — but it means a bare run silently proves less than it appears to:
+
+| Absent from a bare install | What goes unchecked |
+| --- | --- |
+| `pika` | **FR-022** — persistent messages with a JSON content type — is checked only against the test double. The double accepts any keyword at all, so it would not notice `publish_properties()` emitting a key that real `pika.BasicProperties` rejects. |
+| `jsonschema` | The published `schema/usage-record.v1.json` is never run through a JSON Schema engine; payload validity is checked only by this package's own code. |
+| `psycopg` (with `pgserver` or `$TOKENWEIR_TEST_DSN`) | The whole real-Postgres suite: the writer, the source and the migrations against an actual server. Concurrency and adoption behaviour are only observable there. |
+| `pglast` | The migration SQL is never parsed by libpg_query, the server's own parser. |
+| `build` | SC-001 is checked against the packaging declaration rather than by building a wheel and looking inside it. |
+
+**This is accepted, not overlooked.** The alternative is making a broker library a dependency of a
+metering contract that must not have one, which costs more than the coverage is worth. So the suite
+now says so out loud instead: every run ends by naming the drivers it could not import and the claim
+each absence forfeits, so a green CI log
+**cannot be read as covering FR-022** against the real driver. `tests/conftest.py` holds that list, and `tests/test_optional_drivers.py` keeps it equal to
+the set of drivers the suite actually gates on — so it cannot drift as tests are added.
+
+### If you run this project's CI
+
+The authoritative install for the MADO registry entry is `pip install -e . pytest` — no extras — so
+the runs it drives forfeit everything in the table above. To close the `pika` gap, add `pika` to
+this project's `install_commands` in `/etc/mado/projects.yaml`; to close all of them, make the step
+`pip install -e '.[dev]'`. Neither is editable from inside a stream pod, which is why the limitation
+is recorded here rather than fixed there. Nothing needs undoing in this repository if you do: the
+disclosure goes quiet on its own once the driver is present.
+
 Apache-2.0. Metering is intentionally the open-core boundary (ADR-0002).
