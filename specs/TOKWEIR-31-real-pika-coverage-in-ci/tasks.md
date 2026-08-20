@@ -52,8 +52,9 @@ the consistency check are all rendered from or keyed to it.
       (FR-043, FR-044, FR-045, SC-039)
 - [x] **T011** The probe: a module that raises a non-`ImportError` on import counts as absent and
       does not propagate. (FR-046)
-- [x] **T012** The hook end to end via `pytester`: the note reaches the output of a real run, and
-      that run's exit status is unaffected. (FR-046, FR-047)
+- [x] **T012** The hook end to end in a **subprocess** — not `pytester`, which would mean
+      registering that plugin for every run: the note reaches the output of a real run, and that
+      run's exit status is unaffected. (FR-046, FR-047)
 - [x] **T013** The bidirectional consistency check: the set of modules gated by `importorskip`
       across `tests/` equals the record's keys. (FR-051)
 - [x] **T014** *The detector itself*, per `test_repo_hygiene.py`'s convention: with a stubbed record
@@ -93,3 +94,30 @@ the consistency check are all rendered from or keyed to it.
 - **T020 was run rather than asserted.** Removing a README marker, adding an undisclosed gate, and
   leaving a stale entry each turned the suite red with a message naming the fix; all three were
   reverted and the suite returned to 856 / 81.
+
+## Phase 7 (fix round 1): what review 1 found
+
+- [x] **T022** *(Med-1)* Test `missing_optional_drivers` itself, against real modules and not only
+      stubs. The predicate that decides whether an entry is missing had no test that would fail if it
+      broke: rewriting it to disclose every entry left the file green and printed "pika is not
+      installed" on a machine with pika 1.4.4. Four tests added; the mutation now fails three.
+      (FR-045, SC-038, SC-039)
+- [x] **T023** *(Med-2)* Judge the Postgres entry on the condition its own fixtures impose —
+      psycopg **and** a DSN or `pgserver` — not on importability. On a machine with the driver and no
+      server the note went silent while 43 tests carried on skipping, which is this story's own bug
+      one entry over. Entries now carry a `label` as well as a claim, because "psycopg is not
+      installed" is the wrong sentence when psycopg is installed. Verified with a stub psycopg on
+      `PYTHONPATH`: the note still reports Postgres. (FR-043a)
+- [x] **T024** *(Low-1)* Reword the header. It said "A green result above does not cover the
+      following" — false on the red and interrupted runs the note deliberately fires on, and wrong
+      about "above" even on a passing run, since the note precedes the summary line. Now claims
+      nothing about the result, and a test asserts it does not.
+- [x] **T025** *(Low-2)* Restate SC-037 with the measured number (9 lines against `-ra`'s 43, which
+      is 4.8× and not an order of magnitude) and give the test an absolute ceiling, since one line
+      per entry is satisfied at any size.
+- [x] **T026** *(Low-3)* Reconcile plan.md and T012 with the subprocess implementation that shipped.
+- [x] **T027** *(Low-4, Low-5)* Replace the regex scanner with an AST walk: it cannot be fooled by a
+      gate that is merely written about in a docstring, comment or fixture — the trap that caught
+      this story's own test file twice — and it recurses into subdirectories. Tests for all three.
+- [x] **T028** *(Low-6)* Catch `SystemExit` in the probe, and amend FR-046 to say `KeyboardInterrupt`
+      deliberately propagates rather than leaving `except Exception` looking like an oversight.

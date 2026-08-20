@@ -227,12 +227,29 @@ the disclosure table does not know about, and confirm the suite goes red.
   optional driver that is absent from the environment, and for each one MUST name the coverage that
   its absence forfeits. `pika` MUST be one of these entries and its forfeited coverage MUST name
   FR-022 and the fact that the check was against a test double rather than the real driver.
+- **FR-043a** *(added in fix round 1, from review 1's Med-2)*: An entry MUST be judged by the
+  condition its own tests are gated on, which is not always "does this module import". The
+  real-Postgres entry MUST be reported missing unless psycopg is importable **and** either
+  `$TOKENWEIR_TEST_DSN` is set or `pgserver` is importable — the same condition `tests/conftest.py`'s
+  fixtures impose. Deciding it on the import alone made the largest forfeit in the suite disappear
+  from a green run on any machine with the driver and no server, which is this story's own bug one
+  entry over. An entry's wording MUST remain true in that case, so it MUST NOT be phrased as "X is
+  not installed" where X may well be installed.
 - **FR-044**: The report MUST be a small, fixed number of lines that names the forfeited claims —
   not a per-test enumeration. `pytest -ra` is explicitly rejected as the mechanism (see Context).
 - **FR-045**: The report MUST NOT appear for a driver that is present, and MUST NOT appear at all
   when every optional driver is present.
 - **FR-046**: The report MUST NOT alter the run's exit status, MUST NOT fail or error any test, and
-  MUST NOT raise even if a driver's import raises something other than `ImportError`.
+  MUST NOT raise for an import that fails in any ordinary way — including one that raises something
+  other than `ImportError`, and including `SystemExit`, which a module calling `sys.exit()` at import
+  time really does produce and which does not inherit from `Exception`.
+
+  *Amended in fix round 1, from review 1's Low-6.* The original wording ("MUST NOT raise even if a
+  driver's import raises something other than `ImportError`") reads literally as `except
+  BaseException`, which would swallow `KeyboardInterrupt`. That is the wrong trade: finishing a
+  report is not worth ignoring Ctrl-C, and a run the operator asked to stop must stop. So
+  `KeyboardInterrupt` deliberately propagates, and this is written down rather than left looking
+  like an oversight.
 - **FR-047**: The report MUST be produced regardless of the run's outcome, of which tests were
   selected, and of the reporting flags in use.
 - **FR-048**: `README.md` under "Develop" MUST state which optional drivers a bare
@@ -247,7 +264,10 @@ the disclosure table does not know about, and confirm the suite goes red.
   but cannot disappear.
 - **FR-051**: The set of drivers in the disclosure MUST be checked against the set the test suite
   actually gates on, in both directions: a gated module missing from the disclosure MUST fail, and
-  a disclosed module nothing gates on MUST fail.
+  a disclosed module nothing gates on MUST fail. The record MUST be able to hold an entry gated by
+  something other than an `importorskip` without that check calling it stale — otherwise FR-043a's
+  fix has nowhere to live. The check MUST NOT be confused by a gate that is merely *written about*
+  in a docstring, a comment or a test fixture, and MUST see gates in subdirectories of `tests/`.
 - **FR-052**: `pika` MUST remain absent from the project's runtime dependencies and from every
   extra other than `amqp` and `dev`; this change MUST NOT make any driver a requirement of a core
   install.
@@ -271,11 +291,18 @@ the disclosure table does not know about, and confirm the suite goes red.
 - **SC-036**: Running the authoritative test command in a bare-install environment produces output
   from which a reader can name, without opening any other file, the claim the run did not test. The
   baseline for this is the run recorded in Context: green, with the fact absent from the output.
-- **SC-037**: The disclosure adds no more than a handful of lines to the run's output — measured
-  against the 43 lines `-ra` was shown to add, an order of magnitude fewer.
-- **SC-038**: Removing any load-bearing README sentence, adding an unlisted gated module, or
-  listing a module nothing gates on each turns the suite red. Verified by making each change and
-  observing the failure, not by asserting the test exists.
+- **SC-037**: The disclosure adds a small, bounded number of lines to the run's output: one per
+  entry plus a fixed header and footer, and an absolute ceiling besides, so it cannot grow into the
+  wall of text `-ra` was rejected for. *Restated in fix round 1, from review 1's Low-2* — the
+  original claimed "an order of magnitude fewer" than `-ra`'s measured 43, and the note is 9, which
+  is 4.8×. The number was wrong, and the check backing it (one line per entry) was satisfied at any
+  size, so it is now bounded absolutely as well.
+- **SC-038**: Removing any load-bearing README sentence, adding an unlisted gated module, listing a
+  module nothing gates on, **or breaking the predicate that decides whether an entry is missing**
+  each turns the suite red. Verified by making each change and observing the failure, not by
+  asserting the test exists. The last of these was added in fix round 1: review 1 showed that
+  rewriting the predicate to disclose every entry — so a machine with pika 1.4.4 printed "pika is
+  not installed" — left the whole suite green.
 - **SC-039**: In an environment with every optional driver present, the run's output is free of any
   disclosure line, and the two FR-022 tests execute and pass.
 - **SC-040**: The run's pass/fail outcome and exit status in a bare-install environment are

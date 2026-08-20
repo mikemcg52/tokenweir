@@ -1,7 +1,7 @@
 """What a run did not prove, and the record that says so (TOKWEIR-31).
 
-`tests/conftest.py` ends every run by naming the optional drivers it could not
-import and the claim each absence forfeits. These tests are why that note can be
+`tests/conftest.py` ends every run by naming what this environment could not
+supply and the claim each absence forfeits. These tests are why that note can be
 trusted.
 
 The gap that prompted it: `test_amqp.py`'s two real-`pika` tests are gated by
@@ -11,24 +11,29 @@ a dict wrapper that accepts any keyword at all. The run reported "81 skipped" an
 went green. Nothing was wrong with the code; what was wrong was that the run
 overstated itself.
 
-Two properties matter here and they pull in opposite directions:
+Three properties matter here, and the middle one is the one review 1 found
+missing:
 
-- the note must be **honest**, which is what the bidirectional consistency check
-  below is for. A driver the suite gates on but the record omits is a forfeit
-  nobody is told about — the original bug, one file over. A driver the record
-  lists but nothing gates on is a claimed forfeit that no longer exists.
-- the note must be **harmless**, which is what the subprocess runs are for. It is
-  a report about the environment, not a result, so it may not touch the exit
-  status, may not depend on which tests ran, and must still appear when the run
-  itself went red.
+- the note must be **honest about the suite**, which the bidirectional
+  consistency check is for. A driver the suite gates on but the record omits is a
+  forfeit nobody is told about — the original bug, one file over. A driver the
+  record lists but nothing gates on is a claimed forfeit that no longer exists.
+- the note must be **honest about the environment**. Every "is this missing?"
+  decision needs a test that fails when the predicate breaks, or a mutant that
+  discloses drivers which are in fact installed sails through green — which is
+  what happened to the first draft, and it printed "pika is not installed" on a
+  machine with pika 1.4.4.
+- the note must be **harmless**, which the subprocess runs are for. It is a
+  report about the environment, not a result: it may not touch the exit status,
+  may not depend on which tests ran, and must still appear when the run went red.
 
 Every check that inspects the source tree skips where there is none — an sdist
 install has no `README.md` and no `tests/` to scan — the same rule
 `test_repo_hygiene.py` and `test_migration_sql.py` already hold.
 """
 
+import ast
 import importlib.util
-import re
 import subprocess
 import sys
 import textwrap
@@ -38,7 +43,10 @@ from pathlib import Path
 import pytest
 from conftest import (
     OPTIONAL_DRIVERS,
+    OptionalDriver,
     _driver_is_importable,
+    _importable_driver,
+    _postgres_suite_can_run,
     disclosure_lines,
     missing_optional_drivers,
 )
@@ -51,8 +59,18 @@ TESTS_DIR = Path(__file__).resolve().parent
 #: Without it, "names every missing driver" would be untestable on a complete
 #: environment and "says nothing when none are missing" untestable on a bare one.
 STUB_DRIVERS = {
-    "definitely_absent_alpha": "alpha's claim went unchecked",
-    "definitely_absent_beta": "beta's claim went unchecked",
+    "alpha": OptionalDriver(
+        label="alpha is not installed",
+        claim="alpha's claim went unchecked",
+        gate="alpha",
+        available=lambda: False,
+    ),
+    "beta": OptionalDriver(
+        label="beta is not installed",
+        claim="beta's claim went unchecked",
+        gate="beta",
+        available=lambda: True,
+    ),
 }
 
 
@@ -60,38 +78,54 @@ STUB_DRIVERS = {
 
 
 def test_the_note_names_every_missing_driver_and_what_it_costs():
-    lines = disclosure_lines(list(STUB_DRIVERS), STUB_DRIVERS)
-    rendered = "\n".join(lines)
+    rendered = "\n".join(disclosure_lines(list(STUB_DRIVERS), STUB_DRIVERS))
 
-    for name, claim in STUB_DRIVERS.items():
-        assert name in rendered, f"{name} is missing but the note does not say so"
-        assert claim in rendered, f"{name}'s forfeited claim is not stated"
+    for name, driver in STUB_DRIVERS.items():
+        assert driver.label in rendered, f"{name} is missing but the note does not say so"
+        assert driver.claim in rendered, f"{name}'s forfeited claim is not stated"
 
 
 def test_a_present_driver_is_not_disclosed():
     """Half the value of the note is that it goes quiet. A note that lists a
     driver the environment has would train its reader to ignore it."""
-    lines = disclosure_lines(["definitely_absent_beta"], STUB_DRIVERS)
-    rendered = "\n".join(lines)
+    rendered = "\n".join(disclosure_lines(["alpha"], STUB_DRIVERS))
 
-    assert "definitely_absent_beta" in rendered
-    assert "definitely_absent_alpha" not in rendered
+    assert "alpha" in rendered
+    assert "beta" not in rendered
 
 
 def test_a_complete_environment_produces_no_note_at_all():
     """Not an empty banner, not a "nothing missing" line — nothing. This is the
-    state the note is asking the reader to reach, and it must be silent."""
+    state the note asks the reader to reach, and it must be silent."""
     assert disclosure_lines([], STUB_DRIVERS) == []
 
 
+def test_the_note_claims_nothing_about_the_result():
+    """It fires on failing and interrupted runs too, so it may not describe the
+    run as green. The first draft opened with "A green result above does not
+    cover the following" — false on a red run, and wrong about "above" even on a
+    passing one, since the note precedes the summary line."""
+    rendered = "\n".join(disclosure_lines(list(STUB_DRIVERS), STUB_DRIVERS)).lower()
+
+    assert "green" not in rendered
+    assert "above" not in rendered
+
+
 def test_the_note_stays_short():
-    """One line per driver plus a fixed header and footer. `pytest -ra` was the
-    obvious alternative and was rejected for emitting 43 lines against this
-    suite — pytest groups skips by source line, so the long "no Postgres
-    configured" reason repeats forty times and buries the two pika ones."""
+    """One line per entry plus a fixed header and footer, and an absolute ceiling
+    besides. `pytest -ra` was the obvious alternative and was rejected for
+    emitting 43 lines against this suite — pytest groups skips by source line, so
+    the long "no Postgres configured" reason repeats forty times and buries the
+    two pika ones. The ceiling is what keeps that comparison true: the formula
+    alone is satisfied at any size, so it would still pass with forty drivers and
+    forty-three lines."""
     lines = disclosure_lines(list(OPTIONAL_DRIVERS), OPTIONAL_DRIVERS)
 
     assert len(lines) == len(OPTIONAL_DRIVERS) + 3
+    assert len(lines) <= 12, (
+        f"the note has grown to {len(lines)} lines; at this size it is becoming the wall of text "
+        "`-ra` was rejected for. Group the entries or shorten them rather than raising this."
+    )
 
 
 def test_the_pika_entry_names_the_requirement_it_forfeits():
@@ -99,15 +133,16 @@ def test_the_pika_entry_names_the_requirement_it_forfeits():
     the reader to work out what that costs, which is the position they were in
     before."""
     assert "pika" in OPTIONAL_DRIVERS
-    assert "FR-022" in OPTIONAL_DRIVERS["pika"]
+    assert "FR-022" in OPTIONAL_DRIVERS["pika"].claim
 
 
 @pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
 def test_every_entry_states_a_consequence_not_just_a_name(name):
-    claim = OPTIONAL_DRIVERS[name]
+    driver = OPTIONAL_DRIVERS[name]
 
-    assert len(claim) > 40, f"{name}'s entry is too terse to tell anyone anything: {claim!r}"
-    assert claim.strip() == claim
+    assert len(driver.claim) > 40, f"{name}'s entry is too terse to tell anyone anything"
+    assert driver.claim.strip() == driver.claim
+    assert driver.label.strip() == driver.label
 
 
 # --- The probe ----------------------------------------------------------------
@@ -122,9 +157,9 @@ def test_the_standard_library_counts_as_present():
 
 
 def test_a_module_that_explodes_on_import_counts_as_absent(tmp_path, monkeypatch):
-    """`except Exception`, not `except ImportError`. A package that is installed
-    but raises on import is exactly as unable to prove FR-022 as a missing one,
-    and this runs inside a reporting hook that must never raise."""
+    """`except (Exception, SystemExit)`, not `except ImportError`. A package that
+    is installed but raises on import is exactly as unable to prove FR-022 as a
+    missing one, and this runs inside a reporting hook that must never raise."""
     module = tmp_path / "explodes_on_import.py"
     module.write_text("raise RuntimeError('boom')\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -132,10 +167,135 @@ def test_a_module_that_explodes_on_import_counts_as_absent(tmp_path, monkeypatch
     assert not _driver_is_importable("explodes_on_import")
 
 
+def test_a_module_that_exits_on_import_counts_as_absent(tmp_path, monkeypatch):
+    """`SystemExit` does not inherit from `Exception`, so it would have escaped
+    the hook and taken the run's exit status with it."""
+    (tmp_path / "exits_on_import.py").write_text("raise SystemExit(2)\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    assert not _driver_is_importable("exits_on_import")
+
+
+def test_a_keyboard_interrupt_during_import_still_propagates(tmp_path, monkeypatch):
+    """Deliberately not swallowed. Finishing a report is not worth ignoring
+    Ctrl-C, and FR-046 was amended in fix round 1 to say so rather than leaving
+    `except BaseException` to look like an oversight."""
+    module = tmp_path / "interrupted_on_import.py"
+    module.write_text("raise KeyboardInterrupt\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(KeyboardInterrupt):
+        _driver_is_importable("interrupted_on_import")
+
+
+# --- Which entries this environment cannot satisfy ----------------------------
+#
+# Review 1's Med-1: everything above hands `disclosure_lines` a ready-made list
+# of missing names, so `missing_optional_drivers` itself was never exercised.
+# Breaking it to `return list(drivers)` — disclosing drivers that are installed —
+# left the whole file green, and on a machine with pika 1.4.4 the mutant printed
+# "pika is not installed". These are the tests that fail on it.
+
+
+def test_a_driver_that_is_present_is_not_reported_missing():
+    assert missing_optional_drivers(STUB_DRIVERS) == ["alpha"]
+
+
+def test_presence_is_decided_by_asking_the_record_not_by_listing_it():
+    """The mutation that motivated this: with every entry available, the answer
+    must be empty rather than "all of them"."""
+    everything_present = {
+        name: OptionalDriver(
+            label=driver.label, claim=driver.claim, gate=driver.gate, available=lambda: True
+        )
+        for name, driver in STUB_DRIVERS.items()
+    }
+
+    assert missing_optional_drivers(everything_present) == []
+
+
+def test_a_real_importable_module_is_not_reported_missing():
+    """Against the genuine predicate rather than a stub, so a broken
+    `_driver_is_importable` cannot hide behind a lambda. `json` is always there."""
+    record = {"json": _importable_driver("json", "a claim that is never actually forfeited here")}
+
+    assert missing_optional_drivers(record) == []
+
+
+def test_a_real_absent_module_is_reported_missing():
+    record = {
+        "definitely_absent_alpha": _importable_driver(
+            "definitely_absent_alpha", "a claim forfeited because this module does not exist"
+        )
+    }
+
+    assert missing_optional_drivers(record) == ["definitely_absent_alpha"]
+
+
 def test_missing_drivers_come_back_in_the_records_order():
     """So the note's most important entry — pika, the one this story is about —
     stays at the top rather than moving with the environment."""
-    assert missing_optional_drivers(STUB_DRIVERS) == list(STUB_DRIVERS)
+    absent = {
+        name: OptionalDriver(
+            label=driver.label, claim=driver.claim, gate=driver.gate, available=lambda: False
+        )
+        for name, driver in STUB_DRIVERS.items()
+    }
+
+    assert missing_optional_drivers(absent) == list(STUB_DRIVERS)
+
+
+# --- Postgres is not disclosed on an import (review 1, Med-2) -----------------
+#
+# The real-store suite needs psycopg *and* a server. Deciding this entry on
+# `import psycopg` alone made the note go quiet on a machine that had the driver
+# and no database, while forty-three tests carried on skipping — this story's own
+# bug, one entry over. Reachable without contrivance: `pip install -e '.[postgres]'`,
+# or `.[dev]` on Windows, where the `pgserver` marker excludes it.
+
+
+def test_postgres_needs_more_than_the_driver(monkeypatch):
+    monkeypatch.delenv("TOKENWEIR_TEST_DSN", raising=False)
+    monkeypatch.setattr(
+        "conftest._driver_is_importable", lambda name: name == "psycopg"
+    )
+
+    assert not _postgres_suite_can_run(), (
+        "psycopg alone was treated as enough, so a machine with the driver and no server "
+        "would be told nothing while the whole real-store suite skipped"
+    )
+
+
+def test_postgres_is_available_with_a_driver_and_a_configured_dsn(monkeypatch):
+    monkeypatch.setenv("TOKENWEIR_TEST_DSN", "postgresql://example/scratch")
+    monkeypatch.setattr("conftest._driver_is_importable", lambda name: name == "psycopg")
+
+    assert _postgres_suite_can_run()
+
+
+def test_postgres_is_available_with_a_driver_and_an_embedded_server(monkeypatch):
+    monkeypatch.delenv("TOKENWEIR_TEST_DSN", raising=False)
+    monkeypatch.setattr(
+        "conftest._driver_is_importable", lambda name: name in {"psycopg", "pgserver"}
+    )
+
+    assert _postgres_suite_can_run()
+
+
+def test_postgres_without_the_driver_is_never_available(monkeypatch):
+    """A DSN is no use without psycopg, and the fixtures skip in that case too —
+    this predicate has to agree with them or the note describes a different suite
+    from the one that ran."""
+    monkeypatch.setenv("TOKENWEIR_TEST_DSN", "postgresql://example/scratch")
+    monkeypatch.setattr("conftest._driver_is_importable", lambda name: False)
+
+    assert not _postgres_suite_can_run()
+
+
+def test_the_postgres_entry_does_not_claim_the_driver_is_missing():
+    """Its label has to survive the case where psycopg is installed and the
+    server is not, which is the whole point of Med-2."""
+    assert "not installed" not in OPTIONAL_DRIVERS["psycopg"].label
 
 
 # --- The record against the suite, in both directions -------------------------
@@ -144,22 +304,52 @@ def test_missing_drivers_come_back_in_the_records_order():
 # during this story: the first draft of the record listed four drivers, the suite
 # gated on five, and the note would have shipped silently understating itself.
 
-_IMPORTORSKIP = re.compile(r"""importorskip\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']""")
-
 
 def _gated_modules(directory: Path = TESTS_DIR) -> set[str]:
     """Every module name the suite gates on with `importorskip`.
 
-    A text scan, which is a real limitation and a deliberate one: a
-    dynamically-constructed module name would be missed. Every gate in this suite
-    is a literal, the job here is to catch the ordinary accident of adding a gate
-    and forgetting the record, and a heavier mechanism would cost more than the
-    drift it prevents.
+    Parsed, not grepped. A regex over the source text also matched the *fixtures*
+    in this very file — the sample module written to a temp directory, and then
+    the comment explaining why the sample was a problem — and reported them as
+    real gates pointing at `OPTIONAL_DRIVERS`. Review 1 rightly called that a
+    maintenance trap: no test file could ever contain the literal text again.
+
+    An AST walk has no such trap. A call is a `Call` node; the same characters
+    inside a string literal or a docstring are not, so fixtures and documentation
+    examples are free to spell gates out in full. It is also strictly more
+    accurate than the regex it replaces.
     """
     found = set()
-    for path in sorted(directory.glob("*.py")):
-        found.update(_IMPORTORSKIP.findall(path.read_text(encoding="utf-8")))
+    for path in sorted(directory.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            name = (
+                function.attr
+                if isinstance(function, ast.Attribute)
+                else function.id
+                if isinstance(function, ast.Name)
+                else None
+            )
+            if name != "importorskip":
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.add(first.value)
     return found
+
+
+def _gated_in_record() -> set[str]:
+    """The entries claiming to be gated by `importorskip`.
+
+    Entries with `gate=None` are gated some other way and are deliberately out of
+    scope for the comparison — without that escape hatch the record could not
+    hold one, which is exactly the corner Med-2's fix would have been painted
+    into.
+    """
+    return {driver.gate for driver in OPTIONAL_DRIVERS.values() if driver.gate is not None}
 
 
 def _require_source_tree() -> None:
@@ -170,7 +360,7 @@ def _require_source_tree() -> None:
 def test_every_gated_driver_is_disclosed():
     """The original bug, one file over: a forfeit nobody is told about."""
     _require_source_tree()
-    undisclosed = _gated_modules() - set(OPTIONAL_DRIVERS)
+    undisclosed = _gated_modules() - _gated_in_record()
 
     assert not undisclosed, (
         f"{sorted(undisclosed)} are gated by importorskip but absent from OPTIONAL_DRIVERS in "
@@ -184,7 +374,7 @@ def test_every_disclosed_driver_is_actually_gated():
     historical claims, and the note starts reporting forfeits that no longer
     exist."""
     _require_source_tree()
-    stale = set(OPTIONAL_DRIVERS) - _gated_modules()
+    stale = _gated_in_record() - _gated_modules()
 
     assert not stale, (
         f"{sorted(stale)} are disclosed in OPTIONAL_DRIVERS but nothing in tests/ gates on them "
@@ -204,7 +394,7 @@ def test_an_undisclosed_gate_is_actually_detected(monkeypatch):
     monkeypatch.setattr(
         sys.modules[__name__],
         "_gated_modules",
-        lambda directory=TESTS_DIR: set(OPTIONAL_DRIVERS) | {"newly_gated_driver"},
+        lambda directory=TESTS_DIR: _gated_in_record() | {"newly_gated_driver"},
     )
 
     with pytest.raises(AssertionError, match="newly_gated_driver"):
@@ -215,45 +405,50 @@ def test_a_stale_disclosure_is_actually_detected(monkeypatch):
     monkeypatch.setattr(
         sys.modules[__name__],
         "_gated_modules",
-        lambda directory=TESTS_DIR: set(OPTIONAL_DRIVERS) - {"pika"},
+        lambda directory=TESTS_DIR: _gated_in_record() - {"pika"},
     )
 
     with pytest.raises(AssertionError, match="pika"):
         test_every_disclosed_driver_is_actually_gated()
 
 
-#: The gate's name, kept out of the fixture source below as a literal call.
-#:
-#: `_gated_modules` scans every `tests/*.py`, including this one, so a fixture
-#: spelling the call out literally would be picked up as a real gate, and
-#: `test_every_gated_driver_is_disclosed` would demand an `OPTIONAL_DRIVERS` entry
-#: for a driver that does not exist. (Both the first draft of the fixture and the
-#: first draft of this very comment tripped it — the check is doing its job.)
-#: The fixture is data *describing* gates, not gates, and composing the call text
-#: at runtime is what says so. Nothing below may spell it out either.
-_GATE = "importorskip"
+def test_an_entry_gated_some_other_way_is_not_called_stale():
+    """The escape hatch Med-2 needed. An entry with `gate=None` is disclosed but
+    is not claimed to be an `importorskip`, so the consistency check must leave it
+    alone rather than demanding it be removed."""
+    otherwise_gated = OptionalDriver(
+        label="no network was available",
+        claim="a claim gated by something other than an import",
+        gate=None,
+        available=lambda: False,
+    )
+
+    assert otherwise_gated.gate not in _gated_in_record()
 
 
 def test_the_scanner_reads_real_importorskip_calls(tmp_path):
-    """The regex against the shapes this suite actually uses, including the
-    multi-line one `conftest.py` and `test_migration_sql.py` are written in."""
+    """The shapes this suite actually uses, including the multi-line one
+    `conftest.py` and `test_migration_sql.py` are written in."""
     (tmp_path / "test_sample.py").write_text(
         textwrap.dedent(
-            f'''
+            '''
             import pytest
 
             def one():
-                pytest.{_GATE}("inline_driver", reason="...")
+                pytest.importorskip("inline_driver", reason="...")
 
             def two():
-                mod = pytest.{_GATE}(
+                return pytest.importorskip(
                     "wrapped_driver",
                     reason="over several lines",
                 )
-                return mod
 
             def three():
-                return pytest.{_GATE}('single_quoted_driver')
+                return pytest.importorskip('single_quoted_driver')
+
+            def four():
+                from pytest import importorskip
+                return importorskip("bare_name_driver")
             '''
         ),
         encoding="utf-8",
@@ -263,11 +458,49 @@ def test_the_scanner_reads_real_importorskip_calls(tmp_path):
         "inline_driver",
         "wrapped_driver",
         "single_quoted_driver",
+        "bare_name_driver",
     }
 
 
+def test_the_scanner_ignores_gates_that_are_only_talked_about(tmp_path):
+    """The trap the AST walk removes. A docstring, a comment and a string being
+    written to a file all contain the characters of a gate and are not gates —
+    the regex this replaced reported all three, and this file tripped it twice
+    during implementation."""
+    (tmp_path / "test_prose.py").write_text(
+        textwrap.dedent(
+            '''
+            """Gate a test on a driver with pytest.importorskip("documented_driver")."""
+
+            # pytest.importorskip("commented_driver") is how the others do it.
+
+            SAMPLE = \'\'\'
+            pytest.importorskip("fixture_driver")
+            \'\'\'
+            '''
+        ),
+        encoding="utf-8",
+    )
+
+    assert _gated_modules(tmp_path) == set()
+
+
+def test_the_scanner_looks_inside_subdirectories(tmp_path):
+    """`glob` rather than `rglob` would make a gate under `tests/<subpkg>/`
+    invisible to both directions of the check. None exists today; the check
+    should not quietly stop working the day one does."""
+    nested = tmp_path / "integration"
+    nested.mkdir()
+    (nested / "test_nested.py").write_text(
+        'import pytest\n\ndef test_x():\n    pytest.importorskip("nested_driver")\n',
+        encoding="utf-8",
+    )
+
+    assert "nested_driver" in _gated_modules(tmp_path)
+
+
 def test_the_scanner_finds_the_gate_this_story_was_filed_about():
-    """Anchored on a real call rather than only on synthetic ones, so the regex
+    """Anchored on a real call rather than only on synthetic ones, so the scanner
     cannot pass its own fixtures while missing the suite."""
     _require_source_tree()
 
@@ -292,12 +525,16 @@ pytest_terminal_summary = _module.pytest_terminal_summary
 '''
 
 
-def _run_pytest_in(directory: Path) -> subprocess.CompletedProcess:
+def _write_conftest(directory: Path) -> None:
     (directory / "conftest.py").write_text(
         _CONFTEST_TEMPLATE.format(path=str(TESTS_DIR / "conftest.py")), encoding="utf-8"
     )
+
+
+def _run_pytest_in(directory: Path, *extra: str) -> subprocess.CompletedProcess:
+    _write_conftest(directory)
     return subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", str(directory)],
+        [sys.executable, "-m", "pytest", "-q", *extra, str(directory)],
         capture_output=True,
         text=True,
         cwd=str(directory),
@@ -305,22 +542,22 @@ def _run_pytest_in(directory: Path) -> subprocess.CompletedProcess:
     )
 
 
-def _absent_driver() -> str:
+def _absent_entry() -> str:
     missing = missing_optional_drivers()
     if not missing:
-        pytest.skip("every optional driver is installed; there is no note to observe")
-    return missing[0]
+        pytest.skip("this environment can satisfy every entry; there is no note to observe")
+    return OPTIONAL_DRIVERS[missing[0]].label
 
 
 def test_the_note_reaches_the_output_of_a_passing_run(tmp_path):
-    driver = _absent_driver()
+    label = _absent_entry()
     (tmp_path / "test_passes.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
     result = _run_pytest_in(tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Not proven by this run" in result.stdout, result.stdout
-    assert driver in result.stdout, result.stdout
+    assert "Whatever this run reported" in result.stdout, result.stdout
+    assert label in result.stdout, result.stdout
 
 
 def test_a_red_run_still_says_what_it_did_not_prove(tmp_path):
@@ -328,7 +565,7 @@ def test_a_red_run_still_says_what_it_did_not_prove(tmp_path):
     exactly when the output mattered most would be worse than none. This also
     pins the half of FR-046 that matters: the note rides along with an exit
     status it did not cause."""
-    driver = _absent_driver()
+    label = _absent_entry()
     (tmp_path / "test_fails.py").write_text(
         "def test_not_ok():\n    assert False\n", encoding="utf-8"
     )
@@ -336,31 +573,22 @@ def test_a_red_run_still_says_what_it_did_not_prove(tmp_path):
     result = _run_pytest_in(tmp_path)
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "Not proven by this run" in result.stdout, result.stdout
-    assert driver in result.stdout, result.stdout
+    assert "Whatever this run reported" in result.stdout, result.stdout
+    assert label in result.stdout, result.stdout
 
 
 def test_the_note_does_not_depend_on_any_test_having_run(tmp_path):
-    """Absence is a fact about the environment, decided by importing rather than
-    by watching which tests skipped. A skip census would report nothing here —
-    and nothing under `-k`, `-x` or a collection error either."""
-    _absent_driver()
+    """Absence is a fact about the environment, decided by asking the record
+    rather than by watching which tests skipped. A skip census would report
+    nothing here — and nothing under `-k`, `-x` or a collection error either."""
+    _absent_entry()
     (tmp_path / "test_none_selected.py").write_text(
         "def test_ok():\n    assert True\n", encoding="utf-8"
     )
-    (tmp_path / "conftest.py").write_text(
-        _CONFTEST_TEMPLATE.format(path=str(TESTS_DIR / "conftest.py")), encoding="utf-8"
-    )
 
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-k", "matches_nothing_at_all", str(tmp_path)],
-        capture_output=True,
-        text=True,
-        cwd=str(tmp_path),
-        timeout=120,
-    )
+    result = _run_pytest_in(tmp_path, "-k", "matches_nothing_at_all")
 
-    assert "Not proven by this run" in result.stdout, result.stdout
+    assert "Whatever this run reported" in result.stdout, result.stdout
 
 
 # --- The README carries the decision ------------------------------------------
@@ -376,19 +604,22 @@ README_MARKERS = (
     "What a bare install does not cover",   # the section exists
     "This is accepted, not overlooked.",    # deliberate, not an oversight
     "ADR-0001 Pillar 2",                    # and *why* it has to be
-    "cannot be read as covering FR-022",   # the misreading it exists to prevent
+    "cannot be read as covering FR-022",    # the misreading it exists to prevent
     "/etc/mado/projects.yaml",              # the hand-off to whoever owns the registry
     "pip install -e '.[dev]'",              # what closes all of it
 )
 
 
-@pytest.mark.parametrize("marker", README_MARKERS)
-def test_the_readme_records_the_decision(marker):
+def _readme_text() -> str:
     readme = REPO_ROOT / "README.md"
     if not readme.is_file():
         pytest.skip("no README.md (e.g. an installed distribution)")
+    return readme.read_text(encoding="utf-8")
 
-    assert marker in readme.read_text(encoding="utf-8"), (
+
+@pytest.mark.parametrize("marker", README_MARKERS)
+def test_the_readme_records_the_decision(marker):
+    assert marker in _readme_text(), (
         f"README.md no longer records {marker!r} — the choice to accept this coverage gap has to "
         "stay written down, or it reverts to looking like an oversight."
     )
@@ -399,11 +630,7 @@ def test_the_readme_lists_every_disclosed_driver(name):
     """The table and the note are rendered from different places and must agree.
     A driver in the note but not the table sends its reader to a document that
     does not mention it."""
-    readme = REPO_ROOT / "README.md"
-    if not readme.is_file():
-        pytest.skip("no README.md (e.g. an installed distribution)")
-
-    section = readme.read_text(encoding="utf-8").split("## Develop")[-1]
+    section = _readme_text().split("## Develop")[-1]
 
     assert f"`{name}`" in section, (
         f"README.md's 'Develop' section does not mention {name}, which tests/conftest.py "

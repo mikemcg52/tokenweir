@@ -81,15 +81,25 @@ scoped to AMQP, since the record covers four drivers.
    reporter so it respects `-q` and capture. It cannot influence exit status, which is what makes
    FR-046 true by construction rather than by care.
 
-4. **The consistency check is bidirectional, and that is the load-bearing test.** Scanning the test
-   sources for `importorskip("...")` and requiring the set to equal the record's keys catches both
-   drifts: a new gated driver nobody disclosed, and a disclosed driver nothing gates on any more.
-   A one-directional check would let the record quietly become a list of historical claims.
+4. **The consistency check is bidirectional, and that is the load-bearing test.** Finding the
+   `importorskip` calls across `tests/` and requiring the set to equal the record's gated entries
+   catches both drifts: a new gated driver nobody disclosed, and a disclosed driver nothing gates on
+   any more. A one-directional check would let the record quietly become a list of historical claims.
 
-   The scan is over test source text. That is a real limitation — a dynamically-constructed module
-   name would be missed — and it is accepted: every gate in this suite is a literal, the check's job
-   is to catch the ordinary accident, and a heavier mechanism would cost more than the drift it
-   prevents. Recorded here rather than discovered in review.
+   **The scan parses rather than greps** *(changed in fix round 1, review 1's Low-4 and Low-5)*. The
+   first version matched source text, which meant it also matched this story's own test fixtures —
+   and then the comment explaining why the fixtures were a problem — reporting both as real gates
+   with a message pointing at `OPTIONAL_DRIVERS`. That made a rule nobody could see: no test file may
+   ever spell a gate out. An AST walk has no such trap, because a call is a `Call` node and the same
+   characters in a docstring or a string literal are not; it also recurses into subdirectories, which
+   the original `glob("*.py")` did not.
+
+   A dynamically-constructed module name is still missed, and that is accepted: every gate in this
+   suite is a literal, and the check's job is the ordinary accident.
+
+   An entry may also declare **no** gate, for one gated by something other than an import — which is
+   what the Postgres entry needs, since a server is not a module. Without that escape hatch the check
+   would demand the entry's removal.
 
    `conftest.py`'s own `importorskip` for `psycopg` is inside the scan's reach, which is what makes
    the Postgres entry provable rather than asserted; `pgserver` is gated by a plain `try: import`
@@ -111,11 +121,21 @@ scoped to AMQP, since the record covers four drivers.
 
 Four groups, in the repository's existing idiom:
 
-- **The hook's behaviour**, driven through pytest's own `pytester` fixture where a real subprocess
-  run is needed, and directly on the rendering function otherwise. Directly is preferred: the
-  function that turns "these drivers are missing" into lines is pure, so absence can be simulated
-  without an environment that actually lacks them, and the present-driver cases (FR-045, SC-039)
-  become testable in an environment where the drivers happen to be installed.
+- **The hook's behaviour**, driven through a **plain subprocess** where a real run is needed, and
+  directly on the rendering function otherwise. Subprocess rather than pytest's `pytester` fixture,
+  which would mean registering that plugin for every run of this suite; the temporary conftest loads
+  the real one by path under a distinct module name. *(This paragraph said `pytester` until fix
+  round 1 — review 1's Low-3 caught the plan describing a mechanism that did not ship.)*
+
+  Directly is preferred where it works: the function that turns "these entries are missing" into
+  lines is pure, so absence can be simulated without an environment that actually lacks them, and
+  the present-driver cases (FR-045, SC-039) become testable in an environment where the drivers
+  happen to be installed.
+
+  **But not only directly** — review 1's Med-1. Handing the renderer a ready-made list of missing
+  names leaves the predicate that *builds* that list untested, and a mutant returning every entry
+  passed the whole file while printing "pika is not installed" on a machine with pika 1.4.4. The
+  predicate needs its own tests against real modules, not just stubs.
 - **The detector itself**, per `test_repo_hygiene.py`'s explicit convention: without tests that
   stub the record and confirm the checks then fail, a check that always passes looks identical to a
   check that works.

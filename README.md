@@ -720,16 +720,21 @@ ordinary install red — but it means a bare run silently proves less than it ap
 | --- | --- |
 | `pika` | **FR-022** — persistent messages with a JSON content type — is checked only against the test double. The double accepts any keyword at all, so it would not notice `publish_properties()` emitting a key that real `pika.BasicProperties` rejects. |
 | `jsonschema` | The published `schema/usage-record.v1.json` is never run through a JSON Schema engine; payload validity is checked only by this package's own code. |
-| `psycopg` (with `pgserver` or `$TOKENWEIR_TEST_DSN`) | The whole real-Postgres suite: the writer, the source and the migrations against an actual server. Concurrency and adoption behaviour are only observable there. |
+| `psycopg`, **and** a server — either `$TOKENWEIR_TEST_DSN` or `pgserver` | The whole real-Postgres suite: the writer, the source and the migrations against an actual server. Concurrency and adoption behaviour are only observable there. Note this one needs both: the driver on its own proves nothing, so the run reports it missing until a server is reachable too. |
 | `pglast` | The migration SQL is never parsed by libpg_query, the server's own parser. |
 | `build` | SC-001 is checked against the packaging declaration rather than by building a wheel and looking inside it. |
 
 **This is accepted, not overlooked.** The alternative is making a broker library a dependency of a
 metering contract that must not have one, which costs more than the coverage is worth. So the suite
-now says so out loud instead: every run ends by naming the drivers it could not import and the claim
-each absence forfeits, so a green CI log
-**cannot be read as covering FR-022** against the real driver. `tests/conftest.py` holds that list, and `tests/test_optional_drivers.py` keeps it equal to
-the set of drivers the suite actually gates on — so it cannot drift as tests are added.
+says so out loud instead: every run ends by naming what this environment could not supply and the
+claim each absence forfeits, so a green CI log
+**cannot be read as covering FR-022** against the real driver. The note appears on failing and
+interrupted runs too, and never changes a run's exit status — it reports on the environment, not on
+the result.
+
+`tests/conftest.py` holds that record and `tests/test_optional_drivers.py` keeps it honest: equal to
+the set of drivers the suite actually gates on, in both directions, so it cannot drift as tests are
+added or removed.
 
 ### If you run this project's CI
 
