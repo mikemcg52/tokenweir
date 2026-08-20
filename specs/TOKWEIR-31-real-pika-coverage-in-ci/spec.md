@@ -235,10 +235,23 @@ the disclosure table does not know about, and confirm the suite goes red.
   from a green run on any machine with the driver and no server, which is this story's own bug one
   entry over. An entry's wording MUST remain true in that case, so it MUST NOT be phrased as "X is
   not installed" where X may well be installed.
+
+  *One residual is accepted (review 2, Low-1).* `pgserver` that imports but fails to **start** still
+  goes unreported: seeing that would mean starting a database from inside a reporting hook on every
+  run, which costs more than the rare under-report — and that case already carries a loud skip reason
+  naming the failure. The condition above is therefore the fixtures' condition as far as it can be
+  known without side effects, not beyond.
 - **FR-044**: The report MUST be a small, fixed number of lines that names the forfeited claims —
   not a per-test enumeration. `pytest -ra` is explicitly rejected as the mechanism (see Context).
 - **FR-045**: The report MUST NOT appear for a driver that is present, and MUST NOT appear at all
   when every optional driver is present.
+- **FR-046a** *(added in fix round 2, from review 2's Med-2)*: The guarantee in FR-046 MUST hold for
+  the whole report, not only for the import probe. Any failure while deciding what is missing or
+  rendering it MUST be contained and reported as one line, leaving the run's exit status alone. The
+  original text was satisfied by a guarded probe while an unguarded predicate elsewhere produced an
+  `INTERNALERROR` and a non-zero exit on a run whose tests had all passed — and the `psycopg` entry
+  is already such a predicate, so this was one entry from being live. A report about the environment
+  is never the reason a run fails.
 - **FR-046**: The report MUST NOT alter the run's exit status, MUST NOT fail or error any test, and
   MUST NOT raise for an import that fails in any ordinary way — including one that raises something
   other than `ImportError`, and including `SystemExit`, which a module calling `sys.exit()` at import
@@ -261,7 +274,12 @@ the disclosure table does not know about, and confirm the suite goes red.
   can act on them.
 - **FR-050**: The load-bearing sentences of FR-048 and FR-049 MUST be guarded by tests keyed on
   marker strings, following the existing convention, so the prose stays free to change around them
-  but cannot disappear.
+  but cannot disappear. *Strengthened in fix round 2, from review 2's Med-1.* Each marker MUST be
+  unique to the section it guards: two of the original six matched prose elsewhere in `README.md`
+  that predates this story, so the sentences they were named for could be deleted with the suite
+  green. The guard MUST also cover what each omission *forfeits*, not merely that the driver is
+  named — the entire "what goes unchecked" column could be replaced with placeholder text and
+  nothing noticed.
 - **FR-051**: The set of drivers in the disclosure MUST be checked against the set the test suite
   actually gates on, in both directions: a gated module missing from the disclosure MUST fail, and
   a disclosed module nothing gates on MUST fail. The record MUST be able to hold an entry gated by
@@ -280,7 +298,11 @@ the disclosure table does not know about, and confirm the suite goes red.
 ### Key Entities
 
 - **Optional driver disclosure** — the repository's single record of which importable third-party
-  packages the suite gates on, and what claim goes unproven when each is missing. It is what the
+  **Python packages** the suite gates on, and what claim goes unproven when each is missing. External
+  binaries the suite also gates on — `node` for the ECMA-262 check, `git` for the hygiene checks —
+  are deliberately out of scope: a binary has no import to probe, both are present everywhere this
+  project runs, and widening to them is a separate concern. *(Boundary named explicitly in fix round
+  2, from review 2's Low-2, so the note's silence about them is known rather than accidental.)* It is what the
   terminal note is rendered from and what the consistency check in FR-051 is checked against, so
   the log, the check and the README cannot disagree.
 

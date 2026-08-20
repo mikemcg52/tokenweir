@@ -87,13 +87,15 @@ the consistency check are all rendered from or keyed to it.
 - **T013 also caught this story's own test file twice** — first the fixture that spells out a gate
   literally, then the comment explaining why the fixture must not. Both are recorded in
   `test_optional_drivers.py`; the fixture now composes the call text at runtime.
-- **T019 measured, not assumed.** Bare venv: 856 passed / 81 skipped, note lists five drivers.
-  Plus `pika` and `jsonschema`: 880 passed / 57 skipped, both FR-022 tests execute and pass against
-  pika 1.4.4, and those two entries drop out of the note. Full `.[dev]`: 934 passed / 3 skipped and
-  **no note at all**.
-- **T020 was run rather than asserted.** Removing a README marker, adding an undisclosed gate, and
-  leaving a stale entry each turned the suite red with a message naming the fix; all three were
-  reverted and the suite returned to 856 / 81.
+- **T019 measured, not assumed.** Counts below are as of the latest fix round; the figures recorded
+  here after round 1 were left stale and review 2 (Low-5) caught it. Bare venv: **881 passed / 81
+  skipped**, note lists five entries. Plus `pika` and `jsonschema`: both FR-022 tests execute and
+  pass against pika 1.4.4, and those two entries drop out of the note. Full `.[dev]`: **959 passed /
+  3 skipped** and **no note at all**.
+- **T020 was run rather than asserted** — though not thoroughly enough the first time. Round 1
+  exercised *one* README marker; review 2 (Med-1) showed two of the six were satisfied by prose
+  elsewhere in the README and guarded nothing. Fix round 2 runs all six individually, plus the
+  table-gutting case.
 
 ## Phase 7 (fix round 1): what review 1 found
 
@@ -121,3 +123,37 @@ the consistency check are all rendered from or keyed to it.
       this story's own test file twice — and it recurses into subdirectories. Tests for all three.
 - [x] **T028** *(Low-6)* Catch `SystemExit` in the probe, and amend FR-046 to say `KeyboardInterrupt`
       deliberately propagates rather than leaving `except Exception` looking like an oversight.
+
+## Phase 8 (fix round 2): what review 2 found
+
+- [x] **T029** *(Med-1)* Replace the two markers that pinned nothing. `"ADR-0001 Pillar 2"` and
+      `"pip install -e '.[dev]'"` each appear three times in `README.md`, twice in prose predating
+      this story, so FR-048's rationale paragraph and FR-049's option-2 hand-off could both be
+      deleted with the suite green. Now keyed on substrings unique to the section, and **all six
+      deletions were run** — each fails exactly one test. (FR-050, SC-038)
+- [x] **T030** *(Med-1)* Give the table teeth on the forfeit column. `test_the_readme_lists_every
+      _disclosed_driver` asserted only that the driver's name appeared somewhere after `## Develop`,
+      so every "what goes unchecked" cell could be replaced with "TBD" in silence — the column the
+      section exists for. Now each row must be a two-cell row whose second cell is substantive;
+      gutting the table fails five tests. (FR-048)
+- [x] **T031** *(Med-2)* Guard the whole terminal-summary body, not just the import probe. An
+      availability predicate that raised escaped into pytest as an `INTERNALERROR` with a non-zero
+      exit on a run whose tests had all passed, and the `psycopg` entry is already a non-import
+      predicate — one entry from live. FR-046a added; the code comment claiming the property held
+      "by construction" was false and is corrected. (FR-046a)
+- [x] **T032** *(Med-3)* Test that the documentation checks skip rather than fail off a source tree,
+      in `test_repo_hygiene.py`'s `pytest.raises(pytest.skip.Exception)` idiom that plan.md claimed
+      this file already followed. Four added. (FR-054)
+- [x] **T033** *(Med-3)* Delete `_require_source_tree()`. It could never fire — `TESTS_DIR` is the
+      directory the calling file lives in — so it read as protection and provided none.
+- [x] **T034** *(Low-1)* Record the residual: `pgserver` that imports but will not start is still
+      unreported, because seeing that would mean starting a database inside a reporting hook.
+      Written into FR-043a and the predicate's docstring rather than left to be rediscovered.
+- [x] **T035** *(Low-2)* Name the record's boundary — Python packages only, not the `node` and `git`
+      binaries the suite also gates on — so the note's silence about them is known, not accidental.
+- [x] **T036** *(Low-3)* Correct plan.md: the Postgres entry keeps `gate="psycopg"` and does not use
+      the `gate=None` hatch. The plan described the code it almost was.
+- [x] **T037** *(Low-4)* Survive `--import-mode=importlib`, under which this file was the only thing
+      on the branch that failed to collect. The conftest is imported normally with a load-by-path
+      fallback, and the tests patch the module object rather than the string `"conftest"`.
+- [x] **T038** *(Low-5)* Refresh the stale counts recorded above.

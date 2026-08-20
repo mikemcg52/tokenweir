@@ -41,18 +41,46 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from conftest import (
-    OPTIONAL_DRIVERS,
-    OptionalDriver,
-    _driver_is_importable,
-    _importable_driver,
-    _postgres_suite_can_run,
-    disclosure_lines,
-    missing_optional_drivers,
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
+
+
+def _load_conftest():
+    """The module under test, in whichever import mode pytest is using.
+
+    A plain `from conftest import ...` works only under the default `prepend`
+    mode, which puts `tests/` on `sys.path`; under `--import-mode=importlib` this
+    file was the one thing on the branch that failed to collect (review 2, Low-4).
+    The fallback loads it by path.
+
+    The *module object* is what gets returned and what the tests monkeypatch,
+    rather than the string `"conftest"`: under the fallback there is no
+    `sys.modules["conftest"]` to resolve such a target against, and patching a
+    second copy of the module would silently patch nothing.
+    """
+    try:
+        import conftest
+
+        return conftest
+    except ImportError:
+        spec = importlib.util.spec_from_file_location(
+            "_tokenweir_conftest_under_test", TESTS_DIR / "conftest.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
+conftest = _load_conftest()
+
+OPTIONAL_DRIVERS = conftest.OPTIONAL_DRIVERS
+OptionalDriver = conftest.OptionalDriver
+_driver_is_importable = conftest._driver_is_importable
+_importable_driver = conftest._importable_driver
+_postgres_suite_can_run = conftest._postgres_suite_can_run
+disclosure_lines = conftest.disclosure_lines
+missing_optional_drivers = conftest.missing_optional_drivers
 
 #: A stand-in record, so the renderer's behaviour is checked against something
 #: fixed rather than against whatever this machine happens to have installed.
@@ -257,7 +285,7 @@ def test_missing_drivers_come_back_in_the_records_order():
 def test_postgres_needs_more_than_the_driver(monkeypatch):
     monkeypatch.delenv("TOKENWEIR_TEST_DSN", raising=False)
     monkeypatch.setattr(
-        "conftest._driver_is_importable", lambda name: name == "psycopg"
+        conftest, "_driver_is_importable", lambda name: name == "psycopg"
     )
 
     assert not _postgres_suite_can_run(), (
@@ -268,7 +296,7 @@ def test_postgres_needs_more_than_the_driver(monkeypatch):
 
 def test_postgres_is_available_with_a_driver_and_a_configured_dsn(monkeypatch):
     monkeypatch.setenv("TOKENWEIR_TEST_DSN", "postgresql://example/scratch")
-    monkeypatch.setattr("conftest._driver_is_importable", lambda name: name == "psycopg")
+    monkeypatch.setattr(conftest, "_driver_is_importable", lambda name: name == "psycopg")
 
     assert _postgres_suite_can_run()
 
@@ -276,7 +304,7 @@ def test_postgres_is_available_with_a_driver_and_a_configured_dsn(monkeypatch):
 def test_postgres_is_available_with_a_driver_and_an_embedded_server(monkeypatch):
     monkeypatch.delenv("TOKENWEIR_TEST_DSN", raising=False)
     monkeypatch.setattr(
-        "conftest._driver_is_importable", lambda name: name in {"psycopg", "pgserver"}
+        conftest, "_driver_is_importable", lambda name: name in {"psycopg", "pgserver"}
     )
 
     assert _postgres_suite_can_run()
@@ -287,7 +315,7 @@ def test_postgres_without_the_driver_is_never_available(monkeypatch):
     this predicate has to agree with them or the note describes a different suite
     from the one that ran."""
     monkeypatch.setenv("TOKENWEIR_TEST_DSN", "postgresql://example/scratch")
-    monkeypatch.setattr("conftest._driver_is_importable", lambda name: False)
+    monkeypatch.setattr(conftest, "_driver_is_importable", lambda name: False)
 
     assert not _postgres_suite_can_run()
 
@@ -352,14 +380,17 @@ def _gated_in_record() -> set[str]:
     return {driver.gate for driver in OPTIONAL_DRIVERS.values() if driver.gate is not None}
 
 
-def _require_source_tree() -> None:
-    if not TESTS_DIR.is_dir() or not any(TESTS_DIR.glob("test_*.py")):
-        pytest.skip("no test sources to scan (e.g. an installed distribution)")
+# There is deliberately no "skip if there are no test sources" guard on the two
+# checks below, and its absence is the point. An earlier draft had one; review 2
+# showed it could never fire — `TESTS_DIR` is the directory this very file lives
+# in, so if this test is running, the sources it scans are right there. A guard
+# that cannot fire is worse than none: it reads as protection and provides none.
+# The README and pyproject checks below are a different matter and do skip, since
+# those files really can be absent from an installed distribution.
 
 
 def test_every_gated_driver_is_disclosed():
     """The original bug, one file over: a forfeit nobody is told about."""
-    _require_source_tree()
     undisclosed = _gated_modules() - _gated_in_record()
 
     assert not undisclosed, (
@@ -373,7 +404,6 @@ def test_every_disclosed_driver_is_actually_gated():
     """The other direction. A record that only ever grows becomes a list of
     historical claims, and the note starts reporting forfeits that no longer
     exist."""
-    _require_source_tree()
     stale = _gated_in_record() - _gated_modules()
 
     assert not stale, (
@@ -502,7 +532,6 @@ def test_the_scanner_looks_inside_subdirectories(tmp_path):
 def test_the_scanner_finds_the_gate_this_story_was_filed_about():
     """Anchored on a real call rather than only on synthetic ones, so the scanner
     cannot pass its own fixtures while missing the suite."""
-    _require_source_tree()
 
     assert "pika" in _gated_modules()
 
@@ -603,10 +632,15 @@ def test_the_note_does_not_depend_on_any_test_having_run(tmp_path):
 README_MARKERS = (
     "What a bare install does not cover",   # the section exists
     "This is accepted, not overlooked.",    # deliberate, not an oversight
-    "ADR-0001 Pillar 2",                    # and *why* it has to be
+    # FR-048's mandated reason. The bare string "ADR-0001 Pillar 2" was used here
+    # until fix round 2 and pinned nothing: it appears three times in this README,
+    # so the whole rationale paragraph could be deleted with the suite still green.
+    "transport-free by contract (ADR-0001 Pillar 2)",
     "cannot be read as covering FR-022",    # the misreading it exists to prevent
-    "/etc/mado/projects.yaml",              # the hand-off to whoever owns the registry
-    "pip install -e '.[dev]'",              # what closes all of it
+    "/etc/mado/projects.yaml",              # option 1, handed to the registry's owner
+    # Likewise: "pip install -e '.[dev]'" appears three times, including twice in
+    # prose that predates this story, so it did not guard option 2's hand-off.
+    "to close all of them, make the step",
 )
 
 
@@ -625,16 +659,47 @@ def test_the_readme_records_the_decision(marker):
     )
 
 
+def _develop_section() -> str:
+    return _readme_text().split("## Develop")[-1]
+
+
+def _table_row_for(name: str) -> str:
+    """The row of the "what a bare install omits" table that covers `name`."""
+    rows = [
+        line
+        for line in _develop_section().splitlines()
+        if line.startswith("|") and f"`{name}`" in line
+    ]
+    assert len(rows) == 1, (
+        f"expected exactly one README table row mentioning {name}, found {len(rows)}. The table "
+        "and tests/conftest.py's record have to line up one for one."
+    )
+    return rows[0]
+
+
 @pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
 def test_the_readme_lists_every_disclosed_driver(name):
     """The table and the note are rendered from different places and must agree.
     A driver in the note but not the table sends its reader to a document that
     does not mention it."""
-    section = _readme_text().split("## Develop")[-1]
-
-    assert f"`{name}`" in section, (
+    assert f"`{name}`" in _develop_section(), (
         f"README.md's 'Develop' section does not mention {name}, which tests/conftest.py "
         "discloses. The table and the run's own note have to agree."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(OPTIONAL_DRIVERS))
+def test_the_readme_says_what_each_omission_forfeits(name):
+    """Naming the driver is half of FR-048; the other half is saying what its
+    absence costs, and until fix round 2 nothing guarded it. Review 2 replaced
+    every "What goes unchecked" cell in the table with "TBD" and the suite stayed
+    green — the column the section exists for could be gutted in silence."""
+    cells = [cell.strip() for cell in _table_row_for(name).strip().strip("|").split("|")]
+
+    assert len(cells) == 2, f"the {name} row is not a two-column table row: {cells}"
+    assert len(cells[1]) > 60, (
+        f"README.md's table says nothing substantive about what losing {name} costs: "
+        f"{cells[1]!r}. FR-048 requires the forfeited coverage to be named, not just the driver."
     )
 
 
@@ -684,3 +749,101 @@ def test_the_amqp_adapter_still_imports_without_pika():
     assert importlib.util.find_spec("tokenweir.amqp") is not None
 
     import tokenweir.amqp  # noqa: F401
+
+
+# --- The report can never be the reason a run fails (review 2, Med-2) ---------
+
+
+def test_a_predicate_that_raises_does_not_take_the_run_down(tmp_path):
+    """Only the import probe was guarded, so any *other* predicate that raised
+    escaped into pytest as an INTERNALERROR with a non-zero exit — on a run whose
+    tests had all passed. The `psycopg` entry is already a non-import predicate,
+    so this was one entry away from being live rather than hypothetical.
+
+    Run in a subprocess against a record whose predicate raises, because what is
+    being asserted is the exit status of a real pytest invocation.
+    """
+    (tmp_path / "test_passes.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    (tmp_path / "conftest.py").write_text(
+        textwrap.dedent(
+            f'''
+            import importlib.util
+
+            _spec = importlib.util.spec_from_file_location(
+                "_tokenweir_conftest", {str(TESTS_DIR / "conftest.py")!r}
+            )
+            _module = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_module)
+
+
+            def _explode():
+                raise ValueError("the predicate is broken")
+
+
+            _module.OPTIONAL_DRIVERS = {{
+                "broken": _module.OptionalDriver(
+                    label="broken is not installed",
+                    claim="a claim whose availability predicate raises",
+                    gate=None,
+                    available=_explode,
+                )
+            }}
+
+            pytest_terminal_summary = _module.pytest_terminal_summary
+            '''
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        timeout=120,
+    )
+
+    assert result.returncode == 0, (
+        "a broken disclosure predicate changed the run's verdict:\n" + result.stdout + result.stderr
+    )
+    assert "INTERNALERROR" not in result.stdout + result.stderr
+    assert "could not report what this run did not prove" in result.stdout, result.stdout
+
+
+# --- Documentation checks skip rather than fail (FR-054, review 2 Med-3) ------
+#
+# `test_repo_hygiene.py` asserts its own skips with `pytest.raises(pytest.skip
+# .Exception)` for exactly this reason, and plan.md claimed this file followed
+# that convention while nothing here did. A check that is supposed to skip on an
+# installed distribution and instead fails turns an ordinary install red, which
+# is the thing FR-006 forbids and this whole story is careful about elsewhere.
+
+
+def test_the_readme_check_skips_when_there_is_no_readme(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(pytest.skip.Exception):
+        _readme_text()
+
+
+def test_the_pyproject_check_skips_when_there_is_no_pyproject(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(pytest.skip.Exception):
+        _pyproject()
+
+
+def test_the_readme_markers_skip_rather_than_fail_off_a_source_tree(tmp_path, monkeypatch):
+    """The parametrized guard itself, not just its helper — it is the one a
+    consumer running the installed tests would actually hit."""
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(pytest.skip.Exception):
+        test_the_readme_records_the_decision(README_MARKERS[0])
+
+
+def test_the_dependency_guard_skips_rather_than_fails_off_a_source_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    with pytest.raises(pytest.skip.Exception):
+        test_the_core_requires_no_driver_at_all()

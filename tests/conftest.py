@@ -248,6 +248,15 @@ def _postgres_suite_can_run() -> bool:
     when psycopg is importable **and** there is either a configured DSN or a
     `pgserver` to start one. Any other reading discloses the wrong thing —
     see `OptionalDriver.available`.
+
+    **One residual, deliberately left** (review 2, Low-1). `_embedded_dsn` skips
+    when an importable `pgserver` fails to *start*, and this predicate cannot see
+    that: it would have to start a server to find out, inside a reporting hook,
+    on every run. So an environment where pgserver imports and will not run is
+    still told nothing. The trade is one rare under-report against starting a
+    database to write a log line, and the rare case is the one already carrying a
+    loud skip reason naming the failure. Recorded here and in FR-043a rather than
+    left for the next reader to find.
     """
     if not _driver_is_importable("psycopg"):
         return False
@@ -265,6 +274,15 @@ def _importable_driver(module_name: str, claim: str) -> OptionalDriver:
 
 
 #: Every optional driver the suite gates on, and what its absence forfeits.
+#:
+#: **Python packages only.** The suite also gates on external binaries — `node`
+#: for FR-024's ECMA-262 check, `git` for the repository-hygiene checks — and
+#: those are out of this record's scope, so the note is a report on optional
+#: drivers rather than an exhaustive census of everything a run skipped. Both are
+#: present in every environment this project targets and neither has ever gone
+#: missing; widening to them is a separate concern with its own consistency
+#: problem (a binary has no import to probe). Named here so the note's silence
+#: about them is a known boundary rather than an oversight.
 #:
 #: Keys line up with the modules gated by `pytest.importorskip`, and
 #: `test_optional_drivers.py` enforces that in both directions: a new gate nobody
@@ -361,14 +379,30 @@ def pytest_terminal_summary(terminalreporter) -> None:
     `pytest_terminal_summary` rather than a print at collection time: it fires once
     per invocation — including a failed or interrupted one, whose reader needs this
     no less — writes through the terminal reporter so it honours `-q` and capture,
-    and structurally cannot influence the exit status. That last property is what
-    makes "a forfeited claim is a reporting fact, not a failure" true by
-    construction rather than by care.
-    """
-    lines = disclosure_lines(missing_optional_drivers())
-    if not lines:
-        return
+    and cannot fail or error a test.
 
-    terminalreporter.write_sep("=", "not proven by this run", yellow=True)
-    for line in lines:
-        terminalreporter.write_line(line)
+    **The whole body is guarded**, which review 2 showed was not merely belt and
+    braces. An earlier version claimed the no-exit-status-effect property held "by
+    construction"; it did not. Only the *import* probe was protected, so any other
+    predicate that raised escaped into pytest and produced an `INTERNALERROR` with
+    a non-zero exit on a run whose tests had all passed. The `psycopg` entry is
+    already a non-import predicate, so that was one entry away from being live.
+
+    A report about the environment must never be the reason a run fails. If this
+    cannot render, it says so in one line and gets out of the way — the run's
+    verdict is not the disclosure's to change. `KeyboardInterrupt` still
+    propagates, being no `Exception`, for the reason FR-046 records.
+    """
+    try:
+        lines = disclosure_lines(missing_optional_drivers())
+        if not lines:
+            return
+
+        terminalreporter.write_sep("=", "not proven by this run", yellow=True)
+        for line in lines:
+            terminalreporter.write_line(line)
+    except Exception as exc:  # pragma: no cover - exercised via subprocess
+        terminalreporter.write_line(
+            f"could not report what this run did not prove: {exc!r} "
+            "(tests/conftest.py, OPTIONAL_DRIVERS)"
+        )

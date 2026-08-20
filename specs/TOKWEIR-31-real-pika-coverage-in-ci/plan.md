@@ -97,9 +97,13 @@ scoped to AMQP, since the record covers four drivers.
    A dynamically-constructed module name is still missed, and that is accepted: every gate in this
    suite is a literal, and the check's job is the ordinary accident.
 
-   An entry may also declare **no** gate, for one gated by something other than an import — which is
-   what the Postgres entry needs, since a server is not a module. Without that escape hatch the check
-   would demand the entry's removal.
+   An entry may also declare **no** gate, for one gated by something other than an import. The
+   Postgres entry does **not** use it — it keeps `gate="psycopg"`, because psycopg genuinely is
+   gated by an `importorskip` and only the *availability* question needed widening. *(This paragraph
+   claimed otherwise until fix round 2; review 2's Low-3 caught the plan describing the code it
+   almost was.)* The hatch is kept because FR-051 requires the record to be able to hold such an
+   entry, and the alternative — a check that demands every entry be an `importorskip` — is the
+   corner Med-2's fix would otherwise have been painted into.
 
    `conftest.py`'s own `importorskip` for `psycopg` is inside the scan's reach, which is what makes
    the Postgres entry provable rather than asserted; `pgserver` is gated by a plain `try: import`
