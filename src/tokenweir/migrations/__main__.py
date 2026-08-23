@@ -9,8 +9,11 @@ Exit codes: ``0`` success, ``1`` a refusal or a database error (reported as a
 message, not a traceback — an operator reading a deploy log is not debugging this
 library), ``2`` a usage error from argparse.
 
-    python -m tokenweir.migrations status --dsn "$DSN"
-    python -m tokenweir.migrations apply  --dsn "$DSN" --reader-role metrics_reader
+    python -m tokenweir.migrations status    --dsn "$DSN"
+    python -m tokenweir.migrations apply     --dsn "$DSN" --reader-role metrics_reader
+    python -m tokenweir.migrations reconcile --dsn "$DSN"            # plans, changes nothing
+    python -m tokenweir.migrations reconcile --dsn "$DSN" --apply \
+        --baseline-effective-from 2024-01-01
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import re
 import sys
 from typing import Optional, Sequence
 
+from tokenweir import reconcile as reconciler
 from tokenweir.migrations import (
     MigrationError,
     _iter_versions,
@@ -109,6 +113,20 @@ def _redact(message: str, dsn: str) -> str:
     return message
 
 
+def _baseline(value: str) -> str:
+    """argparse type for ``--baseline-effective-from``.
+
+    Validated by the module that will use it, so the CLI cannot come to a
+    different conclusion about what a date is, and re-raised as an
+    ``ArgumentTypeError`` so a typo is a usage error (exit 2) rather than a
+    refusal from deep inside a database session (exit 1).
+    """
+    try:
+        return reconciler._normalise_baseline(value) or value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _common_options() -> argparse.ArgumentParser:
     """Options accepted on either side of the subcommand.
 
@@ -187,6 +205,37 @@ def _build_parser() -> argparse.ArgumentParser:
             "store that has none; you are then responsible for not racing."
         ),
     )
+
+    reconcile_parser = sub.add_parser(
+        "reconcile",
+        help=(
+            "compare a database somebody else migrated against tokenweir's schema, "
+            "and optionally bring it over."
+        ),
+        parents=[common],
+    )
+    reconcile_parser.add_argument(
+        "--apply",
+        action="store_true",
+        dest="apply_plan",
+        help=(
+            "execute the plan, in one transaction. Without this the command only "
+            "prints what it would do and changes nothing — run it against a restored "
+            "dump of the database first, and read the plan."
+        ),
+    )
+    reconcile_parser.add_argument(
+        "--baseline-effective-from",
+        type=_baseline,
+        metavar="DATE",
+        help=(
+            "the date existing model_pricing_rates rows are taken to have been in "
+            "force from, when that table has to be restructured from current-valued "
+            "to effective-dated. ISO date, or '-infinity' for 'these were always the "
+            "rates'. There is no default: the answer changes what every historical "
+            "row costs."
+        ),
+    )
     return parser
 
 
@@ -244,6 +293,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"pending:  {_iter_versions(outstanding)}")
             return 0
 
+        if args.command == "reconcile":
+            return _reconcile(connection, args)
+
         applied = apply(
             connection,
             reader_role=_resolve(args, "reader_role", READER_ROLE_ENV_VAR),
@@ -255,7 +307,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             print("applied:  (none) — already up to date")
         return 0
-    except MigrationError as exc:
+    except (MigrationError, reconciler.ReconcileError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
@@ -266,6 +318,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             connection.close()
         except Exception:  # pragma: no cover - nothing useful to do
             pass
+
+
+def _reconcile(connection, args: argparse.Namespace) -> int:
+    """`reconcile`, plan-first.
+
+    The plan is printed **before** anything is applied and whether or not
+    ``--apply`` was passed, so a log of a run that changed the database still says
+    what it changed. `apply` re-derives the plan itself and refuses if the database
+    moved underneath this one (`reconcile.apply`'s `existing_plan`), which is what
+    makes printing-then-applying honest rather than merely conventional.
+
+    Exit 0 for a plan — it is a report, like `status`, and reports succeed even
+    when what they report is bad news. Exit 1 only for a refusal to *act*.
+    """
+    proposed = reconciler.plan(
+        connection, baseline_effective_from=args.baseline_effective_from
+    )
+    print(proposed.render())
+
+    if not args.apply_plan:
+        if not proposed.is_empty:
+            print("")
+            print("Nothing was changed. Re-run with --apply to execute this plan.")
+        return 0
+
+    applied = reconciler.apply(connection, proposed)
+    print("")
+    if applied.is_empty:
+        print("reconciled: (none) — already matches tokenweir's schema")
+    else:
+        count = len(applied.discrepancies)
+        print(
+            f"reconciled: {count} {'discrepancy' if count == 1 else 'discrepancies'}, "
+            f"{len(applied.statements)} statement(s), in one transaction"
+        )
+    return 0
 
 
 if __name__ == "__main__":

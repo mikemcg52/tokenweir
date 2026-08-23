@@ -1,0 +1,741 @@
+"""Reconciling a gateway-shaped database with tokenweir's schema (TOKWEIR-10).
+
+Against a **real Postgres**, like every other correctness test in this project and
+for the same reason: what is asserted here is what a server does with DDL against
+a table that has rows in it, and a mock of a database only proves the code calls
+the mock. These skip with a message naming `TOKENWEIR_TEST_DSN` when no server is
+available — see `tests/conftest.py`, and note that `pip install -e '.[dev]'` is
+enough, because `pgserver` ships the binaries.
+
+**`LEGACY_SQL` below is a reconstruction, and that is the one thing to know about
+this file.** The story says the authoritative comparison is against a dump of the
+live `ai_gateway_metrics`, and there is no such dump reachable from the pod this
+was written in — the same environment fact the TOKWEIR-5 hand-off recorded, which
+is why tokenweir's own migrations 001-006 are a reconstruction too. What is here
+is built from the story's three known deltas and that comment, in **one place**,
+so that whoever finally has the dump has exactly one thing to correct.
+
+The design is what narrows the gap rather than the fixture: `tokenweir.reconcile`
+introspects the database in front of it and refuses what it does not recognise, so
+being wrong about the legacy shape produces a refusal on the real database rather
+than a wrong reconciliation. Several tests below deliberately deform `LEGACY_SQL`
+in ways nobody has claimed the live database has — an extra column, a duplicated
+rate, a dependent view — because the shapes the reconciler has never seen are
+exactly the ones worth knowing it will not damage.
+"""
+
+import datetime
+
+import pytest
+
+from tokenweir import UsageRecord
+from tokenweir.postgres import PostgresSource
+from tokenweir.reconcile import (
+    REFERENCE_SCHEMA_PREFIX,
+    ManualResolutionError,
+    PlanStaleError,
+    ReconciliationPlan,
+    Resolution,
+    _normalise_baseline,
+    _snapshot,
+    apply,
+    plan,
+    reference_snapshot,
+)
+
+#: The AI Gateway's `ai_gateway_metrics`, as the story and the TOKWEIR-5 hand-off
+#: describe it. A **reconstruction** — see the module docstring. The three known
+#: deltas it encodes, and which each line is here for:
+#:
+#: 1. `gateway_usage` has **no** `schema_version`, and `id` is `BIGSERIAL` rather
+#:    than `GENERATED ALWAYS AS IDENTITY`.
+#: 2. `model_pricing_rates` is current-valued: keyed `(model, pricing_mode)`, with
+#:    no `effective_from`.
+#: 3. `schema_migrations` has no `checksum` column and already records 1-6, which
+#:    is what makes `migrations.apply` a silent no-op against this database.
+#:
+#: It also has the gateway's own rollup view (narrower than tokenweir's, and
+#: without `pricing_mode` in the GROUP BY, which is hand-off note 2), and its own
+#: index names, which is what makes "indexes are compared by shape, not by name"
+#: testable rather than theoretical.
+LEGACY_SQL = """
+CREATE TABLE gateway_usage (
+    id                          BIGSERIAL PRIMARY KEY,
+    request_id                  TEXT        NOT NULL,
+    app_id                      TEXT        NOT NULL,
+    endpoint                    TEXT        NOT NULL,
+    model                       TEXT        NOT NULL,
+    status                      TEXT        NOT NULL,
+    workload                    TEXT,
+    queue                       TEXT,
+    input_tokens                BIGINT      NOT NULL DEFAULT 0,
+    output_tokens               BIGINT      NOT NULL DEFAULT 0,
+    cache_creation_input_tokens BIGINT      NOT NULL DEFAULT 0,
+    cache_read_input_tokens     BIGINT      NOT NULL DEFAULT 0,
+    latency_ms                  BIGINT,
+    pricing_mode                TEXT,
+    ts                          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    parent_request_id           TEXT
+);
+
+-- The gateway's own index names, deliberately not tokenweir's.
+CREATE INDEX idx_gateway_usage_ts ON gateway_usage (ts);
+CREATE INDEX idx_gateway_usage_app_ts ON gateway_usage (app_id, ts);
+CREATE INDEX idx_gateway_usage_parent
+    ON gateway_usage (parent_request_id) WHERE parent_request_id IS NOT NULL;
+
+CREATE TABLE model_pricing_rates (
+    model                         TEXT            NOT NULL,
+    pricing_mode                  TEXT            NOT NULL,
+    input_cost_usd_per_mtok       NUMERIC(18, 10) NOT NULL,
+    output_cost_usd_per_mtok      NUMERIC(18, 10) NOT NULL,
+    cache_write_cost_usd_per_mtok NUMERIC(18, 10),
+    cache_read_cost_usd_per_mtok  NUMERIC(18, 10),
+    source                        TEXT,
+    loaded_at                     TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    PRIMARY KEY (model, pricing_mode)
+);
+
+CREATE VIEW gateway_usage_daily AS
+SELECT
+    u.app_id,
+    (u.ts AT TIME ZONE INTERVAL '0')::DATE AS usage_day,
+    u.model,
+    COUNT(*)                    AS calls,
+    SUM(u.input_tokens)::BIGINT AS input_tokens,
+    SUM(u.output_tokens)::BIGINT AS output_tokens
+FROM gateway_usage u
+GROUP BY 1, 2, 3;
+
+CREATE TABLE schema_migrations (
+    version    INTEGER     PRIMARY KEY,
+    name       TEXT        NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO schema_migrations (version, name) VALUES
+    (1, 'gateway_usage'), (2, 'parent_request_id'), (3, 'model_pricing_rates'),
+    (4, 'reader_grant'), (5, 'gateway_usage_daily'), (6, 'gateway_usage_app_day_index');
+"""
+
+#: Two usage rows and one rate, enough to price. The second row has a NULL
+#: `pricing_mode` — a row written before that column meant anything, which the
+#: rollup must treat as ordinary API usage rather than drop.
+LEGACY_ROWS = """
+INSERT INTO gateway_usage
+    (request_id, app_id, endpoint, model, status, input_tokens, output_tokens,
+     pricing_mode, ts)
+VALUES
+    ('req-1', 'mado', '/v1/messages', 'claude-opus-5', 'ok', 1000, 500, 'api',
+     '2026-08-01T12:00:00Z'),
+    ('req-2', 'mado', '/v1/messages', 'claude-opus-5', 'ok', 2000, 100, NULL,
+     '2026-08-01T13:00:00Z');
+
+INSERT INTO model_pricing_rates
+    (model, pricing_mode, input_cost_usd_per_mtok, output_cost_usd_per_mtok, source)
+VALUES ('claude-opus-5', 'api', 15, 75, 'vendor list');
+"""
+
+BASELINE = "2024-01-01"
+
+OWNED = ("gateway_usage", "model_pricing_rates", "gateway_usage_daily")
+
+
+def execute(connection, sql):
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+    connection.commit()
+
+
+def fetch(connection, sql, params=None):
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+
+
+@pytest.fixture
+def legacy(connection):
+    """A database shaped like the one the AI Gateway has been migrating."""
+    execute(connection, LEGACY_SQL)
+    return connection
+
+
+@pytest.fixture
+def legacy_with_rows(legacy):
+    execute(legacy, LEGACY_ROWS)
+    return legacy
+
+
+def descriptions(result):
+    return " | ".join(d.description for d in result.discrepancies)
+
+
+def find(result, relation, needle):
+    """The one discrepancy about `relation` whose description contains `needle`."""
+    matches = [
+        d
+        for d in result.discrepancies
+        if d.relation == relation and needle in d.description
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {relation} discrepancy mentioning {needle!r}, got "
+        f"{len(matches)}: {descriptions(result)}"
+    )
+    return matches[0]
+
+
+# --- User story 1: tell me what is wrong with this database -------------------
+
+
+def test_the_plan_names_the_three_known_deltas(legacy_with_rows):
+    """The story's own list, each one found on a database that has it.
+
+    Written against the deltas by name rather than against a count, so that a
+    reconciler which found three *different* things would fail here rather than
+    pass on arithmetic.
+    """
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    schema_version = find(result, "gateway_usage", "schema_version")
+    assert schema_version.resolution is Resolution.AUTOMATIC
+    assert "back-filled to 1" in schema_version.description
+
+    rate_card = find(result, "model_pricing_rates", "current-valued")
+    assert rate_card.resolution is Resolution.AUTOMATIC
+    assert "effective_from" in rate_card.description
+
+    rollup = find(result, "gateway_usage_daily", "rollup view differs")
+    assert rollup.resolution is Resolution.AUTOMATIC
+    # The gateway's view has no pricing_mode and no cost columns; tokenweir's has
+    # both, which is hand-off note 2 stated as a schema difference.
+    assert "pricing_mode" in rollup.description
+    assert "est_cost_usd" in rollup.description
+
+
+def test_a_database_tokenweir_migrated_itself_has_nothing_to_reconcile(migrated):
+    """The other end of the same comparison, and the one that keeps it honest.
+
+    A reconciler that reported differences here would be describing its own
+    introspection rather than the database — the reference schema and the live
+    schema are built from the same six files.
+    """
+    result = plan(migrated, baseline_effective_from=BASELINE)
+    assert result.is_empty, result.render()
+    assert result.observations == ()
+
+
+def test_planning_changes_nothing_at_all(legacy_with_rows, scratch_schema):
+    """FR-002. The reference schema is built on this very connection; if the
+    rollback were not real, the operator's first read-only look at production
+    would leave a schema behind in it."""
+    _, schema_name = scratch_schema
+    before = _snapshot(legacy_with_rows, OWNED)
+    rows_before = fetch(legacy_with_rows, "SELECT * FROM gateway_usage ORDER BY id")
+
+    plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    assert _snapshot(legacy_with_rows, OWNED) == before
+    assert fetch(legacy_with_rows, "SELECT * FROM gateway_usage ORDER BY id") == rows_before
+
+    leftovers = fetch(
+        legacy_with_rows,
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE %s",
+        (f"{REFERENCE_SCHEMA_PREFIX}%",),
+    )
+    assert leftovers == [], f"reference schema survived the rollback: {leftovers}"
+
+
+def test_a_column_the_gateway_owns_is_reported_and_never_dropped(legacy_with_rows):
+    """FR-009. The hand-off comment's warning, inverted into a guarantee: a column
+    tokenweir does not know about is the gateway's, and the reconciler says so and
+    leaves it."""
+    execute(legacy_with_rows, "ALTER TABLE gateway_usage ADD COLUMN tenant_id TEXT")
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    noted = [o for o in result.observations if "tenant_id" in o.description]
+    assert len(noted) == 1
+    assert "kept and left alone" in noted[0].description
+    assert not any("tenant_id" in d.description for d in result.discrepancies)
+    assert not any("tenant_id" in s for s in result.statements)
+    assert "DROP COLUMN" not in " ".join(result.statements).upper()
+
+
+def test_an_extra_not_null_column_on_the_usage_table_is_a_decision(legacy_with_rows):
+    """FR-010. `PostgresSource`'s INSERT does not name it, so every batch would
+    fail — a reconciliation that reported success here would have handed back a
+    database that cannot be written to."""
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE gateway_usage ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'x'; "
+        "ALTER TABLE gateway_usage ALTER COLUMN tenant_id DROP DEFAULT",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    blocker = find(result, "gateway_usage", "tenant_id")
+    assert blocker.resolution is Resolution.MANUAL
+    assert "PostgresSource" in blocker.remedy
+    assert "will not drop it" in blocker.remedy
+
+
+def test_an_extra_not_null_column_on_a_table_nothing_writes_is_only_a_note(
+    legacy_with_rows,
+):
+    """The other half of the same rule, and the reason it is scoped to the writer's
+    table rather than stated generally.
+
+    `model_pricing_rates.pricing_mode` is NOT NULL on the live database — it was
+    half the old primary key — and it survives the restructure. Nothing in
+    tokenweir writes to that table, so blocking on it would refuse the *ordinary*
+    case: the reconciliation the story is actually asking for would never run.
+    """
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    assert not any(
+        d.relation == "model_pricing_rates" and "pricing_mode" in d.description
+        for d in result.discrepancies
+    ), descriptions(result)
+    noted = [
+        o
+        for o in result.observations
+        if o.relation == "model_pricing_rates" and "pricing_mode" in o.description
+    ]
+    assert len(noted) == 1
+    assert "must still supply it" in noted[0].description
+
+
+def test_indexes_are_matched_by_shape_not_by_name(legacy_with_rows):
+    """The gateway named its indexes itself. An index over the same columns under
+    another name is the same index, and creating a second one beside it would cost
+    write throughput to serve nothing.
+
+    Migration 006's functional index is genuinely absent from the legacy shape —
+    it was tokenweir's fix — so this asserts both directions at once.
+    """
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    missing = [d for d in result.discrepancies if "index missing" in d.description]
+    assert len(missing) == 1, descriptions(result)
+    # The day-bucketed expression from 005/006, not the raw `ts` column the legacy
+    # database already indexes under another name.
+    assert "date" in missing[0].description
+    assert "app_id" in missing[0].description
+
+
+def test_planning_refuses_an_autocommit_connection(scratch_schema):
+    """FR-005. Under autocommit the reference schema's rollback does nothing, and
+    a scratch schema would be left in the operator's database by the command whose
+    whole promise is that it changes nothing."""
+    connect, _ = scratch_schema
+    connection = connect()
+    connection.autocommit = True
+
+    with pytest.raises(ValueError, match="autocommit"):
+        plan(connection)
+
+
+def test_a_missing_table_says_to_apply_rather_than_reconcile(connection):
+    """An empty database is not a reconciliation. Emitting CREATE TABLE from here
+    would produce a schema with no `schema_migrations` rows describing it."""
+    result = plan(connection)
+
+    usage = find(result, "gateway_usage", "absent")
+    assert usage.resolution is Resolution.MANUAL
+    assert "migrations apply" in usage.remedy
+
+
+def test_an_absent_rollup_view_is_simply_created(legacy):
+    """A gateway that never had a rollup. There is nothing to drop and nothing can
+    depend on it, so this is the easy case and must not be treated as the hard
+    one."""
+    execute(legacy, "DROP VIEW gateway_usage_daily")
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+
+    view = find(result, "gateway_usage_daily", "absent")
+    assert view.resolution is Resolution.AUTOMATIC
+    assert "DROP VIEW" not in " ".join(view.statements).upper()
+
+
+def test_the_reference_schema_is_what_the_migrations_build(connection):
+    """FR-004, asserted rather than assumed: the reference is not a description of
+    the schema kept beside the migrations, it is the migrations."""
+    reference = reference_snapshot(connection)
+
+    assert {r.name for r in reference.relations} == set(OWNED)
+    usage = reference.get("gateway_usage")
+    assert usage.column("schema_version").not_null
+    # `format_type`, not `information_schema.data_type` — the precision is the
+    # point, and losing it is a money bug nobody would see.
+    rates = reference.get("model_pricing_rates")
+    assert rates.column("input_cost_usd_per_mtok").type == "numeric(18,10)"
+    assert rates.primary_key == ("model", "effective_from")
+
+
+# --- User story 2: bring it over without losing a row -------------------------
+
+
+def test_every_pre_existing_row_survives_unchanged(legacy_with_rows):
+    """SC-002, column by column rather than by count. A reconciliation that
+    rewrote a row would keep the count."""
+    before = fetch(
+        legacy_with_rows,
+        "SELECT id, request_id, app_id, endpoint, model, status, workload, queue, "
+        "input_tokens, output_tokens, cache_creation_input_tokens, "
+        "cache_read_input_tokens, latency_ms, pricing_mode, ts, parent_request_id "
+        "FROM gateway_usage ORDER BY id",
+    )
+    rates_before = fetch(
+        legacy_with_rows,
+        "SELECT model, pricing_mode, input_cost_usd_per_mtok, "
+        "output_cost_usd_per_mtok, source FROM model_pricing_rates ORDER BY model",
+    )
+
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    after = fetch(
+        legacy_with_rows,
+        "SELECT id, request_id, app_id, endpoint, model, status, workload, queue, "
+        "input_tokens, output_tokens, cache_creation_input_tokens, "
+        "cache_read_input_tokens, latency_ms, pricing_mode, ts, parent_request_id "
+        "FROM gateway_usage ORDER BY id",
+    )
+    assert after == before
+    assert fetch(
+        legacy_with_rows,
+        "SELECT model, pricing_mode, input_cost_usd_per_mtok, "
+        "output_cost_usd_per_mtok, source FROM model_pricing_rates ORDER BY model",
+    ) == rates_before
+
+    assert fetch(legacy_with_rows, "SELECT DISTINCT schema_version FROM gateway_usage") == [(1,)]
+    assert fetch(
+        legacy_with_rows, "SELECT DISTINCT effective_from FROM model_pricing_rates"
+    ) == [(datetime.date(2024, 1, 1),)]
+
+
+def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
+    legacy_with_rows, scratch_schema, psycopg_module, postgres_dsn
+):
+    """SC-001, and the strongest claim in this file.
+
+    Not "the columns I remembered to check": the whole introspection of both
+    databases, compared. The two documented exceptions are subtracted by name and
+    nothing else is — `gateway_usage.id` stays `BIGSERIAL` because the story says
+    to keep it, and the gateway's extra `pricing_mode` on the rate card stays
+    because this module does not drop data.
+    """
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+    reconciled = _snapshot(legacy_with_rows, OWNED)
+
+    native = reference_snapshot(legacy_with_rows)
+
+    for name in OWNED:
+        got, want = reconciled.get(name), native.get(name)
+        assert got is not None and want is not None
+        assert got.kind == want.kind, name
+        assert got.primary_key == want.primary_key, name
+
+        got_columns = {
+            c.name: c
+            for c in got.columns
+            if not (name == "gateway_usage" and c.name == "id")
+            and not (name == "model_pricing_rates" and c.name == "pricing_mode")
+        }
+        want_columns = {
+            c.name: c for c in want.columns if not (name == "gateway_usage" and c.name == "id")
+        }
+        assert got_columns.keys() == want_columns.keys(), name
+        for column, expected in want_columns.items():
+            actual = got_columns[column]
+            assert (actual.type, actual.not_null, actual.default) == (
+                expected.type,
+                expected.not_null,
+                expected.default,
+            ), f"{name}.{column}"
+
+        # Every index tokenweir wants is present by shape. The gateway's own extra
+        # ones are still there and are not asserted away.
+        assert {shape for shape, _ in want.indexes} <= {shape for shape, _ in got.indexes}, name
+
+
+def test_the_writer_fails_before_reconciliation_and_works_after(
+    legacy, psycopg_module
+):
+    """SC-003, both halves.
+
+    Asserting only the fix would pass just as happily against a database that never
+    had the problem — and "the writer is broken and nothing says so" is the failure
+    the whole story is about, so it is worth reproducing before curing.
+    """
+    record = UsageRecord(
+        request_id="req-new",
+        app_id="mado",
+        endpoint="/v1/messages",
+        model="claude-opus-5",
+        status="ok",
+        input_tokens=10,
+    )
+
+    with pytest.raises(psycopg_module.errors.UndefinedColumn):
+        PostgresSource(legacy).write([record])
+    legacy.rollback()
+
+    apply(legacy, baseline_effective_from=BASELINE)
+
+    assert PostgresSource(legacy).write([record]) == 1
+    assert fetch(
+        legacy,
+        "SELECT schema_version FROM gateway_usage WHERE request_id = 'req-new'",
+    ) == [(1,)]
+
+
+def test_pre_existing_rows_still_price(legacy_with_rows):
+    """SC-004. The story's third acceptance clause, arithmetic and all.
+
+    1000 input @ $15/Mtok + 500 output @ $75/Mtok = 0.015 + 0.0375 = 0.0525
+    2000 input @ $15/Mtok + 100 output @ $75/Mtok = 0.030 + 0.0075 = 0.0375
+
+    Two groups rather than one, because tokenweir's rollup groups by
+    `pricing_mode` and these rows disagree about it — which is hand-off note 2's
+    "returns more rows than it used to", asserted rather than described.
+    """
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    rollup = fetch(
+        legacy_with_rows,
+        "SELECT pricing_mode, calls, is_priced, est_cost_usd FROM gateway_usage_daily "
+        "ORDER BY pricing_mode NULLS LAST",
+    )
+    assert [(r[0], r[1], r[2]) for r in rollup] == [("api", 1, True), (None, 1, True)]
+    assert [float(r[3]) for r in rollup] == [0.0525, 0.0375]
+
+
+def test_reconciling_a_reconciled_database_does_nothing(legacy_with_rows):
+    """FR-021. The property that makes this safe to leave in a deploy script."""
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+    after_first = _snapshot(legacy_with_rows, OWNED)
+
+    second = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+    assert second.is_empty, second.render()
+
+    assert apply(legacy_with_rows, baseline_effective_from=BASELINE).is_empty
+    assert _snapshot(legacy_with_rows, OWNED) == after_first
+
+
+def test_a_failure_part_way_through_leaves_the_database_alone(
+    legacy_with_rows, monkeypatch
+):
+    """FR-018. The rate-card restructure is four statements; a database left
+    between the second and the third has neither key working and reports itself
+    reconciled next time nobody looks."""
+    before = _snapshot(legacy_with_rows, OWNED)
+    rows_before = fetch(legacy_with_rows, "SELECT * FROM gateway_usage ORDER BY id")
+
+    real_plan = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+    assert len(real_plan.statements) > 3
+
+    exploding = ReconciliationPlan(
+        discrepancies=real_plan.discrepancies,
+        observations=real_plan.observations,
+        baseline_effective_from=real_plan.baseline_effective_from,
+    )
+    # Re-derivation inside `apply` is what runs, so the failure has to come from
+    # the database rather than from a doctored plan: a statement that is valid to
+    # parse and impossible to execute, injected after the real ones.
+    import tokenweir.reconcile as reconcile_module
+
+    original = reconcile_module.ReconciliationPlan.statements.fget
+    monkeypatch.setattr(
+        reconcile_module.ReconciliationPlan,
+        "statements",
+        property(lambda self: original(self) + ("SELECT 1 / 0",)),
+    )
+
+    with pytest.raises(Exception):
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+    legacy_with_rows.rollback()
+
+    assert _snapshot(legacy_with_rows, OWNED) == before
+    assert fetch(legacy_with_rows, "SELECT * FROM gateway_usage ORDER BY id") == rows_before
+    assert exploding.baseline_effective_from == BASELINE
+
+
+def test_applying_a_plan_the_database_has_outgrown_is_refused(legacy_with_rows):
+    """FR-020. A plan a human read ten minutes ago is not evidence about the
+    database now."""
+    stale = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE gateway_usage ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+    )
+
+    with pytest.raises(PlanStaleError, match="no longer matches"):
+        apply(legacy_with_rows, stale)
+
+
+def test_a_baseline_that_contradicts_the_plan_is_refused(legacy_with_rows):
+    """Applying a plan nobody read, under a date nobody saw, is how a rate card
+    quietly restates history."""
+    read_by_a_human = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    with pytest.raises(ValueError, match="disagrees with the plan"):
+        apply(legacy_with_rows, read_by_a_human, baseline_effective_from="2020-05-05")
+
+
+# --- User story 3: refuse what a human has to decide --------------------------
+
+
+def test_two_rates_for_one_model_cannot_be_re_keyed_and_says_which(legacy_with_rows):
+    """FR-014, and the sharpest edge in the story.
+
+    The old key is `(model, pricing_mode)`; the new one is `(model,
+    effective_from)` and tokenweir's rate card has no `pricing_mode` at all. Two
+    rows for one model collapse onto one key and one of them has nowhere to go.
+    Which one survives is a decision about money.
+    """
+    execute(
+        legacy_with_rows,
+        "INSERT INTO model_pricing_rates "
+        "(model, pricing_mode, input_cost_usd_per_mtok, output_cost_usd_per_mtok) "
+        "VALUES ('claude-opus-5', 'subscription', 0, 0)",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    collision = find(result, "model_pricing_rates", "cannot be re-keyed")
+    assert collision.resolution is Resolution.MANUAL
+    assert "claude-opus-5" in collision.description
+    assert collision.statements == ()
+
+
+def test_one_decision_outstanding_blocks_everything_including_the_easy_parts(
+    legacy_with_rows,
+):
+    """FR-019 / SC-005. The failure mode of a reconciler is not stopping."""
+    execute(
+        legacy_with_rows,
+        "INSERT INTO model_pricing_rates "
+        "(model, pricing_mode, input_cost_usd_per_mtok, output_cost_usd_per_mtok) "
+        "VALUES ('claude-opus-5', 'subscription', 0, 0)",
+    )
+    before = _snapshot(legacy_with_rows, OWNED)
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+    assert result.automatic, "this test is worthless if there was nothing to skip"
+
+    with pytest.raises(ManualResolutionError) as raised:
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+    legacy_with_rows.rollback()
+
+    assert "Nothing was applied" in str(raised.value)
+    assert _snapshot(legacy_with_rows, OWNED) == before
+
+
+def test_the_rate_card_will_not_be_re_dated_without_being_told_a_date(legacy_with_rows):
+    """FR-013. There is no default, because both available defaults are claims
+    about history that only the operator can make."""
+    result = plan(legacy_with_rows)
+
+    rate_card = find(result, "model_pricing_rates", "current-valued")
+    assert rate_card.resolution is Resolution.MANUAL
+    assert "--baseline-effective-from" in rate_card.remedy
+    assert "-infinity" in rate_card.remedy
+
+    with pytest.raises(ManualResolutionError):
+        apply(legacy_with_rows)
+
+
+def test_a_view_something_else_depends_on_is_not_replaced_silently(legacy_with_rows):
+    """FR-015. `CREATE OR REPLACE VIEW` cannot change a column set, so the rollup
+    has to be dropped and recreated — and dropping it takes the dependent with it
+    under CASCADE, or fails without. Neither is this tool's call."""
+    execute(
+        legacy_with_rows,
+        "CREATE VIEW gateway_usage_monthly AS "
+        "SELECT app_id, model, SUM(calls) AS calls FROM gateway_usage_daily "
+        "GROUP BY 1, 2",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    view = find(result, "gateway_usage_daily", "depend on it")
+    assert view.resolution is Resolution.MANUAL
+    assert "gateway_usage_monthly" in view.description
+    assert "pricing_mode" in view.remedy  # hand-off note 2, where it is needed
+
+
+def test_a_table_squatting_on_the_view_name_is_not_replaced(legacy):
+    """It may hold rows, and replacing it would destroy them."""
+    execute(legacy, "DROP VIEW gateway_usage_daily")
+    execute(legacy, "CREATE TABLE gateway_usage_daily (whatever TEXT)")
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+
+    squatter = find(result, "gateway_usage_daily", "not a view")
+    assert squatter.resolution is Resolution.MANUAL
+    assert squatter.statements == ()
+
+
+def test_a_narrowed_column_type_is_a_decision_not_a_conversion(legacy_with_rows):
+    """FR-011. A widening may be safe; a narrowing truncates. Which this is
+    depends on the data, and the tool does not look."""
+    # `latency_ms` rather than a token count: the legacy rollup selects those, and
+    # Postgres refuses to retype a column a view depends on. The narrowing being
+    # tested is the same one either way — bigint down to integer, which truncates.
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE gateway_usage ALTER COLUMN latency_ms TYPE INTEGER",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    mismatch = find(result, "gateway_usage", "latency_ms is integer")
+    assert mismatch.resolution is Resolution.MANUAL
+    assert mismatch.statements == ()
+
+
+def test_a_nullable_column_holding_nulls_is_a_decision(legacy_with_rows):
+    """The data decides, so the data is consulted. `SET NOT NULL` on a column with
+    NULLs in it fails; picking a value for those rows is not the tool's to do."""
+    execute(legacy_with_rows, "ALTER TABLE gateway_usage ALTER COLUMN status DROP NOT NULL")
+    execute(legacy_with_rows, "UPDATE gateway_usage SET status = NULL WHERE request_id = 'req-1'")
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    blocked = find(result, "gateway_usage", "status is nullable and holds NULLs")
+    assert blocked.resolution is Resolution.MANUAL
+
+    execute(legacy_with_rows, "UPDATE gateway_usage SET status = 'ok' WHERE status IS NULL")
+    fixable = find(
+        plan(legacy_with_rows, baseline_effective_from=BASELINE),
+        "gateway_usage",
+        "status is nullable",
+    )
+    assert fixable.resolution is Resolution.AUTOMATIC
+    assert "SET NOT NULL" in fixable.statements[0]
+
+
+# --- The baseline, without a database -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        ("2024-01-01", "2024-01-01"),
+        ("  2024-01-01  ", "2024-01-01"),
+        ("-infinity", "-infinity"),
+        ("-INFINITY", "-infinity"),
+        (None, None),
+    ],
+)
+def test_the_baseline_is_normalised(given, expected):
+    assert _normalise_baseline(given) == expected
+
+
+@pytest.mark.parametrize("given", ["not-a-date", "2024-13-01", "01/01/2024", ""])
+def test_a_baseline_that_is_not_a_date_is_refused(given):
+    """A rate card back-filled to a date nobody meant is a silent restatement of
+    every historical cost, so this is refused rather than coerced."""
+    with pytest.raises(ValueError, match="ISO date"):
+        _normalise_baseline(given)
