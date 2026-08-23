@@ -231,9 +231,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "the date existing model_pricing_rates rows are taken to have been in "
             "force from, when that table has to be restructured from current-valued "
-            "to effective-dated. ISO date, or '-infinity' for 'these were always the "
-            "rates'. There is no default: the answer changes what every historical "
-            "row costs."
+            "to effective-dated. An ISO date, or '-infinity' for 'these were always "
+            "the rates' — the latter must be written with an equals sign "
+            "(--baseline-effective-from=-infinity), because a leading dash is an "
+            "option to argparse. There is no default: the answer changes what every "
+            "historical row costs."
         ),
     )
     return parser

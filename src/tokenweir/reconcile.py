@@ -44,9 +44,16 @@ inside an aborted transaction and leaves nothing behind — the same technique
 
 **What it will never do.** Drop a column, drop a table, or delete a row. A column
 the gateway has and tokenweir does not is the gateway's data; it is reported and
-kept. The single ``DROP`` this module can emit is of the rollup *view*, which
-holds no data, and even that becomes a human's decision the moment anything
-depends on it.
+kept. The single ``DROP`` this module can emit is of the rollup *view*, and even
+that becomes a human's decision the moment anything depends on it.
+
+That view holds no rows — but it does hold an ACL, and ``DROP VIEW`` takes it
+along. Migration 005 re-issues the grant only when ``tokenweir.reader_role`` is
+set, and reconciliation never sets it, so a reporting role silently loses SELECT
+on the rollup. "Holds no data" was the original justification for that one drop
+and it was true of rows and false of privileges; the plan now names the grantees
+that will need re-granting rather than leaving an operator to discover it from a
+dashboard.
 
 **Transactions belong to this module**, as they do in :mod:`tokenweir.migrations`
 and for the same reason: :func:`plan` rolls back when it is done (that is what
@@ -73,6 +80,7 @@ __all__ = [
     "ManualResolutionError",
     "Observation",
     "PlanStaleError",
+    "ReferenceSchemaError",
     "ReconcileError",
     "ReconciliationPlan",
     "Relation",
@@ -305,18 +313,47 @@ class ReconciliationPlan:
                     lines.append(f"             {_one_line(statement)}")
                     # Named where it is read, not only in the docs. This is the one
                     # place a reconciliation can destroy anything, and an operator
-                    # deciding whether to pass --apply should not have to notice a
-                    # DROP by reading SQL carefully.
-                    if destructive_statements(statement):
+                    # deciding whether to pass --apply should not have to notice it
+                    # by reading SQL carefully.
+                    #
+                    # Narrower than `destructive_statements`, deliberately. That
+                    # function matches the word DROP, which is right for its job —
+                    # gating a migration — and wrong here: a rate-card restructure
+                    # carries DROP DEFAULT and DROP CONSTRAINT, so the annotation
+                    # fired three times before the one statement that removes a
+                    # relation. A warning that cries wolf three times first is not
+                    # read on the fourth.
+                    if _drops_a_relation(statement):
                         lines.append(
-                            "             ^ drops something (a default, a constraint or "
-                            "the rollup view) — read it before you run it. This module "
-                            "never drops a column, a table or a row."
+                            "             ^ removes a relation — the rollup view is "
+                            "rebuilt from migration 005 in the same transaction. "
+                            "This module never drops a column, a table or a row."
                         )
         for observation in self.observations:
             lines.append("")
             lines.append(f"  [note]      {observation.relation}: {observation.description}")
         return "\n".join(lines)
+
+
+#: What the rendered plan flags. ``destructive_statements`` answers a different
+#: question — "does this SQL contain a word that should stop a migration" — and is
+#: still the right answer to that one; this is "does this statement remove a
+#: relation", which is the thing an operator reading a plan needs to see.
+_DROPS_RELATION_RE = re.compile(r"\bDROP\s+(?:MATERIALIZED\s+)?(?:VIEW|TABLE)\b", re.IGNORECASE)
+
+
+def _drops_a_relation(statement: str) -> bool:
+    """Whether this statement removes a whole relation.
+
+    Comment-stripping is delegated to :func:`destructive_statements`'s scan by
+    asking it first: a statement it clears contains no bare ``DROP`` at all, so
+    there is nothing here to find either. That ordering is what keeps this from
+    having to repeat the literal-versus-comment scan that function exists to get
+    right.
+    """
+    if not destructive_statements(statement):
+        return False
+    return bool(_DROPS_RELATION_RE.search(statement))
 
 
 def _one_line(statement: str, limit: int = 160) -> str:
@@ -499,7 +536,13 @@ def _view_migration_sql(view: str) -> str:
     for migration in discover():
         if pattern.search(migration.sql):
             return migration.sql
-    raise ReferenceSchemaError(
+    # Unreachable while `_owned_relation_names` and this function read the same
+    # files: a view in the reference snapshot got there by being created by one of
+    # them. Kept, and marked rather than tested, because the two scans are
+    # separate regexes over the same SQL and a migration written in a form only one
+    # of them matches would otherwise make the reconciler stop checking the rollup
+    # in silence. A guard for a divergence, not for a case.
+    raise ReferenceSchemaError(  # pragma: no cover - guards a future divergence
         f"no shipped migration creates the view {view!r}; tokenweir cannot recreate "
         "it, and reconciling a database without being able to is not something this "
         "module will guess at"
@@ -586,14 +629,39 @@ def _normalise_baseline(value: Union[str, date, None]) -> Optional[str]:
     current-valued rate card that was simply always the rate — but it is not the
     default, because "always" is itself a claim about history and the operator is
     the one who knows whether it is true.
+
+    Positive ``infinity`` is **refused**, and the asymmetry is the whole reason
+    this function does not just hand the string to Postgres. ``DATE 'infinity'``
+    is perfectly valid and means the opposite: migration 005 joins a rate on
+    ``effective_from <= usage_day``, so a card dated at the end of time matches no
+    day that has ever happened. Every pre-existing row comes back ``is_priced =
+    false`` and ``est_cost_usd = NULL`` — which is precisely the outcome the
+    story's third acceptance clause forbids ("every pre-existing row is preserved
+    and **still prices**"), reached through a plan that called itself AUTOMATIC and
+    a command that exited 0. A value whose only effect is to unprice the data
+    silently is not an option worth offering.
+
+    Note that ``--baseline-effective-from -infinity`` cannot be written with a
+    space on the command line — argparse reads the leading dash as an option — so
+    the CLI help and the README give the ``=`` form. That is a real trap rather
+    than a footnote: the obvious recovery from the argparse error is to drop the
+    dash, and dropping the dash used to be accepted.
     """
     if value is None:
         return None
     if isinstance(value, date):
         return value.isoformat()
     text = value.strip()
-    if text.lower() in {"-infinity", "infinity"}:
-        return text.lower()
+    if text.lower() == "-infinity":
+        return "-infinity"
+    if text.lower() == "infinity":
+        raise ValueError(
+            "baseline_effective_from cannot be 'infinity': a rate dated at the end of "
+            "time is in force on no day that has happened, so every existing row would "
+            "stop pricing. Did you mean '-infinity' (written "
+            "--baseline-effective-from=-infinity on the command line), which means "
+            "'these were always the rates'?"
+        )
     try:
         return date.fromisoformat(text).isoformat()
     except ValueError as exc:
@@ -738,17 +806,27 @@ def _rate_card_discrepancy(
                 "re-run with a baseline date (--baseline-effective-from). It decides "
                 "which historical usage the existing rates are taken to have covered, "
                 "and the rollup prices every day on or after it at these rates. "
-                "'-infinity' is accepted and says 'these were always the rates'; there "
-                "is no default, because both answers are claims about history."
+                "'-infinity' says 'these were always the rates' and must be written "
+                "--baseline-effective-from=-infinity, with the equals sign, because a "
+                "leading dash is an option to argparse. There is no default, because "
+                "every answer is a claim about history. ('infinity' is refused: it "
+                "would be in force on no day that has happened, and every existing row "
+                "would stop pricing.)"
             ),
         )
 
     column = _quote("effective_from")
     table = _quote(relation)
+    # The type is read off the reference rather than written here. It is `date`
+    # today, and saying so in this file would be a second statement of something
+    # migration 003 already defines — the exact duplication FR-004 exists to
+    # prevent, differing only in being small enough to look harmless.
+    column_type = reference.column("effective_from").type
     statements = [
         # DEFAULT back-fills every existing row to the operator's baseline in one
         # statement; NOT NULL is safe in the same breath because of it.
-        f"ALTER TABLE {table} ADD COLUMN {column} date NOT NULL DEFAULT DATE '{baseline}'",
+        f"ALTER TABLE {table} ADD COLUMN {column} {column_type} NOT NULL "
+        f"DEFAULT DATE '{baseline}'",
         f"ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT",
     ]
     existing_key = _primary_key_constraint_name(connection, relation)
@@ -974,6 +1052,21 @@ def _compare_columns(
     return discrepancies, observations
 
 
+_INDEX_NAME_RE = re.compile(
+    r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
+    r'(?P<name>"[^"]+"|[^\s"]+)',
+    re.IGNORECASE,
+)
+
+
+def _index_name(indexdef: str) -> str:
+    """The index's own name, unquoted. ``''`` if the definition does not parse."""
+    match = _INDEX_NAME_RE.match(" ".join(indexdef.split()))
+    if not match:
+        return ""
+    return match.group("name").strip('"')
+
+
 def _compare_indexes(relation: str, reference: Relation, live: Relation) -> tuple[
     list[Discrepancy], list[Observation]
 ]:
@@ -981,8 +1074,36 @@ def _compare_indexes(relation: str, reference: Relation, live: Relation) -> tupl
     observations: list[Observation] = []
     live_shapes = {shape for shape, _ in live.indexes}
     reference_shapes = {shape for shape, _ in reference.indexes}
+    # Index names are per-schema unique in Postgres, and the gateway named its own
+    # indexes. Two of them agreeing on a name while disagreeing on a shape is the
+    # one case where "this index is missing" and "I can create it" are both true
+    # of the shape and false of the statement.
+    live_names = {_index_name(definition) for _, definition in live.indexes}
     for shape, definition in reference.indexes:
         if shape in live_shapes:
+            continue
+        name = _index_name(definition)
+        if name and name in live_names:
+            # AUTOMATIC here would be a plan that cannot run: the statement is
+            # `pg_get_indexdef`'s, so it carries tokenweir's name and has no
+            # IF NOT EXISTS, and Postgres answers DuplicateTable. The transaction
+            # rolls back and nothing is corrupted — but the operator was told every
+            # difference was resolvable, which is the one promise the plan makes.
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"index {name} exists but covers something else; tokenweir's "
+                        f"index of that name is {_one_line(shape, 80)}"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        f"tokenweir cannot create its {name} while a different index "
+                        "holds the name, and it will not drop yours. Rename or remove "
+                        "the existing one, then reconcile again."
+                    ),
+                )
+            )
             continue
         discrepancies.append(
             Discrepancy(
@@ -1006,9 +1127,33 @@ def _compare_indexes(relation: str, reference: Relation, live: Relation) -> tupl
     return discrepancies, observations
 
 
+def _view_grantees(connection: Any, view: str) -> tuple[str, ...]:
+    """Roles holding SELECT on ``view`` today, other than its owner.
+
+    ``DROP VIEW`` takes the view's ACL with it, and migration 005's grant block
+    no-ops during a reconciliation because ``tokenweir.reader_role`` is never set
+    here — the reference is about shape, and a reconciliation is not the moment to
+    start managing permissions. The consequence is real all the same: a dashboard
+    role silently loses SELECT on the rollup, and the README's "Granting a reader
+    role later" remedy is then the only way back.
+
+    Reported rather than fixed. Re-granting is one statement an operator can read;
+    guessing which roles *should* have access is not something this module knows.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT DISTINCT grantee FROM information_schema.role_table_grants "
+            "WHERE table_name = %s AND privilege_type = 'SELECT' "
+            "  AND grantee <> grantor "
+            "ORDER BY 1",
+            (view,),
+        )
+        return tuple(row[0] for row in cursor.fetchall())
+
+
 def _compare_view(
     connection: Any, relation: str, reference: Relation, live: Optional[Relation]
-) -> list[Discrepancy]:
+) -> tuple[list[Discrepancy], list[Observation]]:
     sql = _view_migration_sql(relation)
     if live is None:
         return [
@@ -1018,7 +1163,7 @@ def _compare_view(
                 resolution=Resolution.AUTOMATIC,
                 statements=(sql,),
             )
-        ]
+        ], []
 
     if live.kind != reference.kind:
         return [
@@ -1034,13 +1179,13 @@ def _compare_view(
                     "destroy them. Move it aside yourself, then reconcile again."
                 ),
             )
-        ]
+        ], []
 
     # Column set *and order*, not the definition text: two SQL strings differing
     # only in whitespace build the same view, and comparing text would cry wolf on
     # every reformat. Order matters because a view's columns are positional.
     if live.column_names == reference.column_names:
-        return []
+        return [], []
 
     dependents = _view_dependents(connection, relation)
     if dependents:
@@ -1060,7 +1205,23 @@ def _compare_view(
                     "against it return more rows than the gateway's did."
                 ),
             )
-        ]
+        ], []
+
+    observations: list[Observation] = []
+    grantees = _view_grantees(connection, relation)
+    if grantees:
+        observations.append(
+            Observation(
+                relation=relation,
+                description=(
+                    "dropping and recreating the view discards its SELECT grants; "
+                    f"{', '.join(grantees)} will need re-granting afterwards "
+                    "(README, \"Granting a reader role later\"). --reader-role does not "
+                    "reach this: the grant lives in migration 005, which reconcile "
+                    "executes without a reader role set"
+                ),
+            )
+        )
 
     return [
         Discrepancy(
@@ -1073,7 +1234,7 @@ def _compare_view(
             resolution=Resolution.AUTOMATIC,
             statements=(f"DROP VIEW {_quote(relation)}", sql),
         )
-    ]
+    ], observations
 
 
 def plan(
@@ -1120,9 +1281,11 @@ def plan(
         live_relation = live.get(name)
 
         if reference_relation.kind != _TABLE_KIND:
-            discrepancies.extend(
-                _compare_view(connection, name, reference_relation, live_relation)
+            view_discrepancies, view_observations = _compare_view(
+                connection, name, reference_relation, live_relation
             )
+            discrepancies.extend(view_discrepancies)
+            observations.extend(view_observations)
             continue
 
         if live_relation is None:

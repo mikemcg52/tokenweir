@@ -291,9 +291,19 @@ def test_a_version_applied_without_a_checksum_is_adopted_not_refused(caplog):
         applied = apply(conn)
 
     assert [m.version for m in applied] == [4, 5, 6]
+    warnings = [record.getMessage() for record in caplog.records]
     assert any(
-        "without a recorded checksum" in record.message for record in caplog.records
+        "without a recorded checksum" in message for message in warnings
     ), "adopting rows silently would hide that they were never verified"
+    # TOKWEIR-10. "Treated as applied" is a statement about the *record*, and the
+    # record is what cannot be trusted here — these rows were written by another
+    # tool about migrations this library did not run. Stopping there read as
+    # reassurance at the one moment tokenweir knows it has no idea whether the
+    # objects match. The remedy is asserted rather than left to prose because the
+    # sentence naming it could otherwise be deleted with the suite still green.
+    assert any(
+        "reconcile" in message for message in warnings
+    ), "an adopted database must be told how to find out whether it actually matches"
 
 
 def test_status_says_which_rows_it_could_not_verify(caplog):
@@ -309,7 +319,9 @@ def test_status_says_which_rows_it_could_not_verify(caplog):
 
     assert [m.version for m in done] == [1, 2, 3]
     assert [m.version for m in outstanding] == [4, 5, 6]
-    assert any("without a recorded checksum" in r.message for r in caplog.records)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("without a recorded checksum" in m for m in messages)
+    assert any("reconcile" in m for m in messages)
 
 
 def test_an_adopted_row_does_not_excuse_a_genuinely_edited_one():

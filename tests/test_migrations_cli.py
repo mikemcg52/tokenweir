@@ -476,6 +476,35 @@ def test_the_baseline_reaches_the_reconciler_normalised(stub_connect, stub_recon
     assert stub_reconciler["plan"] == ["2024-01-01"]
 
 
+def test_the_documented_negative_infinity_form_reaches_the_reconciler(
+    stub_connect, stub_reconciler
+):
+    """`-infinity` is the one value the flag documents besides a date, and argparse
+    reads its leading dash as an option — so the spaced form the README used to
+    show fails with "expected one argument" before the command ever connects.
+
+    The `=` form is what works, and it is now what everything documents. This test
+    exists because the recovery an operator reaches for when the spaced form fails
+    is dropping the dash, and `infinity` used to be accepted — silently unpricing
+    every historical row.
+    """
+    assert (
+        cli.main(
+            ["reconcile", "--dsn", "postgresql:///s", "--baseline-effective-from=-infinity"]
+        )
+        == 0
+    )
+    assert stub_reconciler["plan"] == ["-infinity"]
+
+
+def test_a_positive_infinity_baseline_is_a_usage_error(stub_connect):
+    """Rejected by argparse, so the command never opens a connection to find out —
+    and the message says what to write instead."""
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["reconcile", "--dsn", "postgresql:///s", "--baseline-effective-from", "infinity"])
+    assert raised.value.code == 2
+
+
 @pytest.mark.parametrize("given", ["not-a-date", "01/01/2024"])
 def test_a_baseline_that_is_not_a_date_is_a_usage_error(given, stub_connect):
     """Exit 2, not 1: a typo in an argument is argparse's to reject, and rejecting

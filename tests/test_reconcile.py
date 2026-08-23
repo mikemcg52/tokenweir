@@ -25,6 +25,7 @@ exactly the ones worth knowing it will not damage.
 """
 
 import datetime
+import uuid
 
 import pytest
 
@@ -35,6 +36,7 @@ from tokenweir.reconcile import (
     ManualResolutionError,
     PlanStaleError,
     ReconciliationPlan,
+    ReferenceSchemaError,
     Resolution,
     _normalise_baseline,
     _snapshot,
@@ -322,6 +324,46 @@ def test_indexes_are_matched_by_shape_not_by_name(legacy_with_rows):
     assert "app_id" in missing[0].description
 
 
+def test_an_index_the_gateway_owns_is_reported_and_left_alone(legacy_with_rows):
+    """FR-016's other half. The legacy indexes are named differently from
+    tokenweir's and cover the same columns, so they are matched by shape — and the
+    ones that cover something else are still the gateway's."""
+    execute(legacy_with_rows, "CREATE INDEX gateway_usage_status_idx ON gateway_usage (status)")
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    noted = [o for o in result.observations if "gateway_usage_status_idx" in o.description]
+    assert len(noted) == 1
+    assert "left in place" in noted[0].description
+    assert "DROP INDEX" not in " ".join(result.statements).upper()
+
+
+def test_an_index_squatting_on_a_shipped_index_name_is_a_decision(legacy_with_rows):
+    """Index names are unique per schema, and the gateway named its own.
+
+    Review 1's Med-1: this was planned AUTOMATIC, and the statement is
+    `pg_get_indexdef`'s — tokenweir's name, no IF NOT EXISTS — so Postgres answered
+    `DuplicateTable` and the operator got a raw driver error out of a plan that had
+    told them every difference was resolvable. Nothing was corrupted; the promise
+    the plan makes was.
+    """
+    execute(
+        legacy_with_rows,
+        "CREATE INDEX gateway_usage_app_day_idx ON gateway_usage (endpoint)",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    collision = find(result, "gateway_usage", "gateway_usage_app_day_idx exists")
+    assert collision.resolution is Resolution.MANUAL
+    assert collision.statements == ()
+    assert "will not drop yours" in collision.remedy
+
+    # And the whole point of classifying it: nothing runs.
+    with pytest.raises(ManualResolutionError):
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+
 def test_planning_refuses_an_autocommit_connection(scratch_schema):
     """FR-005. Under autocommit the reference schema's rollback does nothing, and
     a scratch schema would be left in the operator's database by the command whose
@@ -332,6 +374,57 @@ def test_planning_refuses_an_autocommit_connection(scratch_schema):
 
     with pytest.raises(ValueError, match="autocommit"):
         plan(connection)
+
+
+def test_a_reference_that_cannot_be_built_is_an_error_not_an_empty_plan(
+    legacy_with_rows, psycopg_module, postgres_dsn, scratch_schema
+):
+    """FR-017 names the wrong answer: "MUST NOT report 'no differences' for any
+    reason other than having found none."
+
+    The reference schema needs `CREATE` on the database. Without it there is no
+    target to compare against, and the failure mode worth guarding is not a crash —
+    it is a reconciler that swallows the error and reports a clean database to an
+    operator about to point the gateway at it.
+    """
+    _, schema_name = scratch_schema
+    role = f"tokenweir_nocreate_{uuid.uuid4().hex[:8]}"
+
+    admin = psycopg_module.connect(postgres_dsn)
+    admin.autocommit = True
+    with admin.cursor() as cursor:
+        cursor.execute(f'CREATE ROLE "{role}" LOGIN')
+        cursor.execute(f'GRANT USAGE ON SCHEMA "{schema_name}" TO "{role}"')
+        cursor.execute(
+            f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema_name}" TO "{role}"'
+        )
+    try:
+        restricted = psycopg_module.connect(postgres_dsn, user=role)
+        try:
+            with restricted.cursor() as cursor:
+                cursor.execute(f'SET search_path TO "{schema_name}"')
+            restricted.commit()
+
+            with pytest.raises(ReferenceSchemaError, match="CREATE SCHEMA"):
+                plan(restricted, baseline_effective_from=BASELINE)
+        finally:
+            restricted.close()
+
+        leftovers = fetch(
+            legacy_with_rows,
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name LIKE %s",
+            (f"{REFERENCE_SCHEMA_PREFIX}%",),
+        )
+        assert leftovers == []
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(
+                f'REVOKE ALL ON ALL TABLES IN SCHEMA "{schema_name}" FROM "{role}"'
+            )
+            cursor.execute(f'REVOKE ALL ON SCHEMA "{schema_name}" FROM "{role}"')
+            cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
+        admin.close()
 
 
 def test_a_missing_table_says_to_apply_rather_than_reconcile(connection):
@@ -419,10 +512,22 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
     """SC-001, and the strongest claim in this file.
 
     Not "the columns I remembered to check": the whole introspection of both
-    databases, compared. The two documented exceptions are subtracted by name and
-    nothing else is — `gateway_usage.id` stays `BIGSERIAL` because the story says
-    to keep it, and the gateway's extra `pricing_mode` on the rate card stays
-    because this module does not drop data.
+    databases, compared. **Three** deviations are subtracted by name and nothing
+    else is:
+
+    1. `gateway_usage.id` stays `BIGSERIAL` rather than becoming an identity
+       column, because the story says to keep it.
+    2. The gateway's extra `pricing_mode` on the rate card stays, because this
+       module does not drop data.
+    3. Column **order** differs: an added column lands at the end of the table
+       rather than in the migration's position. Nothing reads column position and
+       reordering would mean rewriting the table, so this is a deviation rather
+       than a defect — but it is one, and review 1 found this docstring claiming
+       there were two while silently dropping it by comparing dicts.
+
+    `identity` is compared along with type, nullability and default, so the `id`
+    exception is the only place `BIGSERIAL` versus `GENERATED ALWAYS AS IDENTITY`
+    is allowed to differ.
     """
     apply(legacy_with_rows, baseline_effective_from=BASELINE)
     reconciled = _snapshot(legacy_with_rows, OWNED)
@@ -447,15 +552,39 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
         assert got_columns.keys() == want_columns.keys(), name
         for column, expected in want_columns.items():
             actual = got_columns[column]
-            assert (actual.type, actual.not_null, actual.default) == (
+            assert (
+                actual.type,
+                actual.not_null,
+                actual.default,
+                actual.identity,
+            ) == (
                 expected.type,
                 expected.not_null,
                 expected.default,
+                expected.identity,
             ), f"{name}.{column}"
 
         # Every index tokenweir wants is present by shape. The gateway's own extra
         # ones are still there and are not asserted away.
         assert {shape for shape, _ in want.indexes} <= {shape for shape, _ in got.indexes}, name
+
+
+def test_an_empty_legacy_table_reconciles_to_the_right_shape(legacy):
+    """Low-8. Back-fills and key swaps on zero rows still have to produce the right
+    *shape* — a reconciler exercised only against populated tables can pass while
+    adding a NOT NULL column the wrong way, because with no rows there is nothing
+    for a missing back-fill to fail on."""
+    apply(legacy, baseline_effective_from=BASELINE)
+
+    reconciled = _snapshot(legacy, OWNED)
+    native = reference_snapshot(legacy)
+
+    usage = reconciled.get("gateway_usage").column("schema_version")
+    assert (usage.not_null, usage.default) == (True, None)
+    assert reconciled.get("model_pricing_rates").primary_key == (
+        native.get("model_pricing_rates").primary_key
+    )
+    assert plan(legacy, baseline_effective_from=BASELINE).is_empty
 
 
 def test_the_writer_fails_before_reconciliation_and_works_after(
@@ -665,6 +794,51 @@ def test_a_view_something_else_depends_on_is_not_replaced_silently(legacy_with_r
     assert "pricing_mode" in view.remedy  # hand-off note 2, where it is needed
 
 
+def test_the_grants_the_view_drop_discards_are_named(
+    legacy_with_rows, psycopg_module, postgres_dsn
+):
+    """Review 1's Med-4. `DROP VIEW` takes the view's ACL with it, and migration
+    005 re-issues the grant only when `tokenweir.reader_role` is set — which
+    reconcile never sets. A reporting role loses SELECT on the rollup with nothing
+    said.
+
+    Reported, not fixed: re-granting is one statement an operator can read, and
+    guessing which roles *should* have access is not something this module knows.
+    """
+    role = f"tokenweir_reader_{uuid.uuid4().hex[:8]}"
+    admin = psycopg_module.connect(postgres_dsn)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE ROLE "{role}"')
+        execute(legacy_with_rows, f'GRANT SELECT ON gateway_usage_daily TO "{role}"')
+
+        result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+        warned = [
+            o
+            for o in result.observations
+            if o.relation == "gateway_usage_daily" and role in o.description
+        ]
+        assert len(warned) == 1, [o.description for o in result.observations]
+        assert "re-granting" in warned[0].description
+        assert "--reader-role does not reach this" in warned[0].description
+
+        # And the loss it warns about is real, which is what makes the warning
+        # worth having rather than defensive noise.
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+        assert fetch(
+            legacy_with_rows,
+            "SELECT has_table_privilege(%s, 'gateway_usage_daily', 'SELECT')",
+            (role,),
+        ) == [(False,)]
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(f'DROP OWNED BY "{role}"')
+            cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
+        admin.close()
+
+
 def test_a_table_squatting_on_the_view_name_is_not_replaced(legacy):
     """It may hold rows, and replacing it would destroy them."""
     execute(legacy, "DROP VIEW gateway_usage_daily")
@@ -739,3 +913,39 @@ def test_a_baseline_that_is_not_a_date_is_refused(given):
     every historical cost, so this is refused rather than coerced."""
     with pytest.raises(ValueError, match="ISO date"):
         _normalise_baseline(given)
+
+
+@pytest.mark.parametrize("given", ["infinity", "INFINITY", " Infinity "])
+def test_a_positive_infinity_baseline_is_refused_by_name(given):
+    """`DATE 'infinity'` is valid SQL and is the semantic opposite of what the flag
+    is for. Migration 005 joins a rate on `effective_from <= usage_day`, so a card
+    dated at the end of time is in force on no day that has happened.
+
+    Review 1 found this accepted, planned AUTOMATIC and applied: the run exited 0
+    having left every pre-existing row `is_priced = false`, which is exactly what
+    the story's third acceptance clause forbids. The parametrisation next to this
+    one covered `-infinity` and `-INFINITY` and agreed with the code rather than
+    with the spec.
+    """
+    with pytest.raises(ValueError, match="in force on no day"):
+        _normalise_baseline(given)
+
+
+def test_the_negative_infinity_baseline_prices_every_pre_existing_row(
+    legacy_with_rows,
+):
+    """The value that *is* offered, doing what it is offered for.
+
+    The counterpart to the test above, and the reason it is not enough to assert
+    the refusal: 'these were always the rates' has to actually price the history,
+    or the flag would be documented and useless.
+    """
+    apply(legacy_with_rows, baseline_effective_from="-infinity")
+
+    rollup = fetch(
+        legacy_with_rows,
+        "SELECT is_priced, est_cost_usd FROM gateway_usage_daily "
+        "ORDER BY pricing_mode NULLS LAST",
+    )
+    assert [r[0] for r in rollup] == [True, True]
+    assert [float(r[1]) for r in rollup] == [0.0525, 0.0375]

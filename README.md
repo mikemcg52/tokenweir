@@ -648,7 +648,11 @@ Three things it will not do:
   effective_from)`, and back-filling the existing rows needs a baseline date that
   decides which historical usage those rates are taken to have covered. There is no
   default: `--baseline-effective-from` is required, and `-infinity` is accepted and
-  means "these were always the rates". If two rows share a model — the old key
+  means "these were always the rates" — write it as
+  `--baseline-effective-from=-infinity`, with the equals sign, or argparse reads the
+  leading dash as an option. Positive `infinity` is **refused**: it is in force on no
+  day that has happened, so every existing row would quietly stop pricing. If two
+  rows share a model — the old key
   allowed one per pricing mode, the new schema has no `pricing_mode` — it refuses
   and names them, because one of those rows has nowhere to go and choosing is a
   decision about money.
@@ -658,6 +662,25 @@ Three things it will not do:
 
 Re-running it is a no-op, so it is safe to leave in a deploy script — though the
 plan-first order above is the one to use the first time.
+
+**A reconciled database is not identical to a fresh one, in three named ways**, and
+none of them is a defect:
+
+- `gateway_usage.id` stays `BIGSERIAL` rather than becoming `GENERATED ALWAYS AS
+  IDENTITY`. Converting it is a full table rewrite for a property that only matters
+  if rows are ever rebuilt — where restoring the old ids needs `OVERRIDING SYSTEM
+  VALUE` and a sequence reset anyway.
+- Columns the gateway owns are still there, and tokenweir's writer will not
+  populate them.
+- Added columns land at the end of the table rather than in the migration's order.
+  Column *position* is not something anything here reads, and reordering would mean
+  rewriting the table.
+
+`reconcile` also does not re-issue grants. Dropping and recreating the rollup view
+discards its SELECT grants, and `--reader-role` does not reach it — the grant lives
+in migration 005, which reconcile executes without a reader role set. The plan names
+the roles that will need re-granting; the statement is in "Granting a reader role
+later" above.
 
 **One limit, stated because you are about to run this against a real database.**
 tokenweir's own migrations were reconstructed during the extraction rather than

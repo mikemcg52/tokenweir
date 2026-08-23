@@ -298,10 +298,12 @@ nothing.
   deployment that ran only some of its own migrations. The diff is computed from what is *there*,
   never from what `schema_migrations` claims, so this is the ordinary case rather than a special
   one.
-- **`schema_migrations` records a version tokenweir does not ship.** Already refused by
-  `UnknownAppliedVersionError`; the reconciler must surface that as a plain refusal rather than a
-  traceback, because it is the first thing an operator will hit on a gateway that had seven
-  migrations.
+- **`schema_migrations` records a version tokenweir does not ship.** This turns out to be
+  unreachable *for the reconciler*, and the reason is FR-003: `reconcile` never reads that table,
+  so it has no opinion about what it records. `migrations.apply` and `status` still refuse with
+  `UnknownAppliedVersionError`, which is correct for them and unchanged. Recorded here rather than
+  quietly dropped, because "the edge case does not arise" and "the edge case was forgotten" look
+  identical in a spec that says nothing.
 - **No `gateway_usage` at all** — the reconciler is pointed at an empty database. That is not a
   reconciliation; the plan says so and directs the operator to `apply`.
 - **An empty legacy table.** Backfills and PK swaps on zero rows must still produce the right
@@ -376,7 +378,13 @@ nothing.
   backfilling every existing row to the operator's baseline, and replacing the primary key with
   `(model, effective_from)`. Without a baseline date the discrepancy MUST be reported and MUST NOT
   be applied: the date decides which historical usage the existing rates are taken to have covered,
-  and no default for it is honest.
+  and no default for it is honest. `-infinity` MUST be accepted and means "these were always the
+  rates"; it MUST be documented as `--baseline-effective-from=-infinity`, because argparse reads a
+  leading dash as an option and the spaced form fails. Positive `infinity` MUST be **refused**: it
+  is valid SQL, it is in force on no day that has happened, and accepting it produced a run that
+  reported `AUTOMATIC`, exited `0`, and left every pre-existing row unpriced — the direct negation
+  of SC-004. The refusal MUST name `-infinity` as the thing probably meant, because the obvious
+  recovery from the argparse error is to drop the dash.
 - **FR-014**: When the existing rate card holds more than one row per `model` (the current-valued
   key is `(model, pricing_mode)`), the restructure MUST be `MANUAL` and MUST name the offending
   models. tokenweir's rate card has no `pricing_mode` column; one of those rows has no
@@ -384,8 +392,20 @@ nothing.
 - **FR-015**: A `gateway_usage_daily` whose column set differs from tokenweir's MUST be resolved by
   dropping and recreating it from migration 005 — `CREATE OR REPLACE VIEW` cannot change a view's
   column set. It MUST be `MANUAL` if any other object depends on the view.
-- **FR-016**: Missing indexes MUST be `AUTOMATIC`. Extra indexes MUST be reported and never
-  dropped.
+- **FR-015a**: That drop takes the view's **ACL** with it, and migration 005 re-issues the grant
+  only when `tokenweir.reader_role` is set, which reconciliation never does. The plan MUST report
+  an `Observation` naming the roles that will lose `SELECT`. It MUST NOT re-grant: which roles
+  *should* have access is not something this module knows, and reconciliation is not the moment to
+  start managing permissions. ("The view holds no data" was the original justification for
+  permitting this one drop; it was true of rows and false of privileges.)
+- **FR-016**: Missing indexes MUST be `AUTOMATIC`. Extra indexes MUST be reported as
+  `Observation`s and never dropped.
+- **FR-016a**: An index whose **name** matches one tokenweir ships but whose shape differs MUST be
+  `MANUAL`. Index names are unique per schema and the gateway named its own; the resolution
+  statement is `pg_get_indexdef`'s, so it carries tokenweir's name and no `IF NOT EXISTS`, and
+  `AUTOMATIC` would be a plan that cannot execute. Nothing is corrupted when it fails — the
+  transaction rolls back — but "every difference here is resolvable" is the one promise the plan
+  makes.
 - **FR-017**: An empty plan MUST be distinguishable from a plan that could not be computed. The
   tool MUST NOT report "no differences" for any reason other than having found none.
 
@@ -449,8 +469,12 @@ nothing.
   `reconcile --apply` produces a schema that introspects **identically** to one produced by running
   tokenweir's migrations on an empty database — same columns, types, nullability, defaults,
   primary keys and indexes on `gateway_usage` and `model_pricing_rates`, same column set on
-  `gateway_usage_daily` — modulo the documented `id` exception (`BIGSERIAL` is kept, per the
-  story) and any extra gateway columns, which are reported and kept.
+  `gateway_usage_daily` — modulo **three** documented deviations, and nothing else: the `id`
+  exception (`BIGSERIAL` is kept, per the story), any extra gateway columns (reported and kept),
+  and column **order**, since an added column lands at the end of the table rather than in the
+  migration's position. Nothing reads column position and reordering would mean rewriting the
+  table, so the third is a deviation rather than a defect — but it is one, and the assertion must
+  subtract it by name rather than by comparing in a way that cannot see it.
 - **SC-002**: Every pre-existing row is present after reconciliation with every original column
   value unchanged, verified column-by-column and not by count alone.
 - **SC-003**: `PostgresSource.write` succeeds against the reconciled database and fails against the
