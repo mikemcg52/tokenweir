@@ -400,6 +400,21 @@ nothing.
   permitting this one drop; it was true of rows and false of privileges.)
 - **FR-016**: Missing indexes MUST be `AUTOMATIC`. Extra indexes MUST be reported as
   `Observation`s and never dropped.
+- **FR-016b**: Constraints other than the primary key MUST be compared, matched by **definition**
+  (`pg_get_constraintdef`) rather than by name, since the gateway named its own. A reference
+  constraint the live table lacks MUST be `AUTOMATIC` only when the existing rows are checked and
+  satisfy it — `ADD CONSTRAINT … CHECK` validates what is already there, so classifying it
+  otherwise is a plan that promises to resolve every difference and then dies on one. Rows that
+  violate it, a definition the tool cannot check, or a name collision MUST all be `MANUAL`. Extra
+  constraints MUST get FR-009's treatment: reported, never dropped.
+
+  This was missing entirely from the first implementation, and the omission is worth recording
+  rather than quietly repairing. `Relation` modelled columns, keys and indexes; migration 003's
+  `CHECK (… >= 0)` — the guard that stops a negative price entering the rate card — was therefore
+  absent from a reconciled table while `plan()` printed *"this database already matches the schema
+  tokenweir owns"*. Both FR-001 and FR-017 were breached, and the SC-001 test could not see it
+  because it is written in terms of the same snapshot that did not model constraints: the
+  implementation and its test agreed with each other and disagreed with the requirement.
 - **FR-016a**: An index whose **name** matches one tokenweir ships but whose shape differs MUST be
   `MANUAL`. Index names are unique per schema and the gateway named its own; the resolution
   statement is `pg_get_indexdef`'s, so it carries tokenweir's name and no `IF NOT EXISTS`, and
@@ -492,6 +507,38 @@ nothing.
 - **SC-007**: The authoritative test command (`/workspace/.mado/project.yaml`) stays green, and the
   real-Postgres additions skip cleanly under the bare install exactly as the existing store tests
   do, with `tests/conftest.py`'s disclosure note unchanged in meaning.
+
+## Additions beyond the requirements
+
+Three things were built that no requirement above asks for. Each is small, each is defended, and
+each is listed here so it reads as a decision rather than as accretion nobody noticed:
+
+- **`apply()` refuses a `baseline_effective_from` that disagrees with the plan it was handed.**
+  FR-020's staleness check already covers the case that matters. This covers a narrower one — a
+  caller applying a plan a human read under a *different* date — where the failure is silent and
+  the subject is money.
+- **The rendered plan flags statements that remove a relation.** FR-007 asks for the statements;
+  it does not ask for them to be annotated. The annotation exists because `--apply` is the operator
+  review, and a review where the one destructive statement has to be spotted by reading SQL
+  carefully is not one.
+- **A test asserts the README still names the three ways a reconciled database differs from a
+  fresh one.** SC-006 requires only the reconstruction residual. This guards the neighbouring
+  claims, by anchor rather than by sentence, following the rule TOKWEIR-31 set for exactly this.
+
+## Known limits, recorded rather than left to be rediscovered
+
+- **`--reader-role` is accepted by `reconcile` and does nothing.** It comes from the shared option
+  group FR-023 requires, and reconciliation never sets `tokenweir.reader_role` (FR-015a). Named in
+  the README and in the grant observation, so an operator who reads is told; the flag still parses.
+- **The rollup view is compared by column set and order, not by definition text.** A live view
+  whose columns happen to match tokenweir's but whose body does not is reported as no difference.
+  FR-015 asks only for the column-set case, and pinning the text would cry wolf on every reformat —
+  but the residual is real, and this is where it is written down.
+- **`apply()`'s re-derivation is not atomic with its execution.** `plan()` rolls back, which is
+  what makes it read-only, so the statements run in a new transaction holding none of the
+  comparison's locks. A change landing in that gap is an error and a rollback, not a corrupted
+  database. No advisory lock is taken: that lock serialises two *migrators*, and two operators
+  reconciling one database at once is not a case anybody has.
 
 ## Assumptions
 

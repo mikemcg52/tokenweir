@@ -30,6 +30,7 @@ import uuid
 import pytest
 
 from tokenweir import UsageRecord
+from tokenweir.migrations import apply as apply_migrations
 from tokenweir.postgres import PostgresSource
 from tokenweir.reconcile import (
     REFERENCE_SCHEMA_PREFIX,
@@ -40,6 +41,7 @@ from tokenweir.reconcile import (
     Resolution,
     _normalise_baseline,
     _snapshot,
+    _view_migration_sql,
     apply,
     plan,
     reference_snapshot,
@@ -364,6 +366,117 @@ def test_an_index_squatting_on_a_shipped_index_name_is_a_decision(legacy_with_ro
         apply(legacy_with_rows, baseline_effective_from=BASELINE)
 
 
+# --- Constraints (review 2, High-1) -------------------------------------------
+
+
+def test_the_rate_cards_non_negative_check_survives_reconciliation(
+    legacy_with_rows, psycopg_module
+):
+    """Migration 003's `CHECK (… >= 0)` is the guard that stops a negative price
+    entering the rate card. `Relation` modelled columns, keys and indexes and not
+    constraints, so a reconciled table did not have it — and `plan()` then printed
+    "this database already matches the schema tokenweir owns", which is a false
+    claim about a money guard made by the one sentence an operator reads before
+    pointing the gateway at the database.
+
+    Red before the fix in three separate ways: the plan was empty, the constraint
+    was absent, and the negative insert succeeded.
+    """
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+    missing = find(result, "model_pricing_rates", "costs_non_negative")
+    assert missing.resolution is Resolution.AUTOMATIC
+    assert "existing rows satisfy it" in missing.description
+
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    with pytest.raises(psycopg_module.errors.CheckViolation):
+        execute(
+            legacy_with_rows,
+            "INSERT INTO model_pricing_rates (model, pricing_mode, effective_from, "
+            "input_cost_usd_per_mtok, output_cost_usd_per_mtok) "
+            "VALUES ('negative', 'api', DATE '2024-01-01', -5, 1)",
+        )
+    legacy_with_rows.rollback()
+
+    assert plan(legacy_with_rows, baseline_effective_from=BASELINE).is_empty
+
+
+def test_a_constraint_existing_rows_already_violate_is_a_decision(legacy_with_rows):
+    """`ADD CONSTRAINT … CHECK` validates the rows already there, so classifying it
+    AUTOMATIC without asking the data would be a plan that promises to resolve every
+    difference and then dies on one — the same mistake the index-name collision was.
+
+    And what it finds is worth finding: a price tokenweir's schema calls impossible
+    is already stored.
+    """
+    execute(
+        legacy_with_rows,
+        "INSERT INTO model_pricing_rates (model, pricing_mode, "
+        "input_cost_usd_per_mtok, output_cost_usd_per_mtok) "
+        "VALUES ('claude-haiku-4-5', 'api', -1, 1)",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    blocked = find(result, "model_pricing_rates", "existing rows violate it")
+    assert blocked.resolution is Resolution.MANUAL
+    assert blocked.statements == ()
+    assert "bill anything" in blocked.remedy
+
+    with pytest.raises(ManualResolutionError):
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+
+def test_a_null_in_a_checked_column_is_not_a_violation(legacy_with_rows):
+    """A CHECK is satisfied when its expression is TRUE **or NULL**. The probe uses
+    `NOT (body)`, whose NULL is not TRUE, so a nullable cache rate left unset does
+    not read as a row that violates the guard — which would have made the ordinary
+    rate card MANUAL and refused the reconciliation this story is for."""
+    assert fetch(
+        legacy_with_rows,
+        "SELECT cache_read_cost_usd_per_mtok FROM model_pricing_rates",
+    ) == [(None,)]
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    assert find(
+        result, "model_pricing_rates", "costs_non_negative"
+    ).resolution is Resolution.AUTOMATIC
+
+
+def test_a_constraint_the_gateway_owns_is_reported_and_kept(legacy_with_rows):
+    """FR-009's treatment, applied to constraints: it is the gateway's rule about
+    the gateway's data, and this module does not remove it."""
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE gateway_usage ADD CONSTRAINT gateway_usage_status_known "
+        "CHECK (status IN ('ok', 'error'))",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    noted = [o for o in result.observations if "gateway_usage_status_known" in o.description]
+    assert len(noted) == 1
+    assert "left in place" in noted[0].description
+    assert "DROP CONSTRAINT gateway_usage_status_known" not in " ".join(result.statements)
+
+
+def test_a_constraint_squatting_on_a_shipped_name_is_a_decision(legacy_with_rows):
+    """Constraint names are unique per table, so `ADD CONSTRAINT` would fail on the
+    duplicate — the index-name collision one relation over."""
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE model_pricing_rates "
+        "ADD CONSTRAINT model_pricing_rates_costs_non_negative CHECK (model <> '')",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    collision = find(result, "model_pricing_rates", "says something else")
+    assert collision.resolution is Resolution.MANUAL
+    assert collision.statements == ()
+
+
 def test_planning_refuses_an_autocommit_connection(scratch_schema):
     """FR-005. Under autocommit the reference schema's rollback does nothing, and
     a scratch schema would be left in the operator's database by the command whose
@@ -434,7 +547,32 @@ def test_a_missing_table_says_to_apply_rather_than_reconcile(connection):
 
     usage = find(result, "gateway_usage", "absent")
     assert usage.resolution is Resolution.MANUAL
+    assert "none of" in usage.remedy
     assert "migrations apply" in usage.remedy
+
+
+def test_a_partially_migrated_database_is_not_sent_to_a_command_that_does_nothing(
+    legacy,
+):
+    """Review 2's Med-1. The remedy for an absent table said to run `apply` — which
+    on a database whose `schema_migrations` records 1-6 returns `()` and creates
+    nothing, because that silent no-op is this module's entire reason for existing.
+
+    The empty-database test below asserts the *other* remedy, and it was the only
+    one there was: it uses the one database where the advice happened to be true.
+    """
+    execute(legacy, "DROP TABLE model_pricing_rates CASCADE")
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+
+    absent = find(result, "model_pricing_rates", "absent")
+    assert absent.resolution is Resolution.MANUAL
+    assert "Do not reach for `apply`" in absent.remedy
+    assert "003_model_pricing_rates.sql" in absent.remedy
+
+    # And the advice it replaced is provably useless here.
+    assert apply_migrations(legacy) == ()
+    assert fetch(legacy, "SELECT to_regclass('model_pricing_rates')") == [(None,)]
 
 
 def test_an_absent_rollup_view_is_simply_created(legacy):
@@ -567,6 +705,11 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
         # Every index tokenweir wants is present by shape. The gateway's own extra
         # ones are still there and are not asserted away.
         assert {shape for shape, _ in want.indexes} <= {shape for shape, _ in got.indexes}, name
+        # Likewise every constraint. Absent from this assertion until review 2, and
+        # invisible to it: the comparison is written in terms of `_snapshot`, and
+        # `_snapshot` did not model constraints — so implementation and test agreed
+        # with each other and disagreed with FR-001.
+        assert {d for _, d in want.constraints} <= {d for _, d in got.constraints}, name
 
 
 def test_an_empty_legacy_table_reconciles_to_the_right_shape(legacy):
@@ -837,6 +980,80 @@ def test_the_grants_the_view_drop_discards_are_named(
             cursor.execute(f'DROP OWNED BY "{role}"')
             cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
         admin.close()
+
+
+def test_the_grant_warning_is_about_this_view_and_not_a_namesake(
+    legacy_with_rows, psycopg_module, postgres_dsn
+):
+    """Review 2's Med-2. The lookup ran `information_schema.role_table_grants WHERE
+    table_name = %s` with no schema predicate, so a `gateway_usage_daily` in an
+    unrelated schema put *its* grantees into this database's warning — naming roles
+    that will lose nothing.
+
+    `pg_class.relacl` by oid answers both halves: it is scoped to the relation
+    actually resolved, and it is the ACL itself rather than a view of it filtered by
+    which roles the caller happens to be a member of.
+    """
+    bystander = f"tokenweir_bystander_{uuid.uuid4().hex[:8]}"
+    elsewhere = f"tokenweir_other_{uuid.uuid4().hex[:8]}"
+    admin = psycopg_module.connect(postgres_dsn)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE ROLE "{bystander}"')
+            cursor.execute(f'CREATE SCHEMA "{elsewhere}"')
+            cursor.execute(f'CREATE TABLE "{elsewhere}".gateway_usage_daily (a INT)')
+            cursor.execute(
+                f'GRANT USAGE ON SCHEMA "{elsewhere}" TO "{bystander}"'
+            )
+            cursor.execute(
+                f'GRANT SELECT ON "{elsewhere}".gateway_usage_daily TO "{bystander}"'
+            )
+
+        result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+        assert not any(
+            bystander in o.description for o in result.observations
+        ), [o.description for o in result.observations]
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{elsewhere}" CASCADE')
+            cursor.execute(f'DROP OWNED BY "{bystander}"')
+            cursor.execute(f'DROP ROLE IF EXISTS "{bystander}"')
+        admin.close()
+
+
+def test_the_rendered_plan_carries_the_whole_statement(legacy_with_rows):
+    """Review 2's Med-3. Every statement went through `_one_line(…, limit=160)`, so
+    migration 005's six thousand characters were printed as a hundred and sixty and
+    an ellipsis — the one statement that drops and rebuilds a relation was the one
+    an operator could not read.
+
+    The plan-first design rests on the plan being readable before it is run. A
+    renderer that elides the interesting statement makes "read the plan" advice
+    nobody can take.
+    """
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+    rendered = result.render()
+
+    assert len(_view_migration_sql("gateway_usage_daily")) > 1000, (
+        "this test is about a statement too long to squash"
+    )
+    # The parts an operator has to see to judge the rebuild: the grouping key that
+    # changes the view's shape, and the guard that decides what stays unpriced.
+    for fragment in ("BOOL_AND", "u.pricing_mode,", "est_cost_usd", "LEFT JOIN LATERAL"):
+        assert fragment in rendered, f"the rendered plan elides {fragment!r}"
+
+    # The general form, so this does not become a list of fragments somebody
+    # remembered: every statement, whole, line for line.
+    unindented = "\n".join(line.strip() for line in rendered.splitlines())
+    for statement in result.statements:
+        for line in statement.strip("\n").splitlines():
+            assert line.strip() in unindented, f"the rendered plan elides {line.strip()!r}"
+
+    # Descriptions are still summaries and may still be elided — the "…" in the
+    # constraint's one-line description is one, and it is deliberate. What must not
+    # be elided is the SQL, which is what the loop above pins.
 
 
 def test_a_table_squatting_on_the_view_name_is_not_replaced(legacy):

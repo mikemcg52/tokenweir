@@ -370,8 +370,11 @@ def test_the_readme_names_the_ways_a_reconciled_database_differs():
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
     section = readme.split("A reconciled database is not identical to a fresh one")[-1]
-    for deviation in ("BIGSERIAL", "Columns the gateway owns", "end of the table"):
-        assert deviation in section, f"README no longer names {deviation!r}"
-    # And the grant the view rebuild discards, which is not a schema difference and
-    # is exactly as invisible.
-    assert "does not re-issue grants" in section
+    # Anchors, not prose. Following the rule `tests/conftest.py`'s
+    # `OptionalDriver.anchors` established for the same reason (TOKWEIR-31): a check
+    # against whole English sentences fails on a reword, which trains the next
+    # person to delete the check rather than keep the claim. These four are the
+    # identifiers the claims are *about*, and none of them survives a reword that
+    # drops the deviation it names.
+    for anchor in ("BIGSERIAL", "populate", "order", "grants"):
+        assert anchor in section, f"README no longer names {anchor!r}"

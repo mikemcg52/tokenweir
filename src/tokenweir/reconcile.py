@@ -192,6 +192,13 @@ class Relation:
     primary_key: tuple[str, ...]
     #: ``(shape, definition)`` per non-constraint index — see :func:`_index_shape`.
     indexes: tuple[tuple[str, str], ...]
+    #: ``(name, definition)`` per constraint that is not the primary key, from
+    #: ``pg_get_constraintdef``. Here because leaving it out was a silent hole: the
+    #: rate card's ``CHECK (… >= 0)`` is migration 003's guard against a negative
+    #: price, a reconciled table did not have it, and the plan said the database
+    #: already matched — a false claim about a money guard, made by the one
+    #: sentence an operator reads before pointing the gateway at it.
+    constraints: tuple[tuple[str, str], ...] = ()
 
     def column(self, name: str) -> Optional[Column]:
         return next((c for c in self.columns if c.name == name), None)
@@ -310,7 +317,7 @@ class ReconciliationPlan:
                 if discrepancy.remedy:
                     lines.append(f"             -> {discrepancy.remedy}")
                 for statement in discrepancy.statements:
-                    lines.append(f"             {_one_line(statement)}")
+                    lines.extend(_render_statement(statement))
                     # Named where it is read, not only in the docs. This is the one
                     # place a reconciliation can destroy anything, and an operator
                     # deciding whether to pass --apply should not have to notice it
@@ -325,8 +332,8 @@ class ReconciliationPlan:
                     # read on the fourth.
                     if _drops_a_relation(statement):
                         lines.append(
-                            "             ^ removes a relation — the rollup view is "
-                            "rebuilt from migration 005 in the same transaction. "
+                            f"{_STATEMENT_INDENT}^ removes a relation — the rollup view "
+                            "is rebuilt from migration 005 in the same transaction. "
                             "This module never drops a column, a table or a row."
                         )
         for observation in self.observations:
@@ -354,6 +361,28 @@ def _drops_a_relation(statement: str) -> bool:
     if not destructive_statements(statement):
         return False
     return bool(_DROPS_RELATION_RE.search(statement))
+
+
+#: How far a rendered statement is indented under its discrepancy.
+_STATEMENT_INDENT = " " * 13
+
+
+def _render_statement(statement: str) -> list[str]:
+    """One statement, in full, for a human deciding whether to pass ``--apply``.
+
+    **Not truncated**, and that is a correction rather than a preference. These
+    lines used to go through ``_one_line``, which squashed migration 005's six
+    thousand characters down to a hundred and sixty and an ellipsis — so the one
+    statement that drops and rebuilds a relation was the one an operator could not
+    read. The whole plan-first design rests on the plan being readable before it is
+    run; a renderer that elides the interesting statement makes "read the plan"
+    advice nobody can take.
+
+    Long is the right failure here. An operator who wants less can stop reading; an
+    operator who wants more had nowhere to get it.
+    """
+    body = statement.strip("\n")
+    return [f"{_STATEMENT_INDENT}{line}" if line.strip() else "" for line in body.splitlines()]
 
 
 def _one_line(statement: str, limit: int = 160) -> str:
@@ -412,6 +441,11 @@ def _index_shape(indexdef: str) -> str:
 def _strip_schema(sql: str, schema: str) -> str:
     """Remove a schema qualifier so two schemas' definitions compare equal."""
     return sql.replace(f"{_quote(schema)}.", "").replace(f"{schema}.", "")
+
+
+def _normalise_sql(sql: str) -> str:
+    """Whitespace-squashed, for comparing two renderings of the same definition."""
+    return " ".join(sql.split())
 
 
 def _relation_oid(cursor: Any, schema: Optional[str], name: str) -> Optional[int]:
@@ -488,6 +522,21 @@ def _snapshot(connection: Any, names: Sequence[str], schema: Optional[str] = Non
                 )
             )
 
+            # Everything except the primary key, which is compared as a key just
+            # above. `conislocal`/inheritance is not filtered: nothing here
+            # inherits, and a constraint that arrived by inheritance is still one
+            # the table has.
+            cursor.execute(
+                "SELECT c.conname, pg_get_constraintdef(c.oid) "
+                "FROM pg_constraint c WHERE c.conrelid = %s AND c.contype <> 'p' "
+                "ORDER BY c.conname",
+                (oid,),
+            )
+            constraints = tuple(
+                sorted((r[0], _normalise_sql(_strip_schema(r[1], namespace)))
+                       for r in cursor.fetchall())
+            )
+
             relations.append(
                 Relation(
                     name=name,
@@ -495,6 +544,7 @@ def _snapshot(connection: Any, names: Sequence[str], schema: Optional[str] = Non
                     columns=columns,
                     primary_key=primary_key,
                     indexes=indexes,
+                    constraints=constraints,
                 )
             )
     return Snapshot(relations=tuple(relations))
@@ -520,6 +570,19 @@ def _owned_relation_names() -> tuple[str, ...]:
             if name not in names:
                 names.append(name)
     return tuple(names)
+
+
+def _creating_migration(relation: str) -> Optional[str]:
+    """The filename of the shipped migration that creates ``relation``."""
+    pattern = re.compile(
+        rf"CREATE\s+(?:TABLE|(?:OR\s+REPLACE\s+)?VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        rf"{re.escape(relation)}\b",
+        re.IGNORECASE,
+    )
+    for migration in discover():
+        if pattern.search(migration.sql):
+            return migration.filename
+    return None
 
 
 def _view_migration_sql(view: str) -> str:
@@ -1140,15 +1203,155 @@ def _view_grantees(connection: Any, view: str) -> tuple[str, ...]:
     Reported rather than fixed. Re-granting is one statement an operator can read;
     guessing which roles *should* have access is not something this module knows.
     """
+    # `pg_class.relacl` by oid, resolved the same way every other probe here
+    # resolves a relation. The obvious query — `information_schema.role_table_grants
+    # WHERE table_name = %s` — has no schema predicate, so a same-named view in an
+    # unrelated schema put its grantees into this warning; and that view is exposed
+    # only for grants involving a currently-enabled role, so a grant issued by an
+    # owner this connection is not a member of went missing altogether. The ACL is
+    # the authoritative answer to both, and it does not depend on who is asking.
     with connection.cursor() as cursor:
         cursor.execute(
-            "SELECT DISTINCT grantee FROM information_schema.role_table_grants "
-            "WHERE table_name = %s AND privilege_type = 'SELECT' "
-            "  AND grantee <> grantor "
+            "SELECT DISTINCT COALESCE(r.rolname, 'PUBLIC') "
+            "FROM pg_class c "
+            "CROSS JOIN LATERAL aclexplode(c.relacl) a "
+            "LEFT JOIN pg_roles r ON r.oid = a.grantee "
+            "WHERE c.oid = to_regclass(%s) "
+            "  AND a.privilege_type = 'SELECT' "
+            "  AND a.grantee <> c.relowner "
             "ORDER BY 1",
             (view,),
         )
         return tuple(row[0] for row in cursor.fetchall())
+
+
+_CHECK_BODY_RE = re.compile(r"^CHECK\s*\((?P<body>.*)\)$", re.IGNORECASE | re.DOTALL)
+
+
+def _check_constraint_violations(connection: Any, relation: str, definition: str) -> bool:
+    """Whether existing rows would fail ``definition``, or ``None`` if unknowable.
+
+    ``ALTER TABLE … ADD CONSTRAINT … CHECK`` validates the rows already there and
+    fails if any do not pass. Classifying the addition ``AUTOMATIC`` without
+    asking the data would be the index-name mistake again: a plan that promises it
+    can resolve every difference and then dies on one.
+
+    ``NOT (body)`` rather than ``body IS NOT TRUE``: a CHECK is satisfied when its
+    expression is TRUE **or NULL**, and ``NOT`` of NULL is NULL, so a row with a
+    null in it is correctly not counted as a violation.
+    """
+    match = _CHECK_BODY_RE.match(_normalise_sql(definition))
+    if not match:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"SELECT EXISTS (SELECT 1 FROM {_quote(relation)} "
+            f"WHERE NOT ({match.group('body')}))"
+        )
+        return bool(cursor.fetchone()[0])
+
+
+def _compare_constraints(
+    connection: Any, relation: str, reference: Relation, live: Relation
+) -> tuple[list[Discrepancy], list[Observation]]:
+    """Constraints tokenweir ships that this table has not got, and vice versa.
+
+    Matched by **definition**, not by name — the gateway named its own, and
+    `pg_get_constraintdef` renders the same expression the same way on both sides,
+    which is what makes the comparison possible at all. A name that collides with a
+    differing definition gets the same treatment as a colliding index: `MANUAL`,
+    because `ADD CONSTRAINT` would fail on the duplicate name.
+    """
+    discrepancies: list[Discrepancy] = []
+    observations: list[Observation] = []
+    live_definitions = {definition for _, definition in live.constraints}
+    reference_definitions = {definition for _, definition in reference.constraints}
+    live_names = {name for name, _ in live.constraints}
+    table = _quote(relation)
+
+    for name, definition in reference.constraints:
+        if definition in live_definitions:
+            continue
+        if name in live_names:
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"constraint {name} exists but says something else; "
+                        f"tokenweir's is {_one_line(definition, 90)}"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        f"tokenweir cannot add its {name} while a different constraint "
+                        "holds the name, and it will not drop yours. Rename or remove "
+                        "the existing one, then reconcile again."
+                    ),
+                )
+            )
+            continue
+
+        violated = _check_constraint_violations(connection, relation, definition)
+        if violated is None:
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"constraint {name} is missing: {_one_line(definition, 90)}"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        "tokenweir only adds a constraint it can check the existing "
+                        "rows against first, and it does not know how to check this "
+                        "one. Add it yourself once you have: "
+                        f"ALTER TABLE {relation} ADD CONSTRAINT {name} {definition};"
+                    ),
+                )
+            )
+        elif violated:
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"constraint {name} is missing and existing rows violate it: "
+                        f"{_one_line(definition, 90)}"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        "adding it would fail on the rows already there, and deciding "
+                        "what those rows should say is not this tool's to do. On the "
+                        "rate card this means a price tokenweir's schema calls "
+                        "impossible is already stored — worth knowing before it is "
+                        "used to bill anything."
+                    ),
+                )
+            )
+        else:
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"constraint {name} is missing: {_one_line(definition, 90)} "
+                        "(existing rows satisfy it)"
+                    ),
+                    resolution=Resolution.AUTOMATIC,
+                    statements=(
+                        f"ALTER TABLE {table} ADD CONSTRAINT {_quote(name)} {definition}",
+                    ),
+                )
+            )
+
+    for name, definition in live.constraints:
+        if definition not in reference_definitions:
+            observations.append(
+                Observation(
+                    relation=relation,
+                    description=(
+                        f"constraint {name} is not part of tokenweir's schema and is "
+                        f"left in place: {_one_line(definition, 90)}"
+                    ),
+                )
+            )
+    return discrepancies, observations
 
 
 def _compare_view(
@@ -1289,20 +1492,39 @@ def plan(
             continue
 
         if live_relation is None:
-            # Not a reconciliation. `apply` creates missing objects and is the
-            # right command; saying so beats emitting a CREATE TABLE from here and
-            # leaving `schema_migrations` describing a database that no longer
-            # exists.
+            # Two different databases wear this symptom, and they need opposite
+            # advice. A fresh one has nothing at all and `apply` is exactly right.
+            # A database that has *some* of these relations is the case this module
+            # exists for — its `schema_migrations` records the migrations as
+            # applied, so `apply` returns `()` and creates nothing. Telling that
+            # operator to run `apply` sends them to a command that provably does
+            # nothing, and FR-019 then blocks every resolvable discrepancy behind
+            # the refusal. One remedy for both was a dead end for the one that
+            # matters.
+            if not live.relations:
+                remedy = (
+                    "there is nothing here to reconcile — this database has none of "
+                    "tokenweir's relations. `python -m tokenweir.migrations apply` "
+                    "creates the schema; reconcile only reshapes what already exists."
+                )
+            else:
+                creator = _creating_migration(name) or "the shipped migration"
+                remedy = (
+                    f"the rest of tokenweir's schema is here, so this database is "
+                    f"part-way rather than empty. Do not reach for `apply`: if "
+                    f"schema_migrations already records {creator} as applied — which "
+                    "is the ordinary case on a database the gateway migrated, and "
+                    "this module's whole reason for existing — it will return "
+                    "nothing and create nothing. Run "
+                    f"src/tokenweir/migrations/sql/{creator} against the database "
+                    "yourself, then reconcile again to shape it."
+                )
             discrepancies.append(
                 Discrepancy(
                     relation=name,
                     description="table is absent from this database",
                     resolution=Resolution.MANUAL,
-                    remedy=(
-                        "there is nothing here to reconcile. `python -m "
-                        "tokenweir.migrations apply` creates tokenweir's schema; "
-                        "reconcile only reshapes objects that already exist."
-                    ),
+                    remedy=remedy,
                 )
             )
             continue
@@ -1346,6 +1568,14 @@ def plan(
         discrepancies.extend(index_discrepancies)
         observations.extend(index_observations)
 
+        # After the columns: a CHECK naming a column cannot be added before the
+        # column exists, and the rate-card restructure is what adds effective_from.
+        constraint_discrepancies, constraint_observations = _compare_constraints(
+            connection, name, reference_relation, live_relation
+        )
+        discrepancies.extend(constraint_discrepancies)
+        observations.extend(constraint_observations)
+
     connection.rollback()
     return ReconciliationPlan(
         discrepancies=tuple(discrepancies),
@@ -1379,6 +1609,16 @@ def apply(
             state this module exists to prevent.
         PlanStaleError: the database changed since ``existing_plan`` was made.
         ValueError, ReferenceSchemaError: see :func:`plan`.
+
+    **The re-derivation is not atomic with the execution**, and the window is worth
+    knowing rather than papering over. :func:`plan` rolls back when it is done —
+    that is what makes it read-only — so the statements below run in a *new*
+    transaction, holding none of the locks the comparison held. A schema change
+    landing in that gap produces an error and a rollback, not a corrupted database,
+    which is why this takes no advisory lock the way
+    :func:`tokenweir.migrations.apply` does: that lock exists to serialise two
+    *migrators*, and two operators reconciling one database at once is not a case
+    anybody has.
     """
     _require_transactional(connection, "apply")
 
