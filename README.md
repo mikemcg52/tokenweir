@@ -640,9 +640,11 @@ Three things it will not do:
 
 - **It never drops a column, a table or a row.** A column the gateway has and
   tokenweir does not is the gateway's data: it is reported, kept, and left alone,
-  and tokenweir's writer will not populate it. The only `DROP` `reconcile` can emit
-  is of the rollup *view*, which holds no data — and even that becomes a decision
-  the moment anything depends on it.
+  and tokenweir's writer will not populate it. The only `DROP` `reconcile` emits
+  that removes a **relation** is of the rollup *view* — and even that becomes a
+  decision the moment anything depends on it. (It emits others that remove nothing
+  stored: `DROP DEFAULT` after a back-fill, and `DROP CONSTRAINT` on the rate
+  card's old primary key.)
 - **It will not date your rate card for you.** `model_pricing_rates` moves from
   current-valued `(model, pricing_mode)` to effective-dated `(model,
   effective_from)`, and back-filling the existing rows needs a baseline date that

@@ -551,15 +551,17 @@ def test_nullability_is_not_reported_twice_as_a_missing_constraint(legacy):
     MANUAL, and FR-019 would block the whole reconciliation — on `schema_version`
     and `effective_from`, the two columns this story exists to add.
 
-    The allow-list is asserted directly, because the embedded server here is 16 and
-    the symptom cannot be reproduced on it. What *can* be checked is that the two
-    columns are reported as columns and by nothing else.
+    The symptom cannot be reproduced on the embedded PostgreSQL 16 this suite runs
+    against, so **this test does not prove the PG 18 behaviour** and should not be
+    counted as covering it. What it does check is the property the allow-list
+    exists to preserve on any version: nullability is reported as a column
+    difference and by nothing else. On 18 the same assertion would fail if
+    `contype = 'n'` rows leaked in.
     """
-    from tokenweir.reconcile import COMPARED_CONSTRAINT_TYPES
-
-    assert "n" not in COMPARED_CONSTRAINT_TYPES
-    assert "p" not in COMPARED_CONSTRAINT_TYPES
-
+    # Deliberately *not* asserted here: `"n" not in COMPARED_CONSTRAINT_TYPES`,
+    # which review 5 pointed out is a literal compared against itself and would
+    # stay green if the constant were referenced nowhere. What follows is the real
+    # claim, and it is the one this server can actually answer.
     result = plan(legacy, baseline_effective_from=BASELINE)
     constraint_talk = [
         d.description for d in result.discrepancies if "constraint" in d.description
@@ -586,6 +588,95 @@ def test_a_generated_column_is_a_decision_not_an_invisible_match(legacy):
     generated = find(result, "gateway_usage", "latency_ms is a generated column")
     assert generated.resolution is Resolution.MANUAL
     assert generated.statements == ()
+
+
+def test_an_identity_column_is_a_decision_not_an_invisible_match(legacy_with_rows):
+    """Review 5's High-1, and the same hole as the generated-column one above.
+
+    `Column.identity` has been captured since the first commit and its docstring
+    says it exists so `BIGSERIAL` versus `GENERATED ALWAYS AS IDENTITY` "is
+    invisible to anything that only reads defaults" — and then nothing compared it,
+    so it made nothing visible. An identity column has no `column_default` and an
+    ordinary type, so it matched on every field the diff *did* compare, while
+    rejecting every INSERT the writer makes.
+
+    A field captured and never read is worse than one never captured: it reads as
+    coverage. `plan()` printed "this database already matches the schema tokenweir
+    owns" about a database that cannot be written to — FR-017's named wrong answer,
+    and the story's own phrase for what it exists to prevent.
+    """
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE gateway_usage "
+        "ADD COLUMN schema_version INTEGER NOT NULL GENERATED ALWAYS AS IDENTITY",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    mismatch = find(result, "gateway_usage", "schema_version is an identity column")
+    assert mismatch.resolution is Resolution.MANUAL
+    assert mismatch.statements == ()
+    assert "DROP IDENTITY" in mismatch.remedy
+
+
+def test_the_exempt_id_column_stays_exempt(legacy_with_rows):
+    """The other side of High-1's fix. `gateway_usage.id` is `BIGSERIAL` on the
+    live table and an identity column in tokenweir's schema — the one identity
+    difference the story says to keep — so comparing identity everywhere must not
+    start reporting it."""
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    assert not any("id is" in d.description for d in result.discrepancies), (
+        descriptions(result)
+    )
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+    assert plan(legacy_with_rows, baseline_effective_from=BASELINE).is_empty
+
+
+def test_a_column_defaulting_to_now_is_not_back_filled_with_this_moment(
+    legacy_with_rows,
+):
+    """Review 5's Med-1. `ADD COLUMN … DEFAULT now()` stamps every pre-existing row
+    with the instant of the reconciliation — a fact about this run, stored as
+    though it were a fact about the row.
+
+    `ts` is the day bucket the rollup groups on, so the whole history would price
+    into today: an SC-004 failure delivered by a plan that called itself AUTOMATIC
+    and exited 0. It is the objection FR-013 already makes about the rate card's
+    baseline, and refusing to invent an `effective_from` while silently inventing a
+    `ts` is not a position worth holding.
+    """
+    execute(legacy_with_rows, "DROP VIEW gateway_usage_daily")
+    execute(legacy_with_rows, "ALTER TABLE gateway_usage DROP COLUMN ts")
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    refused = find(result, "gateway_usage", "ts (timestamp with time zone) is missing")
+    assert refused.resolution is Resolution.MANUAL
+    assert refused.statements == ()
+    assert "not a constant" in refused.description
+
+    with pytest.raises(ManualResolutionError):
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+
+def test_a_constant_default_is_still_back_filled(legacy_with_rows):
+    """The allow-list has to let the ordinary case through, or FR-011b would refuse
+    every column migration 001 gives a `DEFAULT 0`. Asserted beside its refusal so
+    the two cannot drift into one answer."""
+    execute(
+        legacy_with_rows, "ALTER TABLE gateway_usage DROP COLUMN cache_read_input_tokens"
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    added = find(result, "gateway_usage", "cache_read_input_tokens (bigint) is missing")
+    assert added.resolution is Resolution.AUTOMATIC
+
+    apply(legacy_with_rows, baseline_effective_from=BASELINE)
+    assert fetch(
+        legacy_with_rows, "SELECT DISTINCT cache_read_input_tokens FROM gateway_usage"
+    ) == [(0,)]
 
 
 # --- The classification branches, one deformation each (review 3, Med-3) -------
@@ -616,7 +707,7 @@ def test_a_generated_column_is_a_decision_not_an_invisible_match(legacy):
         ),
         pytest.param(
             "ALTER TABLE gateway_usage DROP COLUMN status",
-            "status (text) is missing, and is NOT NULL with no default",
+            "status (text) is missing, and it is NOT NULL with no default",
             Resolution.MANUAL,
             None,
             id="missing-not-null-column-with-no-backfill",
@@ -774,6 +865,39 @@ def test_a_reference_that_cannot_be_built_is_an_error_not_an_empty_plan(
             cursor.execute(f'REVOKE ALL ON SCHEMA "{schema_name}" FROM "{role}"')
             cursor.execute(f'DROP ROLE IF EXISTS "{role}"')
         admin.close()
+
+
+def test_a_reference_build_that_fails_mid_way_leaves_no_schema_behind(
+    legacy, monkeypatch
+):
+    """FR-006 says the scratch schema must be removed "even when the reference
+    build fails". The test above fails at `CREATE SCHEMA` itself, so the schema
+    never exists and the rollback it asserts has nothing to undo — the branch was
+    covered in name only. This one fails after the schema is created and two
+    migrations are in it."""
+    import tokenweir.reconcile as reconcile_module
+
+    real_discover = reconcile_module.discover
+
+    def half_a_schema():
+        shipped = real_discover()
+        broken = type(shipped[-1])(
+            version=99, name="broken", sql="CREATE TABLE nonsense (bad_type NOT_A_TYPE)"
+        )
+        return shipped[:2] + (broken,)
+
+    monkeypatch.setattr(reconcile_module, "discover", half_a_schema)
+
+    with pytest.raises(ReferenceSchemaError):
+        plan(legacy, baseline_effective_from=BASELINE)
+
+    monkeypatch.undo()
+    assert fetch(
+        legacy,
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE %s",
+        (f"{REFERENCE_SCHEMA_PREFIX}%",),
+    ) == []
+    assert fetch(legacy, "SELECT 1") == [(1,)]
 
 
 def test_a_missing_table_says_to_apply_rather_than_reconcile(connection):

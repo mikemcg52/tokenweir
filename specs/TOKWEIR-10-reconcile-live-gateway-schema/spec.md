@@ -360,8 +360,9 @@ nothing.
   it is still there after a successful reconciliation, so counting it as a discrepancy would mean
   a reconciled database never produces an empty plan, and FR-021's "run it again and it does
   nothing" is the property that makes this safe to leave in a deploy script.
-- **FR-010**: Such an extra column MUST be classified `MANUAL` when it is `NOT NULL` with no
-  default **and it is on the table tokenweir's writer inserts into**
+- **FR-010**: Such an extra column MUST be classified `MANUAL` when it is `NOT NULL`, has no
+  default **and is not an identity column** — an identity column supplies its own value, so the
+  writer's INSERT does not fail on it — **and it is on the table tokenweir's writer inserts into**
   (`tokenweir.postgres.USAGE_TABLE`), because `PostgresSource`'s INSERT does not name it and every
   write would fail. The rule MUST be tied to that constant rather than restated, so it follows the
   writer if the writer moves.
@@ -374,6 +375,29 @@ nothing.
   saying inserts of the operator's own must still supply it.
 - **FR-011**: A column whose type differs from tokenweir's MUST be `MANUAL`. A widening might be
   safe and a narrowing is not, and distinguishing them is a decision.
+- **FR-011a**: A column that differs from tokenweir's in being **generated** (`attgenerated`) or an
+  **identity** column (`attidentity`) MUST be `MANUAL`. Neither difference is visible to a
+  comparison of type, nullability and default — both kinds of column have no `column_default` and
+  an ordinary type — so without this the live column introspects as an exact match while rejecting
+  every `INSERT` `PostgresSource` makes: `plan()` prints "this database already matches the schema
+  tokenweir owns" about a database that cannot be written to, which is FR-017's named wrong answer
+  and the story's own phrase for the failure it exists to prevent. `EXEMPT_COLUMNS` keeps
+  `gateway_usage.id` out of it, that being the one difference the story says to keep.
+
+  Recorded at length because it happened twice: `attgenerated` was added in fix round 3 and
+  `attidentity` — captured since the first commit, and documented on the `Column` record as the
+  field that makes `BIGSERIAL`-versus-identity visible at all — was still not being compared two
+  rounds later. A field captured and never read is worse than one never captured: it reads as
+  coverage.
+- **FR-011b**: A missing column whose reference default is **not provably constant** MUST be
+  `MANUAL`. `ADD COLUMN … DEFAULT now()` stamps every pre-existing row with the instant of the
+  reconciliation — a fact about this run, stored as though it were a fact about the row — and `ts`
+  is the day bucket the rollup groups on, so the whole history would price into today. That is
+  FR-008's "no data loss **and no decision**" broken on the second clause, and it is the objection
+  FR-013 already makes about the rate card's baseline: refusing to invent an `effective_from` while
+  silently inventing a `ts` is not a position worth holding. The test MUST be an allow-list of
+  provably-constant expressions, not a deny-list of known-volatile functions — an unrecognised
+  constant is then refused, where an unrecognised volatile one would be applied.
 - **FR-012**: The plan MUST report, as `AUTOMATIC`, a missing `gateway_usage.schema_version`,
   resolving it by adding the column with a default of `1`, backfilling existing rows, setting
   `NOT NULL`, and then **dropping the default** so the reconciled column matches the one migration
@@ -519,19 +543,23 @@ nothing.
 
 ## Additions beyond the requirements
 
-Five things were built that no requirement above asks for. Each is small, each is defended, and
-each is listed here so it reads as a decision rather than as accretion nobody noticed. (The count
-was three until review 4 found two more had landed without being added — which is the argument for
-the section, not against it.)
+Seven things were built that no requirement above asks for. Each is small, each is defended, and
+each is listed here so it reads as a decision rather than as accretion nobody noticed.
+
+The count has been wrong twice: it said three until review 4 found two more, and five until review
+5 found that the very commit fixing the count had landed three further guards unlisted. That is the
+argument for the section rather than against it — but it is also the reason to read it as a running
+tally somebody has to maintain, not as a guarantee.
+
+One item left: review 5 also found the **destructive-statement annotation** listed here and tested
+nowhere. It has been **removed** rather than tested. Once the renderer stopped truncating (FR-022,
+review 2), every statement prints in full and `DROP VIEW "gateway_usage_daily"` is on its own line
+— a second mechanism pointing at it was surface the story never asked for.
 
 - **`apply()` refuses a `baseline_effective_from` that disagrees with the plan it was handed.**
   FR-020's staleness check already covers the case that matters. This covers a narrower one — a
   caller applying a plan a human read under a *different* date — where the failure is silent and
   the subject is money.
-- **The rendered plan flags statements that remove a relation.** FR-007 asks for the statements;
-  it does not ask for them to be annotated. The annotation exists because `--apply` is the operator
-  review, and a review where the one destructive statement has to be spotted by reading SQL
-  carefully is not one.
 - **A test asserts the README still names the four ways a reconciled database differs from a
   fresh one.** SC-006 requires only the reconstruction residual. This guards the neighbouring
   claims, by anchor rather than by sentence, following the rule TOKWEIR-31 set for exactly this.
@@ -543,6 +571,16 @@ the section, not against it.)
 - **`_creating_migration`, and the second absent-table remedy it feeds.** Beyond what the Edge Case
   above used to ask for, and the reason it now asks for more: the single remedy was a dead end on
   the database class this module is *for*. About twenty lines.
+- **`plan()` rolls back on failure.** No FR says a refusal must leave a usable connection. It must:
+  every probe runs in one transaction, so an error aborts it, and returning without a rollback
+  hands the caller a connection that rejects their *next* statement with an error about this
+  function. About ten lines.
+- **The rate card refuses a restructure whose key columns are missing.** FR-013 assumes `model` is
+  there. When it is not, the probe that finds duplicate models is a driver error out of a read-only
+  command — the shape FR-016a's rationale rules out, one relation over. About twenty lines.
+- **The rate card refuses a restructure whose key column holds NULLs.** `ADD PRIMARY KEY` rejects
+  them, so `AUTOMATIC` would be a plan that promises resolvable and dies. Unreachable while the
+  table keeps its old key; reachable on one that lost it. About twenty lines.
 
 ## Known limits, recorded rather than left to be rediscovered
 

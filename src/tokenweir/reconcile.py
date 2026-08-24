@@ -44,8 +44,12 @@ inside an aborted transaction and leaves nothing behind — the same technique
 
 **What it will never do.** Drop a column, drop a table, or delete a row. A column
 the gateway has and tokenweir does not is the gateway's data; it is reported and
-kept. The single ``DROP`` this module can emit is of the rollup *view*, and even
-that becomes a human's decision the moment anything depends on it.
+kept. The only ``DROP`` this module emits that removes a **relation** is of the
+rollup *view*, and even that becomes a human's decision the moment anything
+depends on it. (It emits others that remove nothing anybody stored: ``DROP
+DEFAULT`` after a back-fill, and ``DROP CONSTRAINT`` on the rate card's old
+primary key. The distinction is the point — a relation holds rows and a default
+does not.)
 
 That view holds no rows — but it does hold an ACL, and ``DROP VIEW`` takes it
 along. Migration 005 re-issues the grant only when ``tokenweir.reader_role`` is
@@ -71,7 +75,7 @@ from datetime import date
 from enum import Enum
 from typing import Any, Optional, Sequence, Union
 
-from tokenweir.migrations import destructive_statements, discover
+from tokenweir.migrations import discover
 from tokenweir.postgres import USAGE_TABLE
 
 __all__ = [
@@ -347,51 +351,18 @@ class ReconciliationPlan:
                 lines.append(f"  [{marker}] {discrepancy.relation}: {discrepancy.description}")
                 if discrepancy.remedy:
                     lines.append(f"             -> {discrepancy.remedy}")
+                # No annotation on the statements. There was one — a marker beside
+                # anything that removed a relation — and it went when the renderer
+                # stopped truncating: once every statement prints in full, `DROP
+                # VIEW "gateway_usage_daily"` is right there on its own line, and a
+                # second mechanism pointing at it was unrequested surface that
+                # nothing tested.
                 for statement in discrepancy.statements:
                     lines.extend(_render_statement(statement))
-                    # Named where it is read, not only in the docs. This is the one
-                    # place a reconciliation can destroy anything, and an operator
-                    # deciding whether to pass --apply should not have to notice it
-                    # by reading SQL carefully.
-                    #
-                    # Narrower than `destructive_statements`, deliberately. That
-                    # function matches the word DROP, which is right for its job —
-                    # gating a migration — and wrong here: a rate-card restructure
-                    # carries DROP DEFAULT and DROP CONSTRAINT, so the annotation
-                    # fired three times before the one statement that removes a
-                    # relation. A warning that cries wolf three times first is not
-                    # read on the fourth.
-                    if _drops_a_relation(statement):
-                        lines.append(
-                            f"{_STATEMENT_INDENT}^ removes a relation — the rollup view "
-                            "is rebuilt from migration 005 in the same transaction. "
-                            "This module never drops a column, a table or a row."
-                        )
         for observation in self.observations:
             lines.append("")
             lines.append(f"  [note]      {observation.relation}: {observation.description}")
         return "\n".join(lines)
-
-
-#: What the rendered plan flags. ``destructive_statements`` answers a different
-#: question — "does this SQL contain a word that should stop a migration" — and is
-#: still the right answer to that one; this is "does this statement remove a
-#: relation", which is the thing an operator reading a plan needs to see.
-_DROPS_RELATION_RE = re.compile(r"\bDROP\s+(?:MATERIALIZED\s+)?(?:VIEW|TABLE)\b", re.IGNORECASE)
-
-
-def _drops_a_relation(statement: str) -> bool:
-    """Whether this statement removes a whole relation.
-
-    Comment-stripping is delegated to :func:`destructive_statements`'s scan by
-    asking it first: a statement it clears contains no bare ``DROP`` at all, so
-    there is nothing here to find either. That ordering is what keeps this from
-    having to repeat the literal-versus-comment scan that function exists to get
-    right.
-    """
-    if not destructive_statements(statement):
-        return False
-    return bool(_DROPS_RELATION_RE.search(statement))
 
 
 #: How far a rendered statement is indented under its discrepancy.
@@ -791,26 +762,69 @@ def _normalise_baseline(value: Union[str, date, None]) -> Optional[str]:
         ) from exc
 
 
-def _add_column_statements(relation: str, column: Column) -> Optional[tuple[str, ...]]:
+#: A default expression this module is willing to back-fill historical rows with.
+#: An **allow-list of things provably constant** — a number, a quoted literal
+#: (with or without a cast), NULL, a boolean — and not a deny-list of known
+#: volatile functions, because the failure direction matters: an unrecognised
+#: constant is refused and an unrecognised volatile one would be applied.
+_CONSTANT_DEFAULT_RE = re.compile(
+    r"""^(?:
+          -?\d+(?:\.\d+)?            # 0, -1, 1.5
+        | '(?:[^']|'')*'(?:::[a-z0-9_ "\[\]]+)?   # 'x', 'x'::text
+        | NULL
+        | TRUE | FALSE
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _add_column_statements(
+    relation: str, column: Column
+) -> tuple[Optional[tuple[str, ...]], str]:
     """How to add ``column`` so the result is the column the migration creates.
 
-    ``None`` when there is no way to do it honestly: a ``NOT NULL`` column with no
-    default and no known back-fill value cannot be added to a table with rows in
-    it without inventing a value for every one of them.
+    Returns ``(statements, reason)``. ``statements`` is ``None`` when there is no
+    way to do it honestly, and ``reason`` then says which way — the caller turns
+    it into the remedy an operator reads.
+
+    Two things make it dishonest, and the second was found late:
+
+    - **No default and no known back-fill.** A ``NOT NULL`` column cannot be added
+      to a table with rows in it without inventing a value for every one of them.
+    - **A default that is not a constant.** Migration 001 gives ``ts`` a
+      ``DEFAULT now()``, which is right for a row being written *now* and wrong
+      for a row metered last March: ``ADD COLUMN … DEFAULT now()`` stamps every
+      historical row with the instant of the reconciliation. ``ts`` is the day
+      bucket the rollup groups on, so the whole history would price into today —
+      an SC-004 failure delivered by a plan that called itself AUTOMATIC and
+      exited 0. That is FR-008's "no data loss **and no decision**" broken on the
+      second clause, and it is the objection FR-013 already makes about the rate
+      card's baseline, one column over. Refusing to invent an ``effective_from``
+      while silently inventing a ``ts`` is not a position worth holding.
     """
     table, name = _quote(relation), _quote(column.name)
     if column.default is not None:
-        # The migration's own default back-fills existing rows, and leaving it in
-        # place is correct: it is what the migration would have produced.
+        if not _CONSTANT_DEFAULT_RE.match(column.default.strip()):
+            return None, (
+                f"its default ({_one_line(column.default, 60)}) is not a constant, so "
+                "back-filling the rows already there would stamp them all with "
+                "whatever it evaluates to at the moment of reconciliation — a value "
+                "about this run, recorded as though it were about the row"
+            )
+        # A constant default back-fills every existing row with the same value the
+        # migration would have given them, and leaving it in place is correct: it
+        # is what the migration produced.
         null = " NOT NULL" if column.not_null else ""
-        return (f"ALTER TABLE {table} ADD COLUMN {name} {column.type} "
-                f"DEFAULT {column.default}{null}",)
+        return (
+            f"ALTER TABLE {table} ADD COLUMN {name} {column.type} "
+            f"DEFAULT {column.default}{null}",
+        ), ""
     if not column.not_null:
-        return (f"ALTER TABLE {table} ADD COLUMN {name} {column.type}",)
+        return (f"ALTER TABLE {table} ADD COLUMN {name} {column.type}",), ""
 
     backfill = BACKFILL_VALUES.get((relation, column.name))
     if backfill is None:
-        return None
+        return None, "it is NOT NULL with no default"
     # DEFAULT back-fills every existing row, then the default goes, because the
     # migration's column has none. Two statements, and the second is not optional:
     # a leftover default would silently supply a value for any future writer that
@@ -819,7 +833,7 @@ def _add_column_statements(relation: str, column: Column) -> Optional[tuple[str,
         f"ALTER TABLE {table} ADD COLUMN {name} {column.type} "
         f"NOT NULL DEFAULT {backfill}",
         f"ALTER TABLE {table} ALTER COLUMN {name} DROP DEFAULT",
-    )
+    ), ""
 
 
 def _column_has_nulls(connection: Any, relation: str, column: str) -> bool:
@@ -1033,14 +1047,14 @@ def _compare_columns(
             continue
         found = live.column(column.name)
         if found is None:
-            statements = _add_column_statements(relation, column)
+            statements, refusal = _add_column_statements(relation, column)
             if statements is None:
                 discrepancies.append(
                     Discrepancy(
                         relation=relation,
                         description=(
-                            f"column {column.name} ({column.type}) is missing, and is "
-                            "NOT NULL with no default"
+                            f"column {column.name} ({column.type}) is missing, and "
+                            f"{refusal}"
                         ),
                         resolution=Resolution.MANUAL,
                         remedy=(
@@ -1083,6 +1097,37 @@ def _compare_columns(
                         "it, and this module does not drop columns. It also rejects "
                         "any INSERT that supplies a value for it, which is every "
                         "INSERT PostgresSource makes. Rebuild the column yourself."
+                    ),
+                )
+            )
+            continue
+
+        if found.identity != column.identity:
+            # Captured since the first commit, documented on `Column.identity` as
+            # the thing that makes BIGSERIAL-versus-IDENTITY visible at all — and
+            # then never compared, so it made nothing visible. `EXEMPT_COLUMNS`
+            # skips `gateway_usage.id` above, which is the one place the story says
+            # the difference is intended; everywhere else an identity column
+            # rejects the writer's INSERT outright ("cannot insert a non-DEFAULT
+            # value"), and a plan that said the database matched was describing its
+            # own blind spot.
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"column {column.name} is an identity column; tokenweir's is "
+                        "an ordinary one"
+                        if found.identity
+                        else f"column {column.name} is ordinary; tokenweir's is an "
+                        "identity column"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        "an identity column refuses any INSERT that supplies a value "
+                        "for it, which is every INSERT PostgresSource makes, and "
+                        "converting one is a table rewrite. Decide and do it yourself "
+                        "— `ALTER TABLE … ALTER COLUMN … DROP IDENTITY` keeps the "
+                        "data, and the sequence has to be reset by hand."
                     ),
                 )
             )
