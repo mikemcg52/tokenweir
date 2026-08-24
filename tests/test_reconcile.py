@@ -143,6 +143,17 @@ BASELINE = "2024-01-01"
 
 OWNED = ("gateway_usage", "model_pricing_rates", "gateway_usage_daily")
 
+#: SC-001's third deviation, named. Reconciling adds a column with `ALTER TABLE …
+#: ADD COLUMN`, which puts it at the end of the table rather than in the position
+#: migration 001 or 003 gives it. These are the two the story's known deltas add;
+#: the view is rebuilt wholesale from 005, so its columns land in the migration's
+#: own order and it appends nothing.
+APPENDED_BY_RECONCILIATION = {
+    "gateway_usage": ("schema_version",),
+    "model_pricing_rates": ("effective_from",),
+    "gateway_usage_daily": (),
+}
+
 
 def execute(connection, sql):
     with connection.cursor() as cursor:
@@ -655,6 +666,53 @@ def test_each_classification_branch(
         assert plan(legacy_with_rows, baseline_effective_from=BASELINE).is_empty
 
 
+def test_a_rate_card_missing_a_key_column_is_refused_not_crashed_into(legacy):
+    """Review 4's Low-3, and the same class review 3 fixed one path over: every
+    probe on the rate-card path names a column, and a table that has not got it
+    turned the read-only command into a driver error rather than a refusal."""
+    execute(legacy, "DROP VIEW gateway_usage_daily")
+    execute(legacy, "ALTER TABLE model_pricing_rates DROP COLUMN model CASCADE")
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+
+    refused = find(result, "model_pricing_rates", "has not got the column")
+    assert refused.resolution is Resolution.MANUAL
+    assert refused.statements == ()
+    assert fetch(legacy, "SELECT 1") == [(1,)]
+
+
+def test_a_rate_card_with_a_null_in_the_new_key_is_refused(legacy_with_rows):
+    """`ADD PRIMARY KEY` rejects a NULL in a key column, so AUTOMATIC would be a
+    plan that promises resolvable and dies — FR-016a's rationale, one relation over.
+
+    Impossible while the table keeps `PRIMARY KEY (model, pricing_mode)`, since a
+    key column is NOT NULL. Reachable on one that lost its key along the way, which
+    is the database class this module exists for.
+    """
+    execute(
+        legacy_with_rows,
+        "ALTER TABLE model_pricing_rates DROP CONSTRAINT model_pricing_rates_pkey; "
+        "ALTER TABLE model_pricing_rates ALTER COLUMN model DROP NOT NULL; "
+        "INSERT INTO model_pricing_rates (model, pricing_mode, "
+        "input_cost_usd_per_mtok, output_cost_usd_per_mtok) VALUES (NULL, 'api', 1, 1)",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    refused = find(result, "model_pricing_rates", "cannot be re-keyed: model holds NULLs")
+    assert refused.resolution is Resolution.MANUAL
+    assert refused.statements == ()
+
+    # The generic column diff reaches the same rows by another route — tokenweir's
+    # `model` is NOT NULL and this one is not. Both are true and both are MANUAL;
+    # they are not duplicates of each other, because fixing the nullability is not
+    # the same decision as deciding what a rate with no model means.
+    assert find(result, "model_pricing_rates", "column model is nullable and holds NULLs")
+
+    with pytest.raises(ManualResolutionError):
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+
+
 def test_planning_refuses_an_autocommit_connection(scratch_schema):
     """FR-005. Under autocommit the reference schema's rollback does nothing, and
     a scratch schema would be left in the operator's database by the command whose
@@ -828,7 +886,7 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
     """SC-001, and the strongest claim in this file.
 
     Not "the columns I remembered to check": the whole introspection of both
-    databases, compared. **Three** deviations are subtracted by name and nothing
+    databases, compared. **Four** deviations are subtracted by name and nothing
     else is:
 
     1. `gateway_usage.id` stays `BIGSERIAL` rather than becoming an identity
@@ -873,6 +931,30 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
             c.name: c for c in want.columns if not (name == "gateway_usage" and c.name == "id")
         }
         assert got_columns.keys() == want_columns.keys(), name
+
+        # Deviation 3, subtracted **by name** rather than by the dicts above —
+        # which are keyed by column name and so are order-blind by construction,
+        # which is exactly what SC-001 forbids: "the assertion MUST subtract each by
+        # name rather than by comparing in a way that cannot see it". Review 4 found
+        # this criterion being satisfied by the one mechanism it was written to rule
+        # out.
+        #
+        # The claim is narrow: the two orders differ *only* by the columns this
+        # reconciliation added having been appended. A column that moved for any
+        # other reason fails here, which is what makes this an assertion rather than
+        # an exemption.
+        got_order = [c.name for c in got.columns if c.name in got_columns]
+        native_order = [c.name for c in want.columns if c.name in want_columns]
+        appended = APPENDED_BY_RECONCILIATION[name]
+        assert got_order == [c for c in native_order if c not in appended] + list(
+            appended
+        ), f"{name}: {got_order} vs {native_order}"
+        if appended:
+            assert got_order != native_order, (
+                f"{name}: the ordering deviation has stopped happening — if adding a "
+                "column no longer moves it to the end, SC-001 and the README should "
+                "stop saying it does"
+            )
         for column, expected in want_columns.items():
             actual = got_columns[column]
             assert (

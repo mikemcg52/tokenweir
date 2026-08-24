@@ -153,7 +153,9 @@ def _common_options() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help=(
             "role to grant SELECT to in the grant migrations (default: "
-            f"${READER_ROLE_ENV_VAR}). Without one those migrations no-op."
+            f"${READER_ROLE_ENV_VAR}). Without one those migrations no-op. Has no "
+            "effect on `reconcile`, which never sets it: reconciliation reports the "
+            "grants a view rebuild discards rather than re-issuing them."
         ),
     )
     common.add_argument(

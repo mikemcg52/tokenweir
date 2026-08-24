@@ -304,8 +304,13 @@ nothing.
   `UnknownAppliedVersionError`, which is correct for them and unchanged. Recorded here rather than
   quietly dropped, because "the edge case does not arise" and "the edge case was forgotten" look
   identical in a spec that says nothing.
-- **No `gateway_usage` at all** — the reconciler is pointed at an empty database. That is not a
-  reconciliation; the plan says so and directs the operator to `apply`.
+- **A table absent altogether.** Two databases wear this symptom and they need opposite advice, so
+  the plan MUST distinguish them. A database with **none** of tokenweir's relations is a fresh one
+  and `apply` is exactly right. A database with *some* of them is the case this module exists for:
+  its `schema_migrations` already records the migrations as applied, so `apply` returns `()` and
+  creates nothing, and sending an operator there sends them to a command that provably does
+  nothing — while FR-019 blocks every resolvable discrepancy behind the refusal. The second case
+  MUST name the shipped migration file to run by hand and say why `apply` will not do it.
 - **An empty legacy table.** Backfills and PK swaps on zero rows must still produce the right
   *shape*; a reconciler tested only against populated tables can pass while adding a `NOT NULL`
   column the wrong way.
@@ -514,8 +519,10 @@ nothing.
 
 ## Additions beyond the requirements
 
-Three things were built that no requirement above asks for. Each is small, each is defended, and
-each is listed here so it reads as a decision rather than as accretion nobody noticed:
+Five things were built that no requirement above asks for. Each is small, each is defended, and
+each is listed here so it reads as a decision rather than as accretion nobody noticed. (The count
+was three until review 4 found two more had landed without being added — which is the argument for
+the section, not against it.)
 
 - **`apply()` refuses a `baseline_effective_from` that disagrees with the plan it was handed.**
   FR-020's staleness check already covers the case that matters. This covers a narrower one — a
@@ -525,9 +532,17 @@ each is listed here so it reads as a decision rather than as accretion nobody no
   it does not ask for them to be annotated. The annotation exists because `--apply` is the operator
   review, and a review where the one destructive statement has to be spotted by reading SQL
   carefully is not one.
-- **A test asserts the README still names the three ways a reconciled database differs from a
+- **A test asserts the README still names the four ways a reconciled database differs from a
   fresh one.** SC-006 requires only the reconstruction residual. This guards the neighbouring
   claims, by anchor rather than by sentence, following the rule TOKWEIR-31 set for exactly this.
+- **Generated columns are classified.** No FR names `attgenerated`. It is here because the hole it
+  closes is the FR-010 hole in a different disguise: a live `GENERATED ALWAYS AS (…)` column has no
+  default and an ordinary type, so it introspected as an exact match while rejecting every `INSERT`
+  the writer makes. Arguably inside FR-001's "every way … differ"; listed here because arguably is
+  not the same as written down.
+- **`_creating_migration`, and the second absent-table remedy it feeds.** Beyond what the Edge Case
+  above used to ask for, and the reason it now asks for more: the single remedy was a dead end on
+  the database class this module is *for*. About twenty lines.
 
 ## Known limits, recorded rather than left to be rediscovered
 

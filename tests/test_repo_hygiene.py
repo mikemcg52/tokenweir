@@ -362,19 +362,27 @@ def test_the_readme_documents_reconciling_a_mismatched_database():
 
 
 def test_the_readme_names_the_ways_a_reconciled_database_differs():
-    """A reconciled database is not byte-identical to a fresh one, in three ways
+    """A reconciled database is not byte-identical to a fresh one, in **four** ways
     that are decisions rather than defects. Each is named here because each was
     found by a review reading the code rather than the docs — `BIGSERIAL` in the
-    story, the kept gateway columns in FR-009, and the column ordering that a test
-    docstring claimed did not exist."""
+    story, the kept gateway columns in FR-009, the column ordering that a test
+    docstring claimed did not exist, and the surviving index and constraint names
+    that the docstring's replacement then miscounted the same way."""
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
+    # Bounded at the next heading. Splitting on the opening sentence alone ran the
+    # "section" to end of file, so `grants` — which occurs three more times in the
+    # paragraphs after it — stayed green with the whole bullet list deleted. An
+    # anchor satisfied by unrelated text is not an anchor.
     section = readme.split("A reconciled database is not identical to a fresh one")[-1]
+    section = section.split("\n#")[0]
+
     # Anchors, not prose. Following the rule `tests/conftest.py`'s
     # `OptionalDriver.anchors` established for the same reason (TOKWEIR-31): a check
     # against whole English sentences fails on a reword, which trains the next
-    # person to delete the check rather than keep the claim. These four are the
-    # identifiers the claims are *about*, and none of them survives a reword that
-    # drops the deviation it names.
-    for anchor in ("BIGSERIAL", "populate", "order", "grants"):
+    # person to delete the check rather than keep the claim. Each of these is an
+    # identifier the claim is *about*, and none survives a reword that drops the
+    # deviation it names — including the fourth, which had no anchor at all until
+    # review 4 counted them.
+    for anchor in ("BIGSERIAL", "populate", "order", "matched by what they"):
         assert anchor in section, f"README no longer names {anchor!r}"

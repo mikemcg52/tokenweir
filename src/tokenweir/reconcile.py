@@ -338,7 +338,8 @@ class ReconciliationPlan:
             lines.append(
                 f"{len(self.discrepancies)} discrepanc"
                 f"{'y' if len(self.discrepancies) == 1 else 'ies'}: "
-                f"{len(automatic)} tokenweir can resolve, {len(manual)} need a decision."
+                f"{len(automatic)} tokenweir can resolve, {len(manual)} "
+                f"{'needs' if len(manual) == 1 else 'need'} a decision."
             )
             for discrepancy in self.discrepancies:
                 lines.append("")
@@ -894,6 +895,32 @@ def _rate_card_discrepancy(
     key diff would let a plan be half-applied in a way that leaves the table with
     neither key working.
     """
+    # The same class of defect `_compare_constraints` was fixed for in review 3, on
+    # the neighbouring path: every probe below names a column, and a table that has
+    # not got it turns the read-only command into a driver error rather than a
+    # refusal. `effective_from` is excluded because its absence is the very thing
+    # being reconciled.
+    absent = [
+        column
+        for column in reference.primary_key
+        if column != "effective_from" and live.column(column) is None
+    ]
+    if absent:
+        return Discrepancy(
+            relation=relation,
+            description=(
+                "rate card cannot be re-keyed: it has not got the column(s) the new "
+                f"key is over ({', '.join(absent)})"
+            ),
+            resolution=Resolution.MANUAL,
+            remedy=(
+                "tokenweir's rate card is keyed "
+                f"({', '.join(reference.primary_key)}), and this table is missing "
+                "part of that key. Those columns are elsewhere in this plan: resolve "
+                "them first, then reconcile again."
+            ),
+        )
+
     duplicates = _rate_card_duplicates(connection, relation)
     if duplicates:
         listed = ", ".join(duplicates)
@@ -931,6 +958,32 @@ def _rate_card_discrepancy(
                 "every answer is a claim about history. ('infinity' is refused: it "
                 "would be in force on no day that has happened, and every existing row "
                 "would stop pricing.)"
+            ),
+        )
+
+    # `ADD PRIMARY KEY` rejects a NULL in any key column, so a plan that promised
+    # AUTOMATIC would die on it — FR-016a's rationale, one relation over. Cannot
+    # arise on a table that kept `PRIMARY KEY (model, pricing_mode)`, since a key
+    # column is NOT NULL; it can on one that lost its key along the way.
+    nullable_key = [
+        column
+        for column in reference.primary_key
+        if column != "effective_from"
+        and _column_has_nulls(connection, relation, column)
+    ]
+    if nullable_key:
+        return Discrepancy(
+            relation=relation,
+            description=(
+                "rate card cannot be re-keyed: "
+                f"{', '.join(nullable_key)} holds NULLs, and a primary key column "
+                "cannot"
+            ),
+            resolution=Resolution.MANUAL,
+            remedy=(
+                "decide what those rows should say and update them, then reconcile "
+                "again. A rate with no model is a price for nothing, so it is worth "
+                "knowing which rows these are before deciding."
             ),
         )
 
