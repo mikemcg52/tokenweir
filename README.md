@@ -663,7 +663,7 @@ Three things it will not do:
 Re-running it is a no-op, so it is safe to leave in a deploy script — though the
 plan-first order above is the one to use the first time.
 
-**A reconciled database is not identical to a fresh one, in three named ways**, and
+**A reconciled database is not identical to a fresh one, in four named ways**, and
 none of them is a defect:
 
 - `gateway_usage.id` stays `BIGSERIAL` rather than becoming `GENERATED ALWAYS AS
@@ -675,6 +675,11 @@ none of them is a defect:
 - Added columns land at the end of the table rather than in the migration's order.
   Column *position* is not something anything here reads, and reordering would mean
   rewriting the table.
+- Indexes and constraints the gateway named itself keep those names. Both are
+  matched by what they *do* — an index by its shape, a constraint by its definition
+  — so one already doing tokenweir's job under another name satisfies the
+  requirement and is left alone. Creating a duplicate beside it would cost write
+  throughput to serve nothing.
 
 `reconcile` also does not re-issue grants. Dropping and recreating the rollup view
 discards its SELECT grants, and `--reader-role` does not reach it — the grant lives

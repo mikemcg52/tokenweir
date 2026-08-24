@@ -484,12 +484,16 @@ nothing.
   `reconcile --apply` produces a schema that introspects **identically** to one produced by running
   tokenweir's migrations on an empty database — same columns, types, nullability, defaults,
   primary keys and indexes on `gateway_usage` and `model_pricing_rates`, same column set on
-  `gateway_usage_daily` — modulo **three** documented deviations, and nothing else: the `id`
-  exception (`BIGSERIAL` is kept, per the story), any extra gateway columns (reported and kept),
-  and column **order**, since an added column lands at the end of the table rather than in the
-  migration's position. Nothing reads column position and reordering would mean rewriting the
-  table, so the third is a deviation rather than a defect — but it is one, and the assertion must
-  subtract it by name rather than by comparing in a way that cannot see it.
+  `gateway_usage_daily` — modulo **four** documented deviations, and nothing else: the `id`
+  exception (`BIGSERIAL` is kept, per the story); any extra gateway columns (reported and kept);
+  column **order**, since an added column lands at the end of the table rather than in the
+  migration's position; and the **names** of indexes and constraints the gateway created itself,
+  which are matched by shape and by definition rather than by name and are therefore left alone.
+  None of the four is a defect — nothing reads column position, and a duplicate index beside an
+  equivalent one would cost write throughput to serve nothing — but each is a deviation, and the
+  assertion MUST subtract each by name rather than by comparing in a way that cannot see it. Both
+  the third and the fourth were found by a review reading the code after a docstring claimed the
+  list was complete, which is the argument for spelling them out here.
 - **SC-002**: Every pre-existing row is present after reconciliation with every original column
   value unchanged, verified column-by-column and not by count alone.
 - **SC-003**: `PostgresSource.write` succeeds against the reconciled database and fails against the

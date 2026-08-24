@@ -36,9 +36,9 @@ from tokenweir.reconcile import (
     REFERENCE_SCHEMA_PREFIX,
     ManualResolutionError,
     PlanStaleError,
-    ReconciliationPlan,
     ReferenceSchemaError,
     Resolution,
+    _index_name,
     _normalise_baseline,
     _snapshot,
     _view_migration_sql,
@@ -477,6 +477,184 @@ def test_a_constraint_squatting_on_a_shipped_name_is_a_decision(legacy_with_rows
     assert collision.statements == ()
 
 
+def test_a_check_about_columns_the_table_lacks_does_not_crash_the_plan(legacy):
+    """Review 3's High-1, and the sharpest kind of finding: the tool failed in
+    exactly the way the spec says its design prevents.
+
+    A CHECK is probed by running its own expression against the live rows, and
+    migration 003's guard names both cache-cost columns. A rate card without them —
+    which A-001 explicitly declines to rule out, because nobody has seen the live
+    schema — turned the read-only command into a raw `UndefinedColumn` from the
+    driver, out of `plan()`, leaving the connection in an aborted transaction.
+
+    spec.md: "a tool that reads the real thing and refuses what it does not
+    recognise does not [break]". It refused nothing.
+    """
+    execute(
+        legacy,
+        "ALTER TABLE model_pricing_rates "
+        "DROP COLUMN cache_write_cost_usd_per_mtok, "
+        "DROP COLUMN cache_read_cost_usd_per_mtok",
+    )
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+
+    deferred = find(result, "model_pricing_rates", "cannot be checked yet")
+    assert deferred.resolution is Resolution.MANUAL
+    assert "cache_write_cost_usd_per_mtok" in deferred.description
+    assert deferred.statements == ()
+    # The columns it is waiting on are in this same plan, which is what makes
+    # "resolve them first, then run it again" advice rather than a brush-off.
+    assert find(result, "model_pricing_rates", "cache_write_cost_usd_per_mtok (numeric")
+
+    # And having refused, it left a connection somebody can still use.
+    assert fetch(legacy, "SELECT 1") == [(1,)]
+
+
+def test_a_failed_plan_leaves_a_usable_connection(legacy, monkeypatch):
+    """The other half of High-1. Every probe runs in one transaction, so an error
+    from any of them aborts it — and returning without a rollback hands back a
+    connection that rejects the caller's *next* statement with "current transaction
+    is aborted", an error about `plan()` reported wherever the caller happens to be.
+    """
+    import tokenweir.reconcile as reconcile_module
+
+    def explode(*args, **kwargs):
+        with legacy.cursor() as cursor:
+            cursor.execute("SELECT 1 / 0")
+
+    monkeypatch.setattr(reconcile_module, "_compare_indexes", explode)
+
+    with pytest.raises(Exception):
+        plan(legacy, baseline_effective_from=BASELINE)
+
+    assert fetch(legacy, "SELECT 1") == [(1,)]
+
+
+def test_nullability_is_not_reported_twice_as_a_missing_constraint(legacy):
+    """Review 3's Med-1, guarded where it can be guarded on this server.
+
+    PostgreSQL 18 catalogues NOT NULL in `pg_constraint` as `contype = 'n'`. Under
+    the deny-list this used to use (`contype <> 'p'`), every not-null column the
+    live table lacked would arrive as an unparseable "missing constraint", go
+    MANUAL, and FR-019 would block the whole reconciliation — on `schema_version`
+    and `effective_from`, the two columns this story exists to add.
+
+    The allow-list is asserted directly, because the embedded server here is 16 and
+    the symptom cannot be reproduced on it. What *can* be checked is that the two
+    columns are reported as columns and by nothing else.
+    """
+    from tokenweir.reconcile import COMPARED_CONSTRAINT_TYPES
+
+    assert "n" not in COMPARED_CONSTRAINT_TYPES
+    assert "p" not in COMPARED_CONSTRAINT_TYPES
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+    constraint_talk = [
+        d.description for d in result.discrepancies if "constraint" in d.description
+    ]
+    assert not any("NOT NULL" in description for description in constraint_talk), (
+        constraint_talk
+    )
+
+
+def test_a_generated_column_is_a_decision_not_an_invisible_match(legacy):
+    """Low-2. A generated column has no `column_default` and its type says nothing,
+    so without `attgenerated` a live `GENERATED ALWAYS AS (…) STORED` introspected
+    identically to tokenweir's ordinary column — an empty plan, and a writer whose
+    every INSERT is rejected for supplying a value to it."""
+    execute(legacy, "ALTER TABLE gateway_usage DROP COLUMN latency_ms")
+    execute(
+        legacy,
+        "ALTER TABLE gateway_usage ADD COLUMN latency_ms BIGINT "
+        "GENERATED ALWAYS AS (input_tokens + output_tokens) STORED",
+    )
+
+    result = plan(legacy, baseline_effective_from=BASELINE)
+
+    generated = find(result, "gateway_usage", "latency_ms is a generated column")
+    assert generated.resolution is Resolution.MANUAL
+    assert generated.statements == ()
+
+
+# --- The classification branches, one deformation each (review 3, Med-3) -------
+#
+# Six branches that had code and no test. Each emits SQL or a refusal that had
+# never been executed against a server, and two of them (`SET DEFAULT`, the
+# primary-key mismatch) sit squarely inside SC-001's "same … defaults … primary
+# keys". Written as one parametrised test because the shape is identical: deform
+# `LEGACY_SQL` in one way, assert the classification and the statement.
+
+
+@pytest.mark.parametrize(
+    "deformation,needle,expected,statement_fragment",
+    [
+        pytest.param(
+            "ALTER TABLE gateway_usage DROP COLUMN cache_creation_input_tokens",
+            "cache_creation_input_tokens (bigint) is missing",
+            Resolution.AUTOMATIC,
+            "ADD COLUMN \"cache_creation_input_tokens\" bigint DEFAULT 0 NOT NULL",
+            id="missing-column-with-a-default",
+        ),
+        pytest.param(
+            "ALTER TABLE gateway_usage DROP COLUMN queue",
+            "queue (text) is missing",
+            Resolution.AUTOMATIC,
+            "ADD COLUMN \"queue\" text",
+            id="missing-nullable-column",
+        ),
+        pytest.param(
+            "ALTER TABLE gateway_usage DROP COLUMN status",
+            "status (text) is missing, and is NOT NULL with no default",
+            Resolution.MANUAL,
+            None,
+            id="missing-not-null-column-with-no-backfill",
+        ),
+        pytest.param(
+            "UPDATE gateway_usage SET workload = ''; "
+            "ALTER TABLE gateway_usage ALTER COLUMN workload SET NOT NULL",
+            "workload is NOT NULL; tokenweir's is nullable",
+            Resolution.MANUAL,
+            None,
+            id="live-stricter-than-tokenweir",
+        ),
+        pytest.param(
+            "ALTER TABLE gateway_usage ALTER COLUMN input_tokens SET DEFAULT 5",
+            "input_tokens defaults to 5",
+            Resolution.AUTOMATIC,
+            "SET DEFAULT 0",
+            id="default-mismatch",
+        ),
+        pytest.param(
+            "ALTER TABLE gateway_usage DROP CONSTRAINT gateway_usage_pkey; "
+            "ALTER TABLE gateway_usage ADD PRIMARY KEY (request_id)",
+            "primary key is (request_id)",
+            Resolution.MANUAL,
+            None,
+            id="primary-key-mismatch-outside-the-rate-card",
+        ),
+    ],
+)
+def test_each_classification_branch(
+    legacy_with_rows, deformation, needle, expected, statement_fragment
+):
+    execute(legacy_with_rows, deformation)
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    found = find(result, "gateway_usage", needle)
+    assert found.resolution is expected
+    if statement_fragment is None:
+        assert found.statements == ()
+        assert found.remedy, "a MANUAL discrepancy an operator cannot act on is a crash"
+    else:
+        assert any(statement_fragment in s for s in found.statements), found.statements
+        # And the statement runs. A branch whose SQL has never touched a server is
+        # a guess about syntax, which is what five of these were.
+        apply(legacy_with_rows, baseline_effective_from=BASELINE)
+        assert plan(legacy_with_rows, baseline_effective_from=BASELINE).is_empty
+
+
 def test_planning_refuses_an_autocommit_connection(scratch_schema):
     """FR-005. Under autocommit the reference schema's rollback does nothing, and
     a scratch schema would be left in the operator's database by the command whose
@@ -662,6 +840,13 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
        reordering would mean rewriting the table, so this is a deviation rather
        than a defect — but it is one, and review 1 found this docstring claiming
        there were two while silently dropping it by comparing dicts.
+    4. **Index and constraint names** differ where the gateway named its own.
+       Both are matched by shape and by definition respectively, so an index doing
+       tokenweir's job under the gateway's name satisfies the requirement and is
+       left alone — creating a duplicate beside it would cost write throughput to
+       serve nothing. Review 3 found this one the same way review 1 found the
+       third: claimed absent by a docstring, and invisible to the comparison
+       underneath it.
 
     `identity` is compared along with type, nullability and default, so the `id`
     exception is the only place `BIGSERIAL` versus `GENERATED ALWAYS AS IDENTITY`
@@ -704,12 +889,35 @@ def test_the_reconciled_schema_matches_one_tokenweir_built_itself(
 
         # Every index tokenweir wants is present by shape. The gateway's own extra
         # ones are still there and are not asserted away.
-        assert {shape for shape, _ in want.indexes} <= {shape for shape, _ in got.indexes}, name
+        want_shapes = {shape for shape, _ in want.indexes}
+        got_shapes = {shape for shape, _ in got.indexes}
+        assert want_shapes <= got_shapes, name
+
+        # Deviation 4, asserted rather than hidden by the subset above. Indexes are
+        # matched by shape, so an index the gateway named itself satisfies
+        # tokenweir's requirement and keeps its own name — `idx_gateway_usage_ts`
+        # where a fresh database has `gateway_usage_ts_idx`. Review 3 found this
+        # deviation real, undocumented, and invisible to a `<=` comparison that
+        # cannot see names at all. Named here, and in the README, so a fourth one
+        # cannot arrive the same way.
+        if name == "gateway_usage":
+            served_by_a_gateway_name = {
+                _index_name(definition)
+                for shape, definition in got.indexes
+                if shape in want_shapes and _index_name(definition).startswith("idx_")
+            }
+            assert served_by_a_gateway_name, (
+                "the legacy fixture names its indexes differently on purpose; if "
+                "none survived, indexes are no longer being matched by shape"
+            )
+
         # Likewise every constraint. Absent from this assertion until review 2, and
         # invisible to it: the comparison is written in terms of `_snapshot`, and
         # `_snapshot` did not model constraints — so implementation and test agreed
         # with each other and disagreed with FR-001.
-        assert {d for _, d in want.constraints} <= {d for _, d in got.constraints}, name
+        assert {c.definition for c in want.constraints} <= {
+            c.definition for c in got.constraints
+        }, name
 
 
 def test_an_empty_legacy_table_reconciles_to_the_right_shape(legacy):
@@ -806,11 +1014,6 @@ def test_a_failure_part_way_through_leaves_the_database_alone(
     real_plan = plan(legacy_with_rows, baseline_effective_from=BASELINE)
     assert len(real_plan.statements) > 3
 
-    exploding = ReconciliationPlan(
-        discrepancies=real_plan.discrepancies,
-        observations=real_plan.observations,
-        baseline_effective_from=real_plan.baseline_effective_from,
-    )
     # Re-derivation inside `apply` is what runs, so the failure has to come from
     # the database rather than from a doctored plan: a statement that is valid to
     # parse and impossible to execute, injected after the real ones.
@@ -829,7 +1032,6 @@ def test_a_failure_part_way_through_leaves_the_database_alone(
 
     assert _snapshot(legacy_with_rows, OWNED) == before
     assert fetch(legacy_with_rows, "SELECT * FROM gateway_usage ORDER BY id") == rows_before
-    assert exploding.baseline_effective_from == BASELINE
 
 
 def test_applying_a_plan_the_database_has_outgrown_is_refused(legacy_with_rows):

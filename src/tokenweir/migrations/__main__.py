@@ -122,7 +122,9 @@ def _baseline(value: str) -> str:
     refusal from deep inside a database session (exit 1).
     """
     try:
-        return reconciler._normalise_baseline(value) or value
+        # `_normalise_baseline` returns None only for a None input, and argparse
+        # only calls this with a string.
+        return reconciler._normalise_baseline(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 

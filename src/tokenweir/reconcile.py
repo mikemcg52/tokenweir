@@ -75,7 +75,9 @@ from tokenweir.migrations import destructive_statements, discover
 from tokenweir.postgres import USAGE_TABLE
 
 __all__ = [
+    "COMPARED_CONSTRAINT_TYPES",
     "Column",
+    "Constraint",
     "Discrepancy",
     "ManualResolutionError",
     "Observation",
@@ -178,6 +180,34 @@ class Column:
     default: Optional[str]
     #: ``''`` for an ordinary column, ``'a'`` for ALWAYS, ``'d'`` for BY DEFAULT.
     identity: str
+    #: ``pg_attribute.attgenerated`` -- ``''`` for an ordinary column, ``'s'`` for
+    #: ``GENERATED ALWAYS AS (…) STORED``. Captured for the same reason as
+    #: ``identity``: a generated column has no ``column_default`` and its type says
+    #: nothing, so without this a live ``ts GENERATED ALWAYS AS (…)`` introspects
+    #: identically to tokenweir's and produces an empty plan -- while every INSERT
+    #: `PostgresSource` makes is rejected for supplying a value to it.
+    generated: str = ""
+
+
+#: The ``pg_constraint.contype`` values this module compares: CHECK, UNIQUE,
+#: FOREIGN KEY, EXCLUDE. An allow-list on purpose — see ``_snapshot``.
+COMPARED_CONSTRAINT_TYPES = ("c", "u", "f", "x")
+
+
+@dataclass(frozen=True, order=True)
+class Constraint:
+    """One non-primary-key constraint, and the columns it is about.
+
+    ``columns`` is ``pg_constraint.conkey`` resolved to names. It is not
+    decoration: a CHECK is compared by definition and *probed* against the live
+    rows, and a probe using the reference's expression against a table missing a
+    column that expression names is a ``UndefinedColumn`` out of a command whose
+    whole promise is that it only looks.
+    """
+
+    name: str
+    definition: str
+    columns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,13 +222,13 @@ class Relation:
     primary_key: tuple[str, ...]
     #: ``(shape, definition)`` per non-constraint index — see :func:`_index_shape`.
     indexes: tuple[tuple[str, str], ...]
-    #: ``(name, definition)`` per constraint that is not the primary key, from
-    #: ``pg_get_constraintdef``. Here because leaving it out was a silent hole: the
+    #: Every :class:`Constraint` that is not the primary key. Here because leaving
+    #: them out was a silent hole: the
     #: rate card's ``CHECK (… >= 0)`` is migration 003's guard against a negative
     #: price, a reconciled table did not have it, and the plan said the database
     #: already matched — a false claim about a money guard, made by the one
     #: sentence an operator reads before pointing the gateway at it.
-    constraints: tuple[tuple[str, str], ...] = ()
+    constraints: tuple[Constraint, ...] = ()
 
     def column(self, name: str) -> Optional[Column]:
         return next((c for c in self.columns if c.name == name), None)
@@ -480,7 +510,7 @@ def _snapshot(connection: Any, names: Sequence[str], schema: Optional[str] = Non
 
             cursor.execute(
                 "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
-                "       pg_get_expr(d.adbin, d.adrelid), a.attidentity "
+                "       pg_get_expr(d.adbin, d.adrelid), a.attidentity, a.attgenerated "
                 "FROM pg_attribute a "
                 "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
                 "WHERE a.attrelid = %s AND a.attnum > 0 AND NOT a.attisdropped "
@@ -488,7 +518,14 @@ def _snapshot(connection: Any, names: Sequence[str], schema: Optional[str] = Non
                 (oid,),
             )
             columns = tuple(
-                Column(name=r[0], type=r[1], not_null=bool(r[2]), default=r[3], identity=r[4] or "")
+                Column(
+                    name=r[0],
+                    type=r[1],
+                    not_null=bool(r[2]),
+                    default=r[3],
+                    identity=r[4] or "",
+                    generated=r[5] or "",
+                )
                 for r in cursor.fetchall()
             )
 
@@ -522,19 +559,38 @@ def _snapshot(connection: Any, names: Sequence[str], schema: Optional[str] = Non
                 )
             )
 
-            # Everything except the primary key, which is compared as a key just
-            # above. `conislocal`/inheritance is not filtered: nothing here
-            # inherits, and a constraint that arrived by inheritance is still one
-            # the table has.
+            # `contype = ANY(...)` and not `<> 'p'`. The primary key is compared as
+            # a key just above, so excluding it is the obvious part — but an
+            # allow-list rather than a deny-list matters for a reason that is not
+            # visible on this server: PostgreSQL 18 catalogues **NOT NULL** as a
+            # constraint row (`contype = 'n'`), rendered `NOT NULL <col>`. Under a
+            # deny-list every not-null column the live table lacks would arrive here
+            # as an unparseable "missing constraint", go MANUAL, and FR-019 would
+            # then block the entire reconciliation — on the two columns this story
+            # exists to add. Nullability is `_compare_columns`' job and is handled
+            # there; this list is what is left.
+            #
+            # `conkey` comes along because a CHECK cannot be probed against a table
+            # that has not got the columns it names (see `_compare_constraints`).
             cursor.execute(
-                "SELECT c.conname, pg_get_constraintdef(c.oid) "
-                "FROM pg_constraint c WHERE c.conrelid = %s AND c.contype <> 'p' "
+                "SELECT c.conname, pg_get_constraintdef(c.oid), "
+                "       ARRAY(SELECT a.attname FROM pg_attribute a "
+                "             WHERE a.attrelid = c.conrelid "
+                "               AND a.attnum = ANY(c.conkey) ORDER BY a.attnum) "
+                "FROM pg_constraint c "
+                "WHERE c.conrelid = %s AND c.contype = ANY(%s) "
                 "ORDER BY c.conname",
-                (oid,),
+                (oid, list(COMPARED_CONSTRAINT_TYPES)),
             )
             constraints = tuple(
-                sorted((r[0], _normalise_sql(_strip_schema(r[1], namespace)))
-                       for r in cursor.fetchall())
+                sorted(
+                    Constraint(
+                        name=r[0],
+                        definition=_normalise_sql(_strip_schema(r[1], namespace)),
+                        columns=tuple(r[2] or ()),
+                    )
+                    for r in cursor.fetchall()
+                )
             )
 
             relations.append(
@@ -958,6 +1014,27 @@ def _compare_columns(
                 )
             continue
 
+        if found.generated != column.generated:
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"column {column.name} is a generated column; tokenweir's is "
+                        "an ordinary one"
+                        if found.generated
+                        else f"column {column.name} is ordinary; tokenweir's is generated"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        "a generated column cannot be made ordinary without dropping "
+                        "it, and this module does not drop columns. It also rejects "
+                        "any INSERT that supplies a value for it, which is every "
+                        "INSERT PostgresSource makes. Rebuild the column yourself."
+                    ),
+                )
+            )
+            continue
+
         if found.type != column.type:
             discrepancies.append(
                 Discrepancy(
@@ -1228,7 +1305,9 @@ def _view_grantees(connection: Any, view: str) -> tuple[str, ...]:
 _CHECK_BODY_RE = re.compile(r"^CHECK\s*\((?P<body>.*)\)$", re.IGNORECASE | re.DOTALL)
 
 
-def _check_constraint_violations(connection: Any, relation: str, definition: str) -> bool:
+def _check_constraint_violations(
+    connection: Any, relation: str, definition: str
+) -> Optional[bool]:
     """Whether existing rows would fail ``definition``, or ``None`` if unknowable.
 
     ``ALTER TABLE … ADD CONSTRAINT … CHECK`` validates the rows already there and
@@ -1264,14 +1343,49 @@ def _compare_constraints(
     """
     discrepancies: list[Discrepancy] = []
     observations: list[Observation] = []
-    live_definitions = {definition for _, definition in live.constraints}
-    reference_definitions = {definition for _, definition in reference.constraints}
-    live_names = {name for name, _ in live.constraints}
+    live_definitions = {c.definition for c in live.constraints}
+    reference_definitions = {c.definition for c in reference.constraints}
+    live_names = {c.name for c in live.constraints}
+    live_columns = set(live.column_names)
     table = _quote(relation)
 
-    for name, definition in reference.constraints:
+    for constraint in reference.constraints:
+        name, definition = constraint.name, constraint.definition
         if definition in live_definitions:
             continue
+
+        # Before anything touches the table: a CHECK is probed by running its own
+        # expression against the live rows, and the reference's expression names
+        # the reference's columns. Migration 003's guard names both cache-cost
+        # columns; a rate card without them turned the read-only command into an
+        # `UndefinedColumn` from the driver — the exact failure spec.md claims this
+        # design prevents ("a tool that reads the real thing and refuses what it
+        # does not recognise"). It refused nothing; it broke.
+        #
+        # The missing columns are themselves discrepancies in this same plan, so
+        # the honest answer is "not yet, and here is why": reconcile the columns
+        # first, then run it again and this becomes ordinary.
+        absent = [column for column in constraint.columns if column not in live_columns]
+        if absent:
+            discrepancies.append(
+                Discrepancy(
+                    relation=relation,
+                    description=(
+                        f"constraint {name} is missing and cannot be checked yet: it "
+                        f"is about column(s) this table has not got ({', '.join(absent)})"
+                    ),
+                    resolution=Resolution.MANUAL,
+                    remedy=(
+                        "tokenweir only adds a constraint after checking the rows "
+                        "already there against it, and it cannot check one that names "
+                        "columns which are not there. Those columns are elsewhere in "
+                        "this plan: resolve them first, then reconcile again and this "
+                        "becomes an ordinary addition."
+                    ),
+                )
+            )
+            continue
+
         if name in live_names:
             discrepancies.append(
                 Discrepancy(
@@ -1305,6 +1419,12 @@ def _compare_constraints(
                         "one. Add it yourself once you have: "
                         f"ALTER TABLE {relation} ADD CONSTRAINT {name} {definition};"
                     ),
+                    # Unreachable while the shipped migrations produce exactly one
+                    # non-primary-key constraint and it is a CHECK. It becomes live
+                    # the day a migration adds a UNIQUE, a FOREIGN KEY or an EXCLUDE
+                    # -- all in COMPARED_CONSTRAINT_TYPES, none of them expressible
+                    # as a row predicate -- which is the point of having it now
+                    # rather than discovering the omission then.
                 )
             )
         elif violated:
@@ -1340,14 +1460,15 @@ def _compare_constraints(
                 )
             )
 
-    for name, definition in live.constraints:
-        if definition not in reference_definitions:
+    for constraint in live.constraints:
+        if constraint.definition not in reference_definitions:
             observations.append(
                 Observation(
                     relation=relation,
                     description=(
-                        f"constraint {name} is not part of tokenweir's schema and is "
-                        f"left in place: {_one_line(definition, 90)}"
+                        f"constraint {constraint.name} is not part of tokenweir's "
+                        f"schema and is left in place: "
+                        f"{_one_line(constraint.definition, 90)}"
                     ),
                 )
             )
@@ -1472,6 +1593,22 @@ def plan(
     _require_transactional(connection, "plan")
     baseline = _normalise_baseline(baseline_effective_from)
 
+    try:
+        return _plan(connection, baseline)
+    except Exception:
+        # A read-only command must leave the connection usable, including when it
+        # fails. Every probe below runs in one transaction, so an error from any of
+        # them aborts it, and returning without rolling back hands the caller a
+        # connection that rejects the next statement with "current transaction is
+        # aborted" -- an error about this function, reported at whatever the caller
+        # does next. `reference_snapshot` already had this handler; the rest of the
+        # comparison did not.
+        connection.rollback()
+        raise
+
+
+def _plan(connection: Any, baseline: Optional[str]) -> ReconciliationPlan:
+    """:func:`plan`'s body, so its rollback-on-failure wrapper stays readable."""
     reference = reference_snapshot(connection)
     names = tuple(r.name for r in _ordered(reference))
     live = _snapshot(connection, names)
