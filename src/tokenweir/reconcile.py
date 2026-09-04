@@ -862,6 +862,29 @@ def _rate_card_duplicates(connection: Any, relation: str) -> tuple[str, ...]:
         return tuple(r[0] for r in cursor.fetchall())
 
 
+def _rate_card_unpriceable_solo_rows(connection: Any, relation: str) -> tuple[str, ...]:
+    """Models whose only current-valued row cannot price API-metered usage.
+
+    ``_rate_card_duplicates`` only fires when a model has *more than one* row;
+    this is the one-row case it cannot see. tokenweir's rollup (migration 005)
+    joins the rate card to usage by ``model`` alone — ``pricing_mode`` does not
+    survive the restructure and is never part of that join. So a model whose
+    lone legacy row is ``pricing_mode = 'subscription'`` — carrying no per-call
+    dollar by construction (ADR-0001 Pillar 4) — would become that model's
+    *only* rate. Every API-metered call for it then finds ``rate.model IS NOT
+    NULL`` and prices at the subscription row's rate, typically zero: a
+    confidently wrong ``est_cost_usd``, not the blank migration 005 is built to
+    return for usage it cannot price.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"SELECT model FROM {_quote(relation)} GROUP BY model "
+            "HAVING COUNT(*) = 1 AND MAX(pricing_mode) = 'subscription' "
+            "ORDER BY model"
+        )
+        return tuple(r[0] for r in cursor.fetchall())
+
+
 def _primary_key_constraint_name(connection: Any, relation: str) -> Optional[str]:
     with connection.cursor() as cursor:
         cursor.execute(
@@ -953,6 +976,35 @@ def _rate_card_discrepancy(
                 "the answer changes what every historical row costs."
             ),
         )
+
+    # Distinct from the duplicates check above: this is the *one*-row case,
+    # where there is nothing to collide with. Only reachable when the table
+    # still carries `pricing_mode` at all — a card that never had the column
+    # cannot exhibit a subscription-only row for one to have lost.
+    if live.column("pricing_mode") is not None:
+        unpriceable = _rate_card_unpriceable_solo_rows(connection, relation)
+        if unpriceable:
+            listed = ", ".join(unpriceable)
+            return Discrepancy(
+                relation=relation,
+                description=(
+                    "rate card is current-valued and cannot be re-keyed automatically: "
+                    f"{len(unpriceable)} model(s) have only a subscription rate, which "
+                    f"would become their API rate ({listed})"
+                ),
+                resolution=Resolution.MANUAL,
+                remedy=(
+                    "tokenweir's rollup joins the rate card to usage by model alone — "
+                    "pricing_mode does not survive the restructure — so this row would "
+                    "become the model's only rate and every API-metered call for it "
+                    "would price at a subscription rate that carries no per-call dollar "
+                    "by construction, typically zero. That is a confidently wrong cost, "
+                    "not the blank migration 005 returns for usage it cannot price. Add "
+                    "a real API rate for the model before reconciling, or remove the row "
+                    "to leave the model unpriced: nothing here can choose for you, "
+                    "because the answer changes what every historical row costs."
+                ),
+            )
 
     if baseline is None:
         return Discrepancy(

@@ -1289,6 +1289,35 @@ def test_two_rates_for_one_model_cannot_be_re_keyed_and_says_which(legacy_with_r
     assert collision.statements == ()
 
 
+def test_a_solo_subscription_rate_cannot_silently_become_the_api_rate(legacy_with_rows):
+    """The High the terminal review found: `_rate_card_duplicates` only fires on
+    *more than one* row per model, so a model whose only row is
+    `pricing_mode = 'subscription'` walked past it. tokenweir's rollup joins the
+    rate card to usage by `model` alone — `pricing_mode` does not survive the
+    restructure — so that lone row would become the model's only rate, and
+    every API-metered call for it would price at a subscription rate (no
+    per-call dollar by construction): a confidently wrong `est_cost_usd`, not
+    the blank migration 005 returns for usage it cannot price.
+    """
+    execute(
+        legacy_with_rows,
+        "INSERT INTO model_pricing_rates "
+        "(model, pricing_mode, input_cost_usd_per_mtok, output_cost_usd_per_mtok) "
+        "VALUES ('claude-haiku-4-5', 'subscription', 0, 0)",
+    )
+
+    result = plan(legacy_with_rows, baseline_effective_from=BASELINE)
+
+    collision = find(result, "model_pricing_rates", "cannot be re-keyed")
+    assert collision.resolution is Resolution.MANUAL
+    assert "claude-haiku-4-5" in collision.description
+    assert collision.statements == ()
+
+    # claude-opus-5's own row (from `legacy_with_rows`) is an ordinary,
+    # non-subscription, duplicate-free rate and must not be implicated.
+    assert "claude-opus-5" not in collision.description
+
+
 def test_one_decision_outstanding_blocks_everything_including_the_easy_parts(
     legacy_with_rows,
 ):
