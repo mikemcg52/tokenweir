@@ -10,7 +10,7 @@ sequential — the hook and the docs both depend on the new module existing.
 
 - [x] **T001** Create `src/tokenweir/orchestrator.py` with the module docstring: what the
   orchestrator injects, why attribution comes from it and not the model (ADR-0001 Pillar 4), where
-  the lifecycle vocabulary comes from (`mado-phase --phase`), and the stdlib-only rule (FR-014).
+  the lifecycle vocabulary comes from (`mado-phase begin --phase`), and the stdlib-only rule (FR-014).
 - [x] **T002** Define `PhaseKind` (`implementation`, `review`, `fix`) as a `str` Enum with a
   tolerant `coerce`, mirroring `PricingMode` (FR-001).
 - [x] **T003** Implement `phase_label(kind, occurrence=None)` — canonical `kind` / `kind-N`,
@@ -78,6 +78,11 @@ sequential — the hook and the docs both depend on the new module existing.
 - [x] **T020** (review 3) One definition of an empty phase across both ends, so a
   separator-only value cannot fall through the gap between `str.strip()` and `_collapse`;
   document the `mado`→`tokenweir` version-skew behaviour in the README.
+
+- [x] **T021** (review 4) Cut the negative-occurrence guard, which misread `review - 3`
+  as a negative occurrence; add the `bug-fix` alias; bound FR-012 and SC-002 to what the
+  taxonomy actually reads; make the source-reading tests skip rather than raise where
+  there is no source tree.
 
 ## Explicit non-goals
 

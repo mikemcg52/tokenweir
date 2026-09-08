@@ -60,6 +60,8 @@ def test_one_phase_has_one_label(written):
         ("1st bug fix", "fix-1"),
         ("bugfix 1", "fix-1"),
         ("bug fix", "fix"),
+        ("bug-fix", "fix"),
+        ("bug-fix 2", "fix-2"),
         ("bugfix", "fix"),
         ("implement", "implementation"),
         ("Implementation", "implementation"),
@@ -408,15 +410,25 @@ def test_an_exported_block_clears_the_previous_iterations_phase(monkeypatch):
     assert attribution_from_env()["queue"] is None
 
 
-@pytest.mark.parametrize("written", ["review -3", "fix -1", "review - 3"])
-def test_a_negative_occurrence_is_not_read_as_a_positive_one(written):
-    """Review 1, Med-2. A separator class that swallowed the sign turned `review -3`
-    into `review-3` — a canonical label for a phase that never happened, which
-    `is_canonical_phase` then vouched for so nothing warned about it. The spec's Edge
-    Cases put a negative occurrence on the preserved path, and this is that."""
+@pytest.mark.parametrize("written", ["review -3", "fix -1", "review - 3", "review- 3"])
+def test_a_sign_bearing_spelling_is_one_unrecognized_phase(written):
+    """Review 1 Med-2 and review 4 Med-1, which are the same rule read twice.
+
+    A sign must never be *read* as part of an occurrence — `review -3` becoming
+    `review-3` would be a canonical label for a phase that never happened, vouched for
+    by `is_canonical_phase` so nothing warned. That is Med-2, and it holds here.
+
+    But the guard that once refused these strings also matched `review - 3`, which
+    names occurrence **3**; one string in three spacings had three different outcomes,
+    and the middle one raised "occurrence must be 1 or greater" about a positive
+    number. So all four spellings now land on one path — unrecognized, preserved,
+    exported — and this test is the assertion that they land on the *same* one."""
     normalized = normalize_phase(written)
     assert normalized == _collapse_for_test(written)
     assert not is_canonical_phase(normalized)
+    assert attribution_env(issue_key="TOKWEIR-8", phase=written)[
+        ATTRIBUTION_ENV["phase"]
+    ] == normalized
 
 
 def _collapse_for_test(value: str) -> str:
@@ -431,13 +443,6 @@ def _collapse_for_test(value: str) -> str:
         "review 0",
         "0th fix",
         "fix-0",
-        # Review 2, Med-1: the signed spellings reached neither guard. `f"{kind} {n}"`
-        # with a counter running backwards is the same producer bug as `n == 0`, and
-        # the spec makes no distinction between the two — so neither does the parser.
-        "review -1",
-        "fix -0",
-        "review - 3",
-        "review--2",
     ],
 )
 def test_the_block_rejects_a_kind_with_an_impossible_occurrence(phase):
@@ -452,7 +457,7 @@ def test_the_block_rejects_a_kind_with_an_impossible_occurrence(phase):
         attribution_env(issue_key="TOKWEIR-8", phase=phase)
 
 
-@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix", "review -1", "fix -0"])
+@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix", "fix-0"])
 def test_the_consumer_keeps_what_the_producer_refuses(phase):
     """The other half of the same rule, asserted alongside it so a later edit that
     "made them consistent" would have to take one of the two properties away in plain
@@ -462,7 +467,7 @@ def test_the_consumer_keeps_what_the_producer_refuses(phase):
     assert not is_canonical_phase(normalize_phase(phase))
 
 
-@pytest.mark.parametrize("phase", ["deploy -1", "triage 0", "review +1"])
+@pytest.mark.parametrize("phase", ["deploy -1", "triage 0", "review +1", "deploy 3"])
 def test_the_block_passes_a_signed_occurrence_on_an_unknown_kind_through(phase):
     """The bound on the rule above. A sign only makes a phase a *producer* bug when the
     kind is one the taxonomy knows — `deploy -1` is a phase this library has not met,
@@ -511,8 +516,7 @@ def test_the_hook_resolves_the_variable_names_from_the_contract():
     Checked against the source rather than behaviour: two independent hard-codings
     agree right up until someone edits one of them, and the round-trip test would then
     fail with no indication of why."""
-    source = (REPO_ROOT / "src" / "tokenweir" / "claude_code.py").read_text()
-    tree = ast.parse(source)
+    tree = ast.parse(_source("src", "tokenweir", "claude_code.py"))
     literals = {
         node.value
         for node in ast.walk(tree)
@@ -535,7 +539,7 @@ def test_the_contract_module_imports_nothing_but_the_stdlib_and_the_contract():
     driver. Read from the source rather than from `sys.modules`, so the check sees what
     the module *asks for* — a session that already imported everything cannot hide a
     new import from it."""
-    tree = ast.parse((REPO_ROOT / "src" / "tokenweir" / "orchestrator.py").read_text())
+    tree = ast.parse(_source("src", "tokenweir", "orchestrator.py"))
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -571,6 +575,18 @@ def test_importing_the_contract_module_does_not_import_the_hook():
 
 
 # --- the documented contract -----------------------------------------------
+
+
+def _source(*parts: str) -> str:
+    """A file from the source tree, or a skip.
+
+    Same rule as :func:`_readme` below, and it was missing here (review 4, Med-2): a
+    tests-without-source install has no `src/` to read, and a check that cannot run
+    should say so rather than raise `FileNotFoundError` at collection."""
+    path = REPO_ROOT.joinpath(*parts)
+    if not path.exists():
+        pytest.skip(f"{path} is not present; the source tree is not part of this install")
+    return path.read_text(encoding="utf-8")
 
 
 def _readme() -> str:

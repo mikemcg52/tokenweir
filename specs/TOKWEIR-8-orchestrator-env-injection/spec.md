@@ -191,8 +191,13 @@ canonical label grammar and the per-iteration timing are stated.
   `deploy step`. Folding in one direction is what stops an *unknown* phase splitting into as many
   lanes as it has spellings — the same reason the taxonomy exists at all. The diagnostic still
   names the value as exported, so an operator can find it in their own configuration.
-- **An occurrence of zero or a negative number.** Not a real occurrence; the label is rejected at
-  the producer and left as written at the consumer.
+- **An occurrence of zero.** Not a real occurrence; the label is rejected at the producer
+  (`review-0`, `review 0`, `fix-0`, `0th fix`) and left as written at the consumer.
+- **A negative number where an occurrence would go** (`review -1`). Not an occurrence and not a
+  shape this taxonomy reads at all, so it is an unrecognized phase at both ends: preserved by the
+  consumer, passed through by the producer. Distinguishing it from `review - 3` — occurrence 3,
+  written with spaces — is not something a separator rule can do reliably, and the attempt is what
+  review 4 found misclassifying the positive case.
 - **An occurrence written as a huge number.** Accepted — the fix-round cap is configurable and
   nothing here should decide how many rounds are too many.
 - **A phase that is unset, or set to the empty string.** Already answered by TOKWEIR-7's FR-022:
@@ -248,9 +253,17 @@ canonical label grammar and the per-iteration timing are stated.
 - **FR-011**: The builder MUST canonicalize the phase it is given (FR-003) so the orchestrator
   cannot export a non-canonical label by accident.
 - **FR-012**: The builder MUST reject a value that is present but unusable — a blank issue key, a
-  blank stream id, a phase whose occurrence is not positive, an unrecognized pricing mode — by
-  raising, rather than silently exporting it. A producer is a program with a bug to fix; the
-  consumer's tolerance (FR-005) is for values that already exist in the world.
+  blank stream id, a phase whose occurrence is not positive **in a shape the taxonomy reads**
+  (`review-0`, `review 0`, `fix-0`, `0th fix`), an unrecognized pricing mode — by raising, rather
+  than silently exporting it. A producer is a program with a bug to fix; the consumer's tolerance
+  (FR-005) is for values that already exist in the world.
+
+  The bound is load-bearing and was added after review 4. A *sign-bearing* spelling — `review -1`,
+  `review - 3`, `review- 3` — is an unrecognized phase, not an occurrence, and passes through like
+  any other. The rule it replaces tried to refuse those too and could not do it consistently: the
+  same regex matched `review - 3`, which names occurrence **3**, so one string in three spacings
+  had three outcomes and the middle one raised "occurrence must be 1 or greater" about a positive
+  number.
 - **FR-013**: The builder MUST accept the absence of a value (`None`) as distinct from a bad
   value, and export it as the empty string, which the hook already reads as "unknown".
 - **FR-014**: The module carrying FR-001 to FR-013 MUST import nothing outside the standard
@@ -295,8 +308,11 @@ canonical label grammar and the per-iteration timing are stated.
 
 - **SC-001**: Every documented spelling of a phase — at least the five in User Story 1 — maps to
   a single label, verified by test.
-- **SC-002**: A report grouping a run's records by phase yields at most one row per phase
-  occurrence of that run, with no row that is a spelling variant of another.
+- **SC-002**: A report grouping a run's records by phase yields at most one row per *recognized*
+  phase occurrence of that run — the five spellings of SC-001 do not become five rows. Unrecognized
+  phases are exempt by construction: FR-005 requires preserving them, so two spellings of a phase
+  this taxonomy does not know remain two rows until the taxonomy learns it. (Bounded after review
+  4, Low-2, which observed that the original wording promised something FR-005 forbids.)
 - **SC-003**: 100% of records produced with an injected block carry the issue key and the phase
   label that went into it, verified end to end from builder to record.
 - **SC-004**: A phase outside the taxonomy loses no attribution: the record still carries the
@@ -437,3 +453,45 @@ a reader knowing about:
 
 Review 3's remaining Med is the deferral, unchanged and reported for the third time: the story's
 "for the iteration" clause needs MADO-419.
+
+### Review 4 (2026-09-08) — the guard that cost more than it caught
+
+Round 2 added a regex so the producer would refuse a negative occurrence. Round 4's reviewer found
+what it bought: `- ?` also matched `review - 3`, which names occurrence **3**, so the producer
+raised *"occurrence must be 1 or greater"* about a positive number — and `review-3`, `review - 3`
+and `review- 3` had three different outcomes, the middle one the only loud failure. The boundary
+was arbitrary, which is the one thing round 2 claimed it was buying.
+
+It is cut rather than repaired. Teaching the regex to tell `- 3` from `-3` only moves the boundary
+to `review- 3`, and each move adds a case nobody can predict from the rule. Now every sign-bearing
+spelling is uniformly an unrecognized phase at both ends, and the occurrences FR-012 names —
+`review-0`, `review 0`, `fix-0`, `0th fix` — still raise, through the parsers FR-003 requires
+anyway. FR-012 and the Edge Cases are amended to say exactly that, since the previous wording is
+what asked for the guard in the first place.
+
+Worth recording plainly: **review 2 asked for this guard and review 4 asked for it to go.** Both
+were right about the thing they were looking at — a negative occurrence really did slip through,
+and the fix really did misread a positive one. What settles it is that the spec's own list of
+rejected occurrences can be honoured without the guard, and cannot be honoured *consistently* with
+it.
+
+### Review 4 — two recommendations declined, with reasons
+
+Review 4 also read the negative-occurrence guard, the version-skew paragraph and the SC-005 AST
+test as scope the story never asked for. The guard is cut, above. The other two are kept, and the
+disagreement is recorded here rather than resolved by churn:
+
+- **The version-skew paragraph** exists because review 3 asked for it (Low-5), against US4's own
+  statement of purpose: the `mado` engineer should learn "what happens if they get it wrong". Two
+  reviewers, opposite readings; the paragraph is three sentences and answers a question the
+  deferred half will actually raise. It is trimmed rather than removed, and the same note is on
+  MADO-419, where the producer engineer will meet it.
+- **The SC-005 AST test** exists because review 2 found SC-005 claimed and not held. Review 4
+  argues the round-trip test already catches divergence, and it does catch a *renamed* variable —
+  but not a re-introduced hard-coded literal, which is the shape SC-005 names and the shape the
+  hook was in before round 1. The test is 20 lines and there is repo precedent for structural
+  assertions (`test_contract.py`, `test_optional_drivers.py`). Kept.
+
+Review 4's concrete complaint about those tests is fixed rather than argued with: they read the
+source tree, so like `_readme()` they now **skip** where there is none instead of raising
+`FileNotFoundError` in a tests-without-source install.

@@ -714,10 +714,13 @@ def attribution_from_env() -> dict[str, Any]:
     written = _env(ATTRIBUTION_ENV["phase"])
     phase = normalize_phase(written)
     if phase is not None and not is_canonical_phase(phase):
-        # The value as **exported**, not as normalized: an operator debugging this
-        # goes looking for the string in their orchestrator's configuration, and
+        # The value as read, not as normalized: an operator debugging this goes
+        # looking for the string in their orchestrator's configuration, and
         # `'deploy step'` appears nowhere in a config that says `deploy_step`
-        # (review 1, Low-3).
+        # (review 1, Low-3). "As read" rather than "as exported" because `_env` has
+        # already trimmed the ends — a phase exported with surrounding spaces is
+        # reported without them (review 4, Low-4). The middle, which is the part that
+        # differs after folding, is untouched.
         _note(
             f"{ATTRIBUTION_ENV['phase']}={written!r} is not a phase in the "
             "orchestrator taxonomy; recording it as given"

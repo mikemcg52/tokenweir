@@ -26,7 +26,7 @@ Where the vocabulary comes from
 -------------------------------
 
 The lifecycle is MADO's, not this library's, so the kinds are taken from MADO's own
-record of it rather than invented here. ``mado-phase``, the stamper the
+record of it rather than invented here. ``mado-phase begin``, the stamper the
 ``/mado-implement`` loop calls at every phase boundary, documents its permitted values:
 
     ``--phase PHASE   one of: implementation, review, fix``
@@ -129,13 +129,17 @@ class PhaseKind(str, Enum):
 #: The aliases are not decoration. ``bug fix`` is the story's own wording ("1st bug
 #: fix"), and ``implement`` is what a hand-written stamp tends to say. Recognizing them
 #: is what keeps a human-written phase out of the unrecognized path, where it would
-#: survive as a second spelling of a lane that already has one.
+#: survive as a second spelling of a lane that already has one. ``bug-fix`` is here for
+#: the same reason and was missed at first (review 4, Low-1): the hyphen is this
+#: taxonomy's own canonical separator, so it is the spelling a reader of the README is
+#: most likely to reach for, and :func:`_collapse` does not fold it.
 _KIND_BY_WORD: dict[str, PhaseKind] = {
     "implementation": PhaseKind.IMPLEMENTATION,
     "implement": PhaseKind.IMPLEMENTATION,
     "review": PhaseKind.REVIEW,
     "fix": PhaseKind.FIX,
     "bug fix": PhaseKind.FIX,
+    "bug-fix": PhaseKind.FIX,
     "bugfix": PhaseKind.FIX,
 }
 
@@ -183,13 +187,6 @@ _CANONICAL_RE = re.compile(
 _LEADING_ORDINAL_RE = re.compile(r"^(\d+)(st|nd|rd|th)\s+(.*)$", re.IGNORECASE)
 _TRAILING_NUMBER_RE = re.compile(r"^(.*?)(?:-| +)(\d+)$")
 
-#: The same shape carrying a minus sign — ``review -1``, ``fix -0``, ``review - 3``.
-#: Matched **only** to be refused: a signed occurrence is never a label, but on a known
-#: kind it is not an unknown phase either. It is what ``f"{kind} {n}"`` produces when a
-#: round counter runs backwards, which is the producer bug FR-012 exists to catch, and
-#: review 2 found it slipping past the guard because the negative spelling never
-#: reached :data:`_TRAILING_NUMBER_RE`'s kind lookup at all.
-_NEGATIVE_TRAILING_RE = re.compile(r"^(.*?)(?:-| +)- ?(\d+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,13 +283,16 @@ def _parse_phase(lowered: str) -> _ParsedPhase:
                 return _ParsedPhase(kind=kind, bad_occurrence=True)
             return _ParsedPhase(kind=kind, occurrence=number)
 
-    negative = _NEGATIVE_TRAILING_RE.match(lowered)
-    if negative is not None and _KIND_BY_WORD.get(negative.group(1)) is not None:
-        # A kind with a negative occurrence, reported the same way `review-0` is: the
-        # producer raises, the consumer keeps the string as written. One guard, read
-        # two ways, rather than a second check bolted onto `attribution_env`.
-        return _ParsedPhase(kind=_KIND_BY_WORD[negative.group(1)], bad_occurrence=True)
-
+    # A sign-bearing spelling — `review -1`, `review - 3`, `review- 3` — deliberately
+    # reaches none of the branches above and lands here, unrecognized. Review 2 added a
+    # regex to catch the negative case at the producer; review 3 kept it; review 4 found
+    # what it cost: `- ?` also matched `review - 3`, which names occurrence *3*, so one
+    # string in three spacings had three outcomes and the middle one raised "occurrence
+    # must be 1 or greater" about a positive number. Teaching the regex to tell `- 3`
+    # from `-3` only moves the boundary (`review- 3` is still a fourth case). Cut
+    # instead: every sign-bearing spelling is now uniformly an unrecognized phase, and
+    # the occurrences FR-012 actually names — `review-0`, `review 0`, `fix-0`, `0th
+    # fix` — still raise, through the parsers FR-003 requires anyway.
     return _ParsedPhase()
 
 
