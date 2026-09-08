@@ -127,7 +127,7 @@ from typing import IO, Any, Callable, Mapping, Optional, Tuple
 
 from tokenweir.contract import PricingMode, UsageRecord
 from tokenweir.emitter import BufferedEmitter
-from tokenweir.orchestrator import is_canonical_phase, normalize_phase
+from tokenweir.orchestrator import ATTRIBUTION_ENV, is_canonical_phase, normalize_phase
 from tokenweir.sink import NullSink, Sink, emit_usage
 
 #: What this module offers a caller. The baseline machinery — ``read_baseline``,
@@ -698,28 +698,34 @@ def attribution_from_env() -> dict[str, Any]:
     losing a turn's metering would be the tail wagging the dog.
     """
     mode: PricingMode = PricingMode.SUBSCRIPTION
-    declared = _env("MADO_PRICING_MODE")
+    declared = _env(ATTRIBUTION_ENV["pricing_mode"])
     if declared is not None:
         try:
             coerced = PricingMode.coerce(declared)
         except ValueError:
             _note(
-                f"MADO_PRICING_MODE={declared!r} is not a recognized mode; "
-                "recording as subscription"
+                f"{ATTRIBUTION_ENV['pricing_mode']}={declared!r} is not a recognized "
+                "mode; recording as subscription"
             )
         else:
             if coerced is not None:
                 mode = coerced
-    phase = normalize_phase(_env("MADO_PHASE"))
+
+    written = _env(ATTRIBUTION_ENV["phase"])
+    phase = normalize_phase(written)
     if phase is not None and not is_canonical_phase(phase):
+        # The value as **exported**, not as normalized: an operator debugging this
+        # goes looking for the string in their orchestrator's configuration, and
+        # `'deploy step'` appears nowhere in a config that says `deploy_step`
+        # (review 1, Low-3).
         _note(
-            f"MADO_PHASE={phase!r} is not a phase in the orchestrator taxonomy; "
-            "recording it as given"
+            f"{ATTRIBUTION_ENV['phase']}={written!r} is not a phase in the "
+            "orchestrator taxonomy; recording it as given"
         )
     return {
-        "workload": _env("MADO_ISSUE_KEY"),
+        "workload": _env(ATTRIBUTION_ENV["issue_key"]),
         "queue": phase,
-        "parent_request_id": _env("MADO_STREAM_ID"),
+        "parent_request_id": _env(ATTRIBUTION_ENV["stream_id"]),
         "pricing_mode": mode,
     }
 

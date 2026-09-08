@@ -53,7 +53,8 @@ and the hook's design contract is that it cannot fail a session or lose a turn's
 metering — so an unrecognized phase is carried through as written rather than dropped.
 
 **Nothing here imports the hook**, and nothing here imports outside the standard library
-except :mod:`tokenweir.contract`, for the one enum both ends must agree on. The
+except :mod:`tokenweir.contract` — itself stdlib-only — for the one enum both ends must
+agree on. The
 orchestrator runs in another codebase and another cluster namespace; it should be able to
 depend on this contract without inheriting a capture path or a transport driver. The
 dependency runs one way — :mod:`tokenweir.claude_code` imports this module, never the
@@ -63,6 +64,7 @@ reverse.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional, Union
 
@@ -137,9 +139,12 @@ _KIND_BY_WORD: dict[str, PhaseKind] = {
 #:
 #: Keyed by the argument name :func:`attribution_env` takes, so a caller reading the
 #: mapping sees which of its own values ends up where. Both ends of the contract resolve
-#: a name from here — the producer builds the block from it, and the hook reads through
-#: it — which is what stops a typo at one end from producing records that are silently
-#: unattributed rather than an error at either.
+#: a name from here — :func:`attribution_env` builds the block from it and
+#: :func:`tokenweir.claude_code.attribution_from_env` reads through it — which is what
+#: stops a typo at one end from producing records that are silently unattributed rather
+#: than an error at either. A test asserts the hook spells none of these itself; until
+#: review 1 the hook hard-coded all four while this comment claimed otherwise, and two
+#: hard-codings agree right up until someone edits one of them.
 ATTRIBUTION_ENV: Mapping[str, str] = {
     "issue_key": "MADO_ISSUE_KEY",
     "phase": "MADO_PHASE",
@@ -157,8 +162,38 @@ _CANONICAL_RE = re.compile(
 #: A written phase: a kind-ish word, with an occurrence before or after it.
 #: ``1st review`` and ``review 2`` are both common ways to say the same thing, so both
 #: are read; anything else falls through to the unrecognized path.
+#:
+#: The trailing separator is *one* hyphen or *one run of spaces*, never a mixture, and
+#: the kind is matched without stripping what is left. That is what keeps ``review -3``
+#: out: the only parse that reaches a hyphen leaves ``'review '`` as the kind, which is
+#: not a kind. A looser class — ``[\s-]+`` — swallowed the sign and read a negative
+#: occurrence as a positive one, inventing a canonical label for a phase that never
+#: happened (review 1, Med-2).
 _LEADING_ORDINAL_RE = re.compile(r"^(\d+)(st|nd|rd|th)\s+(.*)$", re.IGNORECASE)
-_TRAILING_NUMBER_RE = re.compile(r"^(.*?)[\s-]+(\d+)$")
+_TRAILING_NUMBER_RE = re.compile(r"^(.*?)(?:-| +)(\d+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedPhase:
+    """What a written phase turned out to be.
+
+    Three outcomes rather than two, because the producer and the consumer need
+    different amounts of detail from the same parse:
+
+    - a **kind**, with or without an occurrence — the recognized case;
+    - **nothing** — unrecognized, which the consumer keeps and the producer passes on;
+    - a kind whose occurrence is **not a real occurrence** (``review-0``, ``0th fix``).
+
+    That third case is the one worth separating. To the consumer it is just another
+    unrecognized value, kept as written; to the producer it is a bug worth raising on
+    (FR-012), because a phase naming a real kind and an impossible occurrence is what
+    an off-by-one round counter produces, and it is the split report lane the taxonomy
+    exists to prevent.
+    """
+
+    kind: Optional[PhaseKind] = None
+    occurrence: Optional[int] = None
+    bad_occurrence: bool = False
 
 
 def _collapse(value: str) -> str:
@@ -180,18 +215,59 @@ def _english_ordinal(digits: str, suffix: str) -> Optional[int]:
     ordinal at all — a stripper would read both as 11 and quietly accept a typo as a
     phase occurrence, which is exactly the kind of near-miss this taxonomy exists to
     keep out of a report.
+
+    Positivity is deliberately **not** judged here. ``0th`` is a well-formed English
+    ordinal naming a number that is not an occurrence, and the two failures need
+    telling apart: a bad suffix is an unrecognized string, while a good suffix on a
+    bad number is a kind with an impossible occurrence, which the producer must hear
+    about (:class:`_ParsedPhase`).
     """
     try:
         number = int(digits)
     except ValueError:  # pragma: no cover - the regex only matches digits
-        return None
-    if number <= 0:
         return None
     if 11 <= number % 100 <= 13:
         expected = "th"
     else:
         expected = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
     return number if suffix.lower() == expected else None
+
+
+def _parse_phase(lowered: str) -> _ParsedPhase:
+    """Read a collapsed, lower-cased phase into its parts. Never raises.
+
+    One parser for both ends of the contract, so the producer's strictness and the
+    consumer's tolerance are two readings of the *same* answer rather than two pieces
+    of code that have to be kept agreeing.
+    """
+    direct = _KIND_BY_WORD.get(lowered)
+    if direct is not None:
+        return _ParsedPhase(kind=direct)
+
+    leading = _LEADING_ORDINAL_RE.match(lowered)
+    if leading is not None:
+        number = _english_ordinal(leading.group(1), leading.group(2))
+        kind = _KIND_BY_WORD.get(leading.group(3).strip())
+        if number is not None and kind is not None:
+            if number < 1:
+                return _ParsedPhase(kind=kind, bad_occurrence=True)
+            return _ParsedPhase(kind=kind, occurrence=number)
+
+    trailing = _TRAILING_NUMBER_RE.match(lowered)
+    if trailing is not None:
+        # No `strip()`: the regex already permits exactly the separators a phase is
+        # written with, so anything left clinging to the kind — a stray sign, a second
+        # separator — means this was not one of the shapes we read.
+        kind = _KIND_BY_WORD.get(trailing.group(1))
+        if kind is not None:
+            # `int()` rather than the raw digits: `review-01` is the same occurrence as
+            # `review-1` and must not survive as a second spelling of it.
+            number = int(trailing.group(2))
+            if number < 1:
+                return _ParsedPhase(kind=kind, bad_occurrence=True)
+            return _ParsedPhase(kind=kind, occurrence=number)
+
+    return _ParsedPhase()
 
 
 def phase_label(
@@ -244,12 +320,22 @@ def normalize_phase(value: Optional[str]) -> Optional[str]:
     - A phase this taxonomy recognizes → its canonical label. ``1st review``,
       ``review 1``, ``Review #1``, ``REVIEW-1`` and ``review_1`` all become
       ``'review-1'``.
-    - Anything else → the value with its separators folded, unchanged otherwise.
+    - Anything else → the value with its separators folded, unchanged otherwise. That
+      includes a kind carrying an impossible occurrence (``review-0``): the spec's
+      Edge Cases say such a value is "left as written at the consumer", and it is the
+      producer that hears about it instead.
 
     That last case is a deliberate refusal to be clever. The ACP lifecycle may grow a
     phase before this library hears about it, and a record carrying ``deploy`` is worth
     more than a record carrying nothing — being wrong about the vocabulary should cost
     a non-canonical row in a report, not a lost attribution.
+
+    "Unchanged otherwise" is bounded by :func:`_collapse`, and the bound is worth
+    naming: ``_`` and ``#`` become spaces in the preserved value too, so
+    ``deploy_step`` is kept as ``deploy step``. Folding separators in *one* direction
+    is what stops an unknown phase splitting into as many lanes as it has spellings —
+    the same reason the taxonomy exists — and it is why this is "as written" only up
+    to the separators.
     """
     if value is None:
         return None
@@ -257,29 +343,12 @@ def normalize_phase(value: Optional[str]) -> Optional[str]:
     if not collapsed:
         return None
 
-    lowered = collapsed.lower()
-
-    direct = _KIND_BY_WORD.get(lowered)
-    if direct is not None:
-        return direct.value
-
-    leading = _LEADING_ORDINAL_RE.match(lowered)
-    if leading is not None:
-        number = _english_ordinal(leading.group(1), leading.group(2))
-        if number is not None:
-            kind = _KIND_BY_WORD.get(leading.group(3).strip())
-            if kind is not None:
-                return f"{kind.value}-{number}"
-
-    trailing = _TRAILING_NUMBER_RE.match(lowered)
-    if trailing is not None:
-        kind = _KIND_BY_WORD.get(trailing.group(1).strip())
-        # `int()` rather than the raw digits: `review-01` is the same occurrence as
-        # `review-1` and must not survive as a second spelling of it.
-        if kind is not None and (number := int(trailing.group(2))) >= 1:
-            return f"{kind.value}-{number}"
-
-    return collapsed
+    parsed = _parse_phase(collapsed.lower())
+    if parsed.kind is None or parsed.bad_occurrence:
+        return collapsed
+    if parsed.occurrence is None:
+        return parsed.kind.value
+    return f"{parsed.kind.value}-{parsed.occurrence}"
 
 
 def is_canonical_phase(value: Optional[str]) -> bool:
@@ -354,14 +423,35 @@ def attribution_env(
 
     Raises:
         ValueError: on a value that is present but unusable — a blank issue key or
-            stream id, a blank phase, or a pricing mode that is not a mode. The hook
-            tolerates such values because it may not fail a session; a producer is a
-            program with a bug, and telling it so is the whole point.
+            stream id, a blank phase, **a phase whose occurrence is not positive**
+            (``review-0``, ``0th fix``), or a pricing mode that is not a mode. The
+            hook tolerates all of these because it may not fail a session; a producer
+            is a program with a bug, and telling it so is the whole point.
+
+            A phase this taxonomy does not *recognize* is not in that list — it passes
+            through (see the note above). The difference is whether the value names a
+            real kind: ``deploy`` may be a phase this library has not met, but
+            ``review-0`` is a phase that cannot have happened, and the likeliest way
+            to produce one is an off-by-one round counter.
     """
     mode = PricingMode.coerce(pricing_mode)
 
+    if phase is not None and not isinstance(phase, (str, PhaseKind)):
+        # Otherwise this walks into `_collapse` and surfaces as an AttributeError
+        # about `.replace`, which tells the caller nothing about phases (review 1,
+        # Low-4).
+        raise ValueError(
+            f"phase must be a PhaseKind, a string or None; "
+            f"got {type(phase).__name__} {phase!r}"
+        )
     if isinstance(phase, str) and not phase.strip():
         raise ValueError("phase was given as blank; pass None to leave it unknown")
+    if isinstance(phase, str) and _parse_phase(_collapse(phase).lower()).bad_occurrence:
+        raise ValueError(
+            f"phase occurrence must be 1 or greater; got {phase!r}. "
+            "A kind with an impossible occurrence is a producer bug, not an "
+            "unrecognized phase — pass the kind alone if the occurrence is unknown."
+        )
     label = phase.value if isinstance(phase, PhaseKind) else normalize_phase(phase)
 
     return {

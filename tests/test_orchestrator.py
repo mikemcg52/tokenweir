@@ -105,6 +105,9 @@ def test_blank_is_no_phase_and_not_a_label(blank):
         ("11st fix", "11st fix"),
         ("1th fix", "1th fix"),
         ("triage 2", "triage 2"),
+        ("review -3", "review -3"),
+        ("review - 3", "review - 3"),
+        ("0th review", "0th review"),
     ],
 )
 def test_an_unrecognized_phase_is_kept_as_written(written, expected):
@@ -344,10 +347,20 @@ def test_a_record_carries_the_issue_key_and_phase_that_were_injected(
         monkeypatch.setenv(name, value)
 
     attribution = attribution_from_env()
+    # The builder canonicalizes on the way out, so the block alone would pass with the
+    # hook's normalization removed — which is what review 1 said about this test. The
+    # hook half is proven by the raw re-export below and by the hook suite's own cases.
     assert attribution["workload"] == issue_key
     assert attribution["queue"] == expected_phase
     assert attribution["parent_request_id"] == stream_id
     assert attribution["pricing_mode"] is PricingMode.SUBSCRIPTION
+
+    raw = phase.value if isinstance(phase, PhaseKind) else phase
+    monkeypatch.setenv(ATTRIBUTION_ENV["phase"], raw)
+    assert attribution_from_env()["queue"] == expected_phase, (
+        "a phase exported without going through the builder — an orchestrator "
+        "written before this contract — must still reach the record canonical"
+    )
 
 
 def test_an_exported_block_clears_the_previous_iterations_phase(monkeypatch):
@@ -365,6 +378,77 @@ def test_an_exported_block_clears_the_previous_iterations_phase(monkeypatch):
     for name, value in attribution_env(issue_key="TOKWEIR-8", stream_id="stream-17").items():
         monkeypatch.setenv(name, value)
     assert attribution_from_env()["queue"] is None
+
+
+@pytest.mark.parametrize("written", ["review -3", "fix -1", "review - 3"])
+def test_a_negative_occurrence_is_not_read_as_a_positive_one(written):
+    """Review 1, Med-2. A separator class that swallowed the sign turned `review -3`
+    into `review-3` — a canonical label for a phase that never happened, which
+    `is_canonical_phase` then vouched for so nothing warned about it. The spec's Edge
+    Cases put a negative occurrence on the preserved path, and this is that."""
+    normalized = normalize_phase(written)
+    assert normalized == _collapse_for_test(written)
+    assert not is_canonical_phase(normalized)
+
+
+def _collapse_for_test(value: str) -> str:
+    """What preservation is allowed to change: separators, nothing else."""
+    return " ".join(value.replace("_", " ").replace("#", " ").split())
+
+
+@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix", "fix-0"])
+def test_the_block_rejects_a_kind_with_an_impossible_occurrence(phase):
+    """FR-012, review 1 High-1. The spec's Edge Cases: "the label is rejected at the
+    producer and left as written at the consumer", and the README promises the same to
+    whoever wires the `mado` side.
+
+    This is the case that matters most in practice, because the way to produce it is an
+    off-by-one round counter — a live bug in the producer, exporting a label that then
+    splits a report lane in exactly the way the taxonomy was built to prevent."""
+    with pytest.raises(ValueError, match="occurrence"):
+        attribution_env(issue_key="TOKWEIR-8", phase=phase)
+
+
+@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix"])
+def test_the_consumer_keeps_what_the_producer_refuses(phase):
+    """The other half of the same rule, asserted alongside it so a later edit that
+    "made them consistent" would have to take one of the two properties away in plain
+    sight. The hook may not fail a session over a label, whatever the producer thinks
+    of it."""
+    assert normalize_phase(phase) is not None
+    assert not is_canonical_phase(normalize_phase(phase))
+
+
+@pytest.mark.parametrize("phase", [7, 7.0, ["review"], object()])
+def test_the_block_rejects_a_phase_that_is_not_a_phase(phase):
+    """Review 1, Low-4. The documented failure is `ValueError`; without a guard this
+    surfaced as an `AttributeError` about `.replace`, which tells a caller nothing
+    about phases."""
+    with pytest.raises(ValueError, match="phase"):
+        attribution_env(issue_key="TOKWEIR-8", phase=phase)
+
+
+def test_the_hook_resolves_the_variable_names_from_the_contract():
+    """SC-005, review 1 Med-1. "Producer **and consumer** both resolve them from that
+    one definition" — which was not true when the hook spelled all four by hand, and
+    the contract module's docstring said it was.
+
+    Checked against the source rather than behaviour: two independent hard-codings
+    agree right up until someone edits one of them, and the round-trip test would then
+    fail with no indication of why."""
+    source = (REPO_ROOT / "src" / "tokenweir" / "claude_code.py").read_text()
+    tree = ast.parse(source)
+    literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value in set(ATTRIBUTION_ENV.values())
+    }
+    assert not literals, (
+        f"the hook spells {sorted(literals)} itself; the names live in "
+        "ATTRIBUTION_ENV so that producer and consumer cannot drift apart"
+    )
 
 
 # --- isolation -------------------------------------------------------------

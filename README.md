@@ -630,10 +630,13 @@ would write onto the canonical label: case, `_` and `#` separators, surrounding
 whitespace, a leading English ordinal (`1st review`, `22nd fix`), a trailing number
 (`review 2`), and the aliases `bug fix`/`bugfix` → `fix` and `implement` →
 `implementation`. Ordinal suffixes are validated rather than stripped, so `11th` is 11
-and `11st` is not an ordinal at all. A phase the taxonomy does not recognize is **kept
-as written** and logged — the lifecycle may grow a phase before this library hears about
-it, and a record carrying `deploy` is worth more than a record carrying nothing. Unset
-and blank still mean "no phase" and still leave the field `None`.
+and `11st` is not an ordinal at all. A phase the taxonomy does not recognize is **kept**
+and logged — the lifecycle may grow a phase before this library hears about it, and a
+record carrying `deploy` is worth more than a record carrying nothing. Separators are
+folded in the preserved value too (`deploy_step` is kept as `deploy step`), so an
+unknown phase does not split into as many lanes as it has spellings; the log names the
+value as you exported it, so you can still find it in your own configuration. Unset and
+blank still mean "no phase" and still leave the field `None`.
 
 **Writing is strict.** The producer builds the block from the contract rather than
 spelling the variable names by hand, and hears about a value it cannot use:
@@ -652,8 +655,8 @@ env.update(attribution_env(
 the caller does not have. That is the load-bearing part: a block that omitted what it
 had nothing to say about would leave the previous iteration's phase standing during the
 next one, and the resulting record would be well-formed, plausible and wrong. A blank
-issue key, a blank stream id, a non-positive occurrence or an unrecognized pricing mode
-raises instead of being exported — the hook tolerates such values because it may not
+issue key, a blank stream id, a non-positive occurrence on a known kind (`review-0`,
+`0th fix`) or an unrecognized pricing mode raises instead of being exported — the hook tolerates such values because it may not
 fail a session, while a producer is a program with a bug worth surfacing.
 
 So the orchestrator's obligation is: **export the whole block, on every iteration,
@@ -662,7 +665,9 @@ before the turn**, into the environment Claude Code inherits.
 > **The orchestrator-side change is not in this repository.** MADO's orchestrator is
 > `services/orchestrator/` in the `mado` repo. TOKWEIR-8 delivers the contract here —
 > the taxonomy, the builder, and the hook's conformance to it — and the export itself is
-> a separate change over there, written against this contract.
+> a separate change over there, tracked as **MADO-419** and written against this
+> contract. Until it lands, records from a Max-authenticated stream carry no issue key
+> and no phase, however green this repo's suite is.
 
 ### Everything else it reads
 

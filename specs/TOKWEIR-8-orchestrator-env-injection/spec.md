@@ -154,8 +154,9 @@ and compare the resulting record fields against the values that went in.
    written before this contract, or by hand — **When** the hook builds a record, **Then** `queue`
    still holds the canonical label.
 3. **Given** a phase this taxonomy does not recognize, **When** the hook builds a record,
-   **Then** the record still carries the value as written rather than losing it, and a diagnostic
-   notes that the label is not in the taxonomy.
+   **Then** the record still carries the value — separators folded, words untouched — rather than
+   losing it, and a diagnostic notes that the label is not in the taxonomy, naming the value as
+   the orchestrator exported it.
 
 ---
 
@@ -181,9 +182,15 @@ canonical label grammar and the per-iteration timing are stated.
 ### Edge Cases
 
 - **A phase kind that is not in the taxonomy** (the ACP lifecycle grows a `deploy` phase before
-  this library hears about it). The value is preserved as written, whitespace-normalized, and
-  noted — never dropped and never coerced into a kind it is not. Losing the attribution would be
-  a worse outcome than carrying an unrecognized one.
+  this library hears about it). The value is preserved and noted — never dropped and never coerced
+  into a kind it is not. Losing the attribution would be a worse outcome than carrying an
+  unrecognized one.
+
+  "Preserved" is bounded, and the bound is part of the requirement rather than an accident of the
+  implementation: separators are folded in the preserved value too, so `deploy_step` is kept as
+  `deploy step`. Folding in one direction is what stops an *unknown* phase splitting into as many
+  lanes as it has spellings — the same reason the taxonomy exists at all. The diagnostic still
+  names the value as exported, so an operator can find it in their own configuration.
 - **An occurrence of zero or a negative number.** Not a real occurrence; the label is rejected at
   the producer and left as written at the consumer.
 - **An occurrence written as a huge number.** Accepted — the fix-round cap is configurable and
@@ -241,8 +248,11 @@ canonical label grammar and the per-iteration timing are stated.
 - **FR-013**: The builder MUST accept the absence of a value (`None`) as distinct from a bad
   value, and export it as the empty string, which the hook already reads as "unknown".
 - **FR-014**: The module carrying FR-001 to FR-013 MUST import nothing outside the standard
-  library and MUST NOT import the hook, so the orchestrator can depend on the contract without
-  depending on the capture path.
+  library **except `tokenweir.contract`**, which is itself stdlib-only and holds the one enum both
+  ends must agree on, and MUST NOT import the hook — so the orchestrator can depend on the
+  contract without depending on the capture path or on any transport driver. (Revised after
+  review 1, Low-2: the original wording forbade the import the design always intended to make,
+  and the enforcing test had the exception written into it.)
 
 **The consumer side**
 
@@ -287,8 +297,9 @@ canonical label grammar and the per-iteration timing are stated.
   value, in 100% of cases.
 - **SC-005**: The variable names appear exactly once as literals in the library; producer and
   consumer both resolve them from that one definition.
-- **SC-006**: The contract module has zero non-stdlib imports, so the orchestrator can adopt it
-  without inheriting a transport dependency.
+- **SC-006**: The contract module imports nothing beyond the standard library and
+  `tokenweir.contract`, so the orchestrator can adopt it without inheriting a transport dependency
+  — verified by reading the module's own imports rather than `sys.modules`.
 
 ## Assumptions
 
@@ -311,3 +322,50 @@ canonical label grammar and the per-iteration timing are stated.
 - **Producers raise, consumers tolerate.** The asymmetry between FR-012 and FR-005 is deliberate:
   a bad value in a producer is a bug that should be found in the orchestrator's own tests, while
   the hook's whole design contract (TOKWEIR-7 FR-025) is that it cannot fail a session.
+
+## Revision log
+
+### Review 1 (2026-09-08) — the producer half of FR-012 was missing
+
+The reviewer found that `attribution_env` exported a phase naming a real kind with an impossible
+occurrence (`review-0`, `review 0`, `0th fix`) instead of raising, while the README promised the
+opposite to whoever wires the `mado` side. FR-012 and the Edge Cases had always said "rejected at
+the producer and left as written at the consumer"; only the consumer half existed.
+
+The fix was to enforce it rather than to amend the requirement, because the way to produce such a
+label in the wild is an off-by-one round counter — a live producer bug exporting exactly the split
+report lane this taxonomy exists to prevent. It needed the parser to distinguish three outcomes
+rather than two, so `_parse_phase` now reports *kind with a bad occurrence* as its own answer, and
+the two ends read the same parse: the producer raises on it, the consumer keeps it.
+
+Two related defects came out of the same restructuring:
+
+- The trailing-number separator class `[\s-]+` swallowed a minus sign, so `review -3` normalized
+  to `review-3` — a canonical label for a phase that never happened, which `is_canonical_phase`
+  then vouched for, so nothing warned. The separator is now one hyphen or one run of spaces, and
+  the kind is matched without stripping what is left.
+- `attribution_env(phase=7)` raised `AttributeError` from inside `_collapse` rather than the
+  documented `ValueError`.
+
+### Review 1 — SC-005 was asserted rather than held
+
+The four variable names were literals in two places: `ATTRIBUTION_ENV` and, by hand, the hook —
+while the module's own comment claimed "both ends of the contract resolve a name from here". The
+hook now reads through `ATTRIBUTION_ENV`, and a test asserts it spells none of the names itself.
+The claim is checked rather than repeated.
+
+### Review 1 — the deferred half, restated
+
+The reviewer confirmed independently that `/workspace` holds only `token-weir`, that the deferral
+of the orchestrator-side export to the `mado` repo is legitimate and documented, and that the Jira
+acceptance clause ("emitted records carry the correct issue key and phase **for the iteration**")
+is therefore not satisfiable on this branch alone. Nothing about that changed in this round; it is
+recorded here so the run's report and this spec say the same thing.
+
+The reviewer could not check whether a follow-up existed (`mado-jira` reads by key, and the
+reviewer cannot write to Jira by design), so this round checked and filed it: **MADO-419**,
+*"Orchestrator: export the MADO_* attribution block into stream pods per iteration"*, linked to
+TOKWEIR-8 with a `Relates` link. It is not a duplicate of MADO-235, which covers the
+`X-App-ID` / `X-Workload` **header** path for API-metered capture at the gateway — a different
+mechanism for the same attribution. TOKWEIR-8 should not be closed as delivering end-to-end
+attribution while MADO-419 is open.

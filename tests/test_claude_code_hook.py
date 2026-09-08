@@ -1261,7 +1261,7 @@ def test_attribution_keeps_a_phase_outside_the_taxonomy(transcript, monkeypatch,
     library hears about it. Losing the attribution would be a worse answer than
     carrying an unrecognized one, so the value survives — and is noted, because a
     taxonomy nobody is told has been missed is a taxonomy that quietly rots."""
-    monkeypatch.setenv("MADO_PHASE", "deploy step")
+    monkeypatch.setenv("MADO_PHASE", "deploy_step")
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     sink = RecordingSink()
 
@@ -1269,7 +1269,13 @@ def test_attribution_keeps_a_phase_outside_the_taxonomy(transcript, monkeypatch,
         run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].queue == "deploy step"
-    assert any("taxonomy" in message for message in caplog.messages)
+    notes = [message for message in caplog.messages if "taxonomy" in message]
+    assert notes
+    assert "'deploy_step'" in notes[0], (
+        "the diagnostic must name the value as exported: an operator goes looking "
+        "for it in their orchestrator's configuration, where the normalized "
+        "spelling appears nowhere (review 1, Low-3)"
+    )
 
 
 def test_attribution_does_not_warn_about_a_phase_it_recognizes(

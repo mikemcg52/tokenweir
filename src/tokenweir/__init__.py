@@ -11,6 +11,10 @@ stable seams the gateway's usage pipeline is being pulled into:
 - ``emitter``   — ``BufferedEmitter``, the client that actually *discharges* the
   fire-and-forget contract: buffers, returns immediately, swallows failures
 - ``source``    — the write-side interface (persists records to a store)
+- ``orchestrator`` — the MADO side of attribution: the phase taxonomy and the
+  environment block an orchestrator injects for the Claude Code ``Stop`` hook to
+  read back (TOKWEIR-8). Stdlib-only and hook-free, so a producer in another
+  codebase can depend on the contract without depending on the capture path.
 
 Transport adapters live behind optional extras and are reached by their own import
 path, never from this namespace, so ``import tokenweir`` carries no wire
