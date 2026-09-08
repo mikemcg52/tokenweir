@@ -603,6 +603,67 @@ column would say the field was populated.
 > down here, in the module, and in the story's spec so a future v2 can move it
 > deliberately rather than find it.
 
+### The phase taxonomy, and what the orchestrator must export (TOKWEIR-8)
+
+`MADO_PHASE` lands in a free-text column, so without a defined vocabulary `review`,
+`Review`, `1st review`, `review 1` and `review-1` are five different strings for one
+phase of one run — and a report grouping by phase shows five lanes where the work had
+one. `tokenweir.orchestrator` defines the vocabulary both ends use.
+
+**The kinds** are the orchestrator's own, taken from `mado-phase --phase` (*"one of:
+implementation, review, fix"*) rather than invented here. The loop — implement → review
+→ fix → review → … — is what makes a kind recur, so a label is a kind and, optionally,
+which occurrence of it:
+
+```text
+implementation        a kind on its own
+review-1  fix-1       a kind and a positive occurrence, hyphen-joined
+review-12             any occurrence — the fix-round cap is configurable
+```
+
+The set of kinds is closed; the occurrence is not. A bare kind means *the orchestrator
+did not say which occurrence*, which is not the same claim as "the first" — so nothing
+here ever invents a `-1`.
+
+**Reading is forgiving.** `normalize_phase` maps what a human or an older orchestrator
+would write onto the canonical label: case, `_` and `#` separators, surrounding
+whitespace, a leading English ordinal (`1st review`, `22nd fix`), a trailing number
+(`review 2`), and the aliases `bug fix`/`bugfix` → `fix` and `implement` →
+`implementation`. Ordinal suffixes are validated rather than stripped, so `11th` is 11
+and `11st` is not an ordinal at all. A phase the taxonomy does not recognize is **kept
+as written** and logged — the lifecycle may grow a phase before this library hears about
+it, and a record carrying `deploy` is worth more than a record carrying nothing. Unset
+and blank still mean "no phase" and still leave the field `None`.
+
+**Writing is strict.** The producer builds the block from the contract rather than
+spelling the variable names by hand, and hears about a value it cannot use:
+
+```python
+from tokenweir import attribution_env, phase_label
+
+env.update(attribution_env(
+    issue_key="TOKWEIR-8",
+    phase=phase_label("fix", 2),      # 'fix-2'
+    stream_id=stream_id,
+))
+```
+
+`attribution_env` returns **all four variables on every call**, using `''` for a value
+the caller does not have. That is the load-bearing part: a block that omitted what it
+had nothing to say about would leave the previous iteration's phase standing during the
+next one, and the resulting record would be well-formed, plausible and wrong. A blank
+issue key, a blank stream id, a non-positive occurrence or an unrecognized pricing mode
+raises instead of being exported — the hook tolerates such values because it may not
+fail a session, while a producer is a program with a bug worth surfacing.
+
+So the orchestrator's obligation is: **export the whole block, on every iteration,
+before the turn**, into the environment Claude Code inherits.
+
+> **The orchestrator-side change is not in this repository.** MADO's orchestrator is
+> `services/orchestrator/` in the `mado` repo. TOKWEIR-8 delivers the contract here —
+> the taxonomy, the builder, and the hook's conformance to it — and the export itself is
+> a separate change over there, written against this contract.
+
 ### Everything else it reads
 
 | Variable | Effect |

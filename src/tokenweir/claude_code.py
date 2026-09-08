@@ -127,6 +127,7 @@ from typing import IO, Any, Callable, Mapping, Optional, Tuple
 
 from tokenweir.contract import PricingMode, UsageRecord
 from tokenweir.emitter import BufferedEmitter
+from tokenweir.orchestrator import is_canonical_phase, normalize_phase
 from tokenweir.sink import NullSink, Sink, emit_usage
 
 #: What this module offers a caller. The baseline machinery — ``read_baseline``,
@@ -682,6 +683,15 @@ def attribution_from_env() -> dict[str, Any]:
       Assumptions and in the README so that a future v2 can move it deliberately
       rather than discover it.
 
+    The phase is read through :func:`tokenweir.orchestrator.normalize_phase`
+    (TOKWEIR-8 FR-015), so ``1st review`` and ``review_1`` reach the record as the
+    one label ``review-1`` whether the orchestrator was written before this
+    taxonomy existed or a phase was stamped by hand. That module defines the
+    vocabulary; this one does not restate it. A phase outside the taxonomy is
+    **kept** and noted (FR-016) — the hook may not lose a turn's attribution over a
+    label it does not know, any more than it may over a pricing mode it does not
+    know.
+
     ``pricing_mode`` defaults to ``subscription`` — that is the whole point of this
     capture path — and an unrecognized ``MADO_PRICING_MODE`` falls **back** to it
     rather than dropping the record (FR-018). A misconfigured environment variable
@@ -700,9 +710,15 @@ def attribution_from_env() -> dict[str, Any]:
         else:
             if coerced is not None:
                 mode = coerced
+    phase = normalize_phase(_env("MADO_PHASE"))
+    if phase is not None and not is_canonical_phase(phase):
+        _note(
+            f"MADO_PHASE={phase!r} is not a phase in the orchestrator taxonomy; "
+            "recording it as given"
+        )
     return {
         "workload": _env("MADO_ISSUE_KEY"),
-        "queue": _env("MADO_PHASE"),
+        "queue": phase,
         "parent_request_id": _env("MADO_STREAM_ID"),
         "pricing_mode": mode,
     }

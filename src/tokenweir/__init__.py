@@ -29,6 +29,14 @@ from tokenweir.contract import (
     usage_record_json_schema,
 )
 from tokenweir.emitter import BufferedEmitter, EmitterStats
+from tokenweir.orchestrator import (
+    ATTRIBUTION_ENV,
+    PhaseKind,
+    attribution_env,
+    is_canonical_phase,
+    normalize_phase,
+    phase_label,
+)
 from tokenweir.sink import (
     BatchSink,
     DirectSink,
@@ -72,6 +80,12 @@ __all__ = [
     "emit_usage",
     "Source",
     "MemorySource",
+    "ATTRIBUTION_ENV",
+    "PhaseKind",
+    "attribution_env",
+    "is_canonical_phase",
+    "normalize_phase",
+    "phase_label",
 ]
 
 __version__ = "0.0.0"
