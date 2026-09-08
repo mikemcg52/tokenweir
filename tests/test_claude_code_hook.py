@@ -231,14 +231,18 @@ def hook_stdin(transcript_path, session_id="sess-1"):
     )
 
 
-def into(sink, *, degraded: bool = False):
+def into(sink, *, degraded: bool = False, drop_counter: str = None):
     """A `sink_factory` for `run` that hands back a prepared sink.
 
     `run` builds its sink late — nothing is constructed for a turn with nothing to
     emit — so it takes a factory rather than a sink. Tests want a sink they can
     inspect afterwards, which is what this closes over.
+
+    `drop_counter` is opt-in here exactly as it is in `select_sink`: the party that
+    built the sink is the one that knows what its counters mean, so a test that
+    wants its double's drops consulted says so.
     """
-    return lambda: SinkChoice(sink, degraded=degraded)
+    return lambda: SinkChoice(sink, degraded=degraded, drop_counter=drop_counter)
 
 
 def counts_of(record: UsageRecord) -> tuple:
@@ -302,13 +306,20 @@ def test_counts_one_api_response_once_however_many_lines_mention_it(transcript):
     about the result looks wrong."""
     repeated = usage(1000, 200, 50, 10)
     transcript.append(
-        *[transcript_entry(message_id="msg_same", usage=repeated) for _ in range(4)]
+        *[transcript_entry(message_id="msg_same", usage=repeated) for _ in range(3)],
+        # A fourth line claiming the same response with *different* numbers. The
+        # tie-break is take-first, and giving every duplicate the same usage object
+        # would make first and last indistinguishable — the rule would be stated
+        # and unenforced.
+        transcript_entry(message_id="msg_same", usage=usage(9999, 9999, 9999, 9999)),
     )
     sink = RecordingSink()
 
     run(hook_stdin(transcript), into(sink))
 
-    assert counts_of(sink.records[0]) == (1000, 200, 50, 10)
+    assert counts_of(sink.records[0]) == (1000, 200, 50, 10), (
+        "one response counted once, and the first entry claiming it wins"
+    )
 
 
 def test_counts_sidechain_subagent_entries(transcript):
@@ -366,6 +377,18 @@ def test_counts_survive_lines_that_are_not_usable(transcript):
         handle.write("not json at all\n")
         handle.write(json.dumps(["a list, not an object"]) + "\n")
         handle.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+        # Carries usage but is not typed `assistant`. FR-005 selects on "does this
+        # entry carry a usage object", so this MUST be counted — selecting on
+        # `type` instead would silently drop it, and nothing else in the suite
+        # would notice.
+        handle.write(
+            json.dumps(
+                transcript_entry(
+                    message_id="odd_type", usage=usage(5, 2), entry_type="tool_result"
+                )
+            )
+            + "\n"
+        )
         handle.write(
             json.dumps({"message": {"id": "m", "usage": "not a mapping"}}) + "\n"
         )
@@ -375,7 +398,9 @@ def test_counts_survive_lines_that_are_not_usable(transcript):
     sink = RecordingSink()
     run(hook_stdin(transcript), into(sink))
 
-    assert counts_of(sink.records[0]) == (7, 3, 0, 0)
+    assert counts_of(sink.records[0]) == (12, 5, 0, 0), (
+        "usage decides what is counted, not the entry's `type`"
+    )
 
 
 @pytest.mark.parametrize(
@@ -489,9 +514,7 @@ def test_counts_still_produce_a_record_when_no_message_id_is_present(transcript)
     """A transcript with no usable ids must still produce a record: `request_id`
     is required and non-blank, and a uuid is a worse identifier than a message id
     but an infinitely better one than a dropped turn."""
-    entry = transcript_entry(message_id=None, usage=usage(10, 1))
-    entry.pop("uuid")
-    transcript.append(entry)
+    transcript.append(transcript_entry(message_id=None, usage=usage(10, 1)))
     sink = RecordingSink()
 
     record = run(hook_stdin(transcript), into(sink))
@@ -677,7 +700,7 @@ def test_counts_carry_forward_when_a_conforming_sink_drops_without_raising(
 
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     dropping = ConformingDropSink()
-    assert run(hook_stdin(transcript), into(dropping)) is None
+    assert run(hook_stdin(transcript), into(dropping, drop_counter="dropped")) is None
     assert dropping.dropped == 1, "the sink was actually offered the record"
 
     transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
@@ -704,7 +727,7 @@ def test_counts_carry_forward_through_the_librarys_own_direct_sink(transcript):
 
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     dead = DirectSink(UnreachableStore())
-    assert run(hook_stdin(transcript), into(dead)) is None
+    assert run(hook_stdin(transcript), into(dead, drop_counter="dropped")) is None
     assert dead.written == 0 and dead.dropped == 1
 
     transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
@@ -732,6 +755,42 @@ def test_counts_advance_the_baseline_when_a_conforming_sink_really_stores(
 
     assert [r.input_tokens for r in store.records] == [100]
     assert [r.input_tokens for r in second.records] == [20]
+
+
+def test_counts_ignore_a_drop_counter_the_choice_did_not_name(transcript):
+    """The hazard that made attribute-sniffing wrong, pinned.
+
+    The published `Sink` protocol declares only `emit` and `close`, so an attribute
+    called `dropped` on a stranger's sink promises nothing about *this* record — it
+    might count drops of other records on a shared sink, or lifetime drops across
+    reconnects. Reading it anyway would pin the baseline and re-report the session
+    for ever. Only a counter the `SinkChoice` named is consulted.
+    """
+
+    class BusySharedSink:
+        """Stores our record fine, while something else's drops tick up."""
+
+        def __init__(self):
+            self.records = []
+            self.dropped = 41  # somebody else's losses, on a shared handle
+
+        def emit(self, record):
+            self.records.append(record)
+            self.dropped += 1  # ... and another, unrelated to this record
+
+        def close(self):
+            pass
+
+    shared = BusySharedSink()
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    assert run(hook_stdin(transcript), into(shared)) is not None
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    run(hook_stdin(transcript), into(shared))
+
+    assert [counts_of(r) for r in shared.records] == [(100, 10, 0, 0), (20, 2, 0, 0)], (
+        "an unnamed counter must not be read as a verdict on our record"
+    )
 
 
 def test_counts_advance_for_a_conforming_sink_that_reports_no_drops(transcript):
@@ -981,9 +1040,8 @@ def test_never_disturbs_the_session_without_a_session_id(transcript):
     """FR-003 — "and MUST work without it". Claude Code supplies `session_id`, but
     the hook's contract does not require it, and the fallback identity branch is
     only reachable when it is absent."""
-    entry = transcript_entry(message_id=None, usage=usage(10, 1))
-    entry.pop("uuid")  # no `message.id` *and* no entry uuid: nothing to be stable about
-    transcript.append(entry)
+    # No `message.id`: nothing to be stable about, so identity falls back.
+    transcript.append(transcript_entry(message_id=None, usage=usage(10, 1)))
     payload = io.StringIO(json.dumps({"transcript_path": str(transcript)}))
     sink = RecordingSink()
 
@@ -1345,9 +1403,7 @@ def test_counts_do_not_inherit_a_previous_turns_id_for_an_unidentifiable_entry(
     """
 
     def anonymous(tokens):
-        entry = transcript_entry(message_id=None, usage=usage(tokens))
-        entry.pop("uuid")
-        return entry
+        return transcript_entry(message_id=None, usage=usage(tokens))
 
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     sink = RecordingSink()
@@ -1462,8 +1518,12 @@ def test_select_sink_uses_the_broker_path_when_an_amqp_url_is_configured(
     )
     monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://broker.example/")
 
-    assert select_sink().sink is stub
-    assert select_sink().degraded is False
+    choice = select_sink()
+    assert choice.sink is stub
+    assert choice.degraded is False
+    assert choice.drop_counter == "dropped", (
+        "select_sink must declare the counter for an adapter it built itself"
+    )
 
 
 def test_select_sink_prefers_the_broker_when_both_transports_are_configured(
@@ -1493,8 +1553,12 @@ def test_select_sink_prefers_the_broker_when_both_transports_are_configured(
     monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://broker.example/")
     monkeypatch.setenv("TOKENWEIR_DSN", "postgresql://example/db")
 
-    assert select_sink().sink is stub
-    assert select_sink().degraded is False
+    choice = select_sink()
+    assert choice.sink is stub
+    assert choice.degraded is False
+    assert choice.drop_counter == "dropped", (
+        "select_sink must declare the counter for an adapter it built itself"
+    )
 
 
 def test_select_sink_uses_the_direct_path_when_a_dsn_is_configured(monkeypatch):
@@ -1523,6 +1587,7 @@ def test_select_sink_uses_the_direct_path_when_a_dsn_is_configured(monkeypatch):
     assert isinstance(choice.sink, DirectSink)
     assert isinstance(choice.sink.source, FakeSource)
     assert choice.degraded is False
+    assert choice.drop_counter == "dropped"
 
 
 # ===========================================================================

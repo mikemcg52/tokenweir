@@ -357,10 +357,14 @@ def scan_transcript(path: Any) -> ScanResult:
     last line of a transcript being read while it is written is routinely a
     half-written fragment.
 
-    De-duplication is on ``message.id`` (FR-006), falling back to the entry's own
-    ``uuid``. An entry with neither is counted on its own: it cannot be shown to be
-    a duplicate of anything, and under-counting a turn is the worse error of the
-    two available. Where two entries *do* share an id, the **first** is counted and
+    De-duplication is on ``message.id`` (FR-006) and on nothing else. An entry with
+    no id is counted on its own: it cannot be shown to be a duplicate of anything,
+    and under-counting a turn is the worse error of the two available. An earlier
+    draft fell back to the entry's own ``uuid``, which is unique per *line* rather
+    than per response — so it de-duplicated nothing that ``message.id`` had not
+    already caught, while widening what counts as an identity. It is gone.
+
+    Where two entries *do* share an id, the **first** is counted and
     the rest are skipped — the case this exists for is one response repeated
     verbatim, so first and last are the same value; a genuine disagreement between
     two entries claiming one response id would be a transcript-format change, and
@@ -418,7 +422,7 @@ def scan_transcript(path: Any) -> ScanResult:
                 if not isinstance(usage, Mapping):
                     continue
 
-                identity = _text(message.get("id")) or _text(entry.get("uuid"))
+                identity = _text(message.get("id"))
                 if identity is not None:
                     if identity in seen:
                         continue
@@ -710,9 +714,9 @@ def build_fields(
 ) -> dict[str, Any]:
     """Assemble the record's fields. Pure: reads the environment, touches nothing else.
 
-    Identity (FR-019) is the last counted response's ``message.id``, which is
-    unique per API response and therefore per turn, and which is *traceable* — a
-    row in the store can be found again in the transcript that produced it.
+    Identity (FR-019) is the last counted response's ``message.id`` — unique per
+    API response and therefore per turn, and *traceable*: a row in the store can be
+    found again in the transcript that produced it.
 
     It is deliberately **stable, not fresh per emission**. A turn re-reported
     because its record could not be stored keeps its id, so the redelivery arrives
@@ -788,15 +792,30 @@ class SinkChoice:
         sink: where records go, possibly a ``NullSink`` standing in for a
             transport that could not be built.
         degraded: ``True`` when a transport *was* configured and could not be
-            constructed. The turn is then never treated as stored.
+            constructed. The turn is then never treated as kept.
+        drop_counter: the name of an attribute on ``sink`` that counts records the
+            sink is **certain** it lost, or ``None`` for a sink that offers no such
+            promise.
+
+            Named here, by whoever built the sink, rather than sniffed off the
+            object at use time. That was the first design and it was wrong: the
+            published :class:`~tokenweir.sink.Sink` protocol declares only ``emit``
+            and ``close``, so an attribute called ``dropped`` on a stranger's sink
+            is not a contract — it might count drops of other records on a sink
+            shared with something else, or lifetime drops across reconnects, and
+            reading it as "this record was lost" would pin the baseline and
+            re-report the session for ever. The party that constructed the sink is
+            the only one that knows what its counters mean, so the name travels
+            with the choice.
     """
 
     sink: Sink
     degraded: bool = False
+    drop_counter: Optional[str] = None
 
 
-def _dropped_count(sink: Any) -> Optional[int]:
-    """How many records this sink says it has **lost**, if it says.
+def _dropped_count(choice: SinkChoice) -> Optional[int]:
+    """How many records this sink says it has **lost**, if it promised to say.
 
     A negative signal, and the direction is the whole design. The obvious version
     of this function asks a success counter — ``DirectSink.written``,
@@ -825,10 +844,17 @@ def _dropped_count(sink: Any) -> Optional[int]:
     not tell us it lost this record* — and the residual is written down in the
     README rather than dressed up.
 
+    Only a counter the :class:`SinkChoice` **named** is read. Nothing is inferred
+    from the shape of the object: see :attr:`SinkChoice.drop_counter` for why an
+    attribute named ``dropped`` on an arbitrary sink is not a promise about this
+    record.
+
     Returns:
-        The counter, or ``None`` for a sink that offers none.
+        The counter, or ``None`` when none was named or it is not an integer.
     """
-    value = getattr(sink, "dropped", None)
+    if choice.drop_counter is None:
+        return None
+    value = getattr(choice.sink, choice.drop_counter, None)
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     return None
@@ -871,7 +897,7 @@ def select_sink() -> SinkChoice:
         try:
             from tokenweir.amqp import AMQPSink
 
-            return SinkChoice(AMQPSink.from_url(url))
+            return SinkChoice(AMQPSink.from_url(url), drop_counter="dropped")
         except Exception:
             _note(
                 "AMQP sink could not be constructed; this turn is not metered and "
@@ -885,7 +911,10 @@ def select_sink() -> SinkChoice:
             from tokenweir.postgres import PostgresSource
             from tokenweir.sink import DirectSink
 
-            return SinkChoice(DirectSink(PostgresSource.from_dsn(dsn), owns_source=True))
+            return SinkChoice(
+                DirectSink(PostgresSource.from_dsn(dsn), owns_source=True),
+                drop_counter="dropped",
+            )
         except Exception:
             _note(
                 "direct sink could not be constructed; this turn is not metered and "
@@ -944,11 +973,13 @@ def run(
     in this process can see that without publisher confirms, and the README says so
     rather than implying otherwise.
 
-    A sink offering no drop counter is not consulted at all, which is what stops a
-    conforming third-party sink from being assumed to have failed for ever. A
-    *configured* transport that could not be built never counts (see
-    :class:`SinkChoice`); an unconfigured hook does, because it is discarding by
-    choice rather than by failure.
+    Only a counter the :class:`SinkChoice` named is consulted — the adapters this
+    library builds declare theirs in :func:`select_sink`, and a caller supplying
+    its own factory says so or does not. A sink that named none is simply believed,
+    which is what stops a conforming third-party sink from being assumed to have
+    failed for ever. A *configured* transport that could not be built never counts
+    (see :class:`SinkChoice`); an unconfigured hook does, because it is discarding
+    by choice rather than by failure.
 
     That flush is bounded, not unbounded, so this stays inside the hook's own
     budget (FR-027, FR-028) — the wait is the same one ``close`` already promises.
@@ -1023,7 +1054,7 @@ def run(
     # found rather than shipped.
     choice = (sink_factory or select_sink)()
     sink = choice.sink
-    dropped_before = _dropped_count(sink)
+    dropped_before = _dropped_count(choice)
 
     emitter = BufferedEmitter(sink, close_timeout=close_timeout)
     try:
@@ -1037,7 +1068,7 @@ def run(
     # Accepted at the seam, and the transport did not report losing it.
     kept = record is not None and emitter.stats().delivered >= 1
 
-    dropped_after = _dropped_count(sink)
+    dropped_after = _dropped_count(choice)
     if dropped_before is not None and dropped_after is not None:
         if dropped_after > dropped_before:
             # The adapter is certain it lost this record: the store raised, or the

@@ -6,8 +6,11 @@
 **Jira**: TOKWEIR-7 (Story) — "Stop-hook usage emitter (transcript delta → tokenweir)"
 **Input**: The Jira story, read with `mado-jira read TOKWEIR-7` on 2026-09-08 against the
 `default` account (`https://bostoncio-cto.atlassian.net`) and quoted verbatim below rather than
-reconstructed from the branch name. The reviewer subagent cannot reach that account, so this quote
-is the only story text it can grade against.
+reconstructed from the branch name. **Check it rather than trusting it**: `mado-jira read` resolves
+from any pod on this project, and every review of this branch has re-read the story and confirmed
+the quote. An earlier draft of this line claimed a reviewer could not reach the account, which was
+false — and a sentence telling a reviewer the primary source is unreachable is exactly the sentence
+that stops an implementer-revised spec from being checked against it.
 
 > Build a Claude Code Stop hook that, on each response turn, reads `transcript_path` from stdin,
 > sums the `message.usage.{input_tokens, output_tokens, cache_creation_input_tokens,
@@ -18,8 +21,8 @@ is the only story text it can grade against.
 > **Acceptance:** a Max-authenticated Claude Code turn produces exactly one usage record with
 > correct token deltas; a forced emitter failure does not block the next turn.
 
-Parent epic **TOKWEIR-2** (read the same way, same account), quoted for the attribution
-requirement it adds:
+Parent epic **TOKWEIR-2** (read the same way, same account, elisions marked `[…]`), quoted for the
+attribution requirement it adds:
 
 > Goal: Capture granular per-iteration usage when Claude Code runs on a Claude Max subscription,
 > where API interception isn't possible (OAuth, not a base-URL-swappable API path).
@@ -479,6 +482,8 @@ should know which clauses were written after the fact and why.
 | Fix 3 | FR-017 | Added the live-session clause | Review 3 found the "collapsible duplicates" remedy does not exist once the transcript grows. |
 | Fix 4 | FR-012 | Success counter → **acceptance plus no reported drop**, with the limit of the claim made a requirement | Review 4 showed the success counter unsound both ways: `AMQPSink.published` counts socket frames (no publisher confirms — `amqp.py` documents this), and a conforming sink keeping no such counter would look permanently failed. |
 | Fix 4 | Assumptions (close-timeout window) | Struck the "duplicates share an id" defence | Review 4 found the same live-session error review 3 had corrected elsewhere, left standing here. |
+| Fix 5 | Header | Struck the claim that a reviewer cannot reach the Jira account | It was false, and it discouraged the one check that keeps this document honest. |
+| Fix 5 | FR-006 | De-duplication is on `message.id` **only** | The entry-`uuid` fallback de-duplicated nothing `message.id` had not already caught, while widening what counts as an identity, and no test held it. |
 
 The story itself (quoted at the top, re-read from Jira each round) is unchanged throughout and is
 the scope ceiling these revisions were measured against.
@@ -487,14 +492,45 @@ the scope ceiling these revisions were measured against.
 
 The story's first acceptance clause — *"a Max-authenticated Claude Code turn produces exactly one
 usage record with correct token deltas"* — is exercised in this repo only against **synthetic**
-transcripts built by the test helper, which encodes the same format assumption the parser makes. A
-review running in this pod did drive the hook against a live Claude Code transcript and reported
-one correct record, and reported that de-duplication was doing real work there (50 of 82
-usage-bearing ids appeared on more than one line; summing lines would have over-counted by 80%) —
-but that transcript is a developer's own session data and is not checked in, so nothing in CI
-proves it.
+transcripts built by the test helper, which encodes the same format assumption the parser makes.
+
+Two independent reviews did drive the hook against live Claude Code transcripts in this pod. Both
+reported exactly one record with counts matching their own de-duplicated recount, and both found
+de-duplication doing substantial work: 50 of 82 usage-bearing ids on more than one line in the
+first, 74 of 124 in the second, with a naive line-sum over-counting `cache_read` by ~80% in each.
+The second also checked the selection rule against real output — every usage-bearing entry was
+typed `assistant` and carried a `message.id`, and no id's usage objects disagreed across lines.
+
+None of that is in CI. Those transcripts are developers' own session data and are not checked in.
 
 The check that would close this is one redacted real transcript committed as a fixture with an
 expected-total assertion. It is deliberately not done here: redacting session content reliably is
 its own piece of work, and doing it carelessly is how a test fixture ends up carrying somebody's
 conversation into a public repository. **Treat AC 1 as verified in a pod and unverified in CI.**
+
+### A scope disagreement, recorded rather than resolved
+
+Reviews 4 and 5 both hold that the "was it kept?" check — `SinkChoice.degraded`, the named drop
+counter, and the `kept` computation in `run` — is scope TOKWEIR-7 does not carry, since the story
+says only *"calls the tokenweir emitter"* and the emitter's published contract stops at acceptance.
+Review 4 asked for it to be cut; review 5 restated it as a Med and conceded that the *ordering*
+(advance the baseline after the emit, not before) is in scope.
+
+It was kept, and the reasoning belongs in the record rather than in a commit message nobody will
+find:
+
+- Review 3 demonstrated, with a repro against this library's own `DirectSink`, that advancing on
+  the emitter's number **silently deletes a turn** whenever the store is unreachable —
+  `EmitterStats.delivered` means "the sink did not raise", and a conforming `Sink` may not raise.
+  Cutting the check reintroduces a defect that was found, reproduced and fixed on this branch.
+- The epic's acceptance is that records **land in the tokenweir store**. A capture path that loses
+  a turn to a routine broker restart does not meet it.
+- What review 4 *was* right about is the mechanism, and that was changed: a success counter is
+  unsound both ways, so the question became "did the transport report losing it", the residual is
+  documented, and after review 5 the counter is named by whoever built the sink instead of being
+  sniffed off an arbitrary object.
+
+A reviewer who still considers the layer out of scope is not wrong to; it is a judgement about
+where this story ends, and the counter-argument is that deleting it knowingly ships a data-loss
+path. **The follow-up that would settle it is publisher confirms in `AMQPSink`**, which would make
+the answer authoritative instead of merely honest, and which is genuinely a separate story.
