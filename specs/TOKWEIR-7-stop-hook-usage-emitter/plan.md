@@ -27,8 +27,8 @@ never had to answer before:
 ## Technical Context
 
 **Language/Version**: Python 3.11+ (as declared in `pyproject.toml`).
-**Runtime dependencies**: none. The hook uses `json`, `os`, `sys`, `signal`, `hashlib`,
-`tempfile`, `pathlib` — all stdlib — plus `tokenweir` itself. This keeps ADR-0001 Pillar 2's
+**Runtime dependencies**: none. The hook uses `json`, `os`, `sys`, `hashlib`, `tempfile`,
+`pathlib` — all stdlib — plus `tokenweir` itself. This keeps ADR-0001 Pillar 2's
 "core stays dependency-light" true of the new module, and it is why the module can live in the
 core package rather than behind an extra.
 **Optional dependencies**: `pika` (via `tokenweir[amqp]`) and `psycopg` (via `tokenweir[postgres]`)
@@ -36,13 +36,13 @@ are imported only if the environment selects that transport, and only through th
 adapters, which already defer their imports.
 **Storage**: a small JSON state file per transcript under a cache directory. Disposable.
 **Testing**: `pytest`, per `/workspace/.mado/project.yaml` — `/workspace/repo/.venv/bin/pytest`.
-**Target platform**: Linux (the stream pod) and macOS (a developer's laptop). The time-budget
-alarm is POSIX; its absence degrades to no budget rather than to an error.
+**Target platform**: Linux (the stream pod) and macOS (a developer's laptop). Nothing in the
+module is platform-specific.
 **Project type**: single library.
 **Performance**: one pass over the transcript per turn, streaming, constant memory in the number
 of lines and linear in the number of distinct API responses.
-**Constraints**: exit 0 always; nothing on stdout; total runtime well inside a 30-second hook
-timeout; no `pika`/`psycopg` at import.
+**Constraints**: exit 0 always; nothing on stdout; no `pika`/`psycopg` at import; the run bounded
+by the host's own hook timeout rather than by a timer of our own.
 
 ## Constitution Check
 
@@ -190,6 +190,32 @@ A single-record, short-lived process could call `DirectSink.emit` directly. It s
 either here would be the fourth copy of a guarantee the library exists to own — the exact argument
 `emitter.py`'s own docstring makes.
 
+### 8. What "stored" is measured by — and why not the emitter's own number
+
+*Added at review 3, which found the first answer wrong in a way that lost data with both shipped
+transports.*
+
+`EmitterStats.delivered` counts records the sink took **without raising**. That reads like a
+delivery signal and is not one, because `Sink.emit` may not raise by contract — so every adapter in
+this library catches its own transport failure and returns normally: `DirectSink` on an unreachable
+store, `AMQPSink` on a failed publish. Both increment `delivered`, both stored nothing. A baseline
+advanced on that number deletes the turn, permanently and silently, in exactly the outage the
+carry-forward design exists for.
+
+So the run asks the **transport's own success counter** — `DirectSink.written`,
+`AMQPSink.published` — sampled either side of the emit. A sink offering neither falls back to
+acceptance, which is the strongest signal it makes available and the honest answer for `NullSink`.
+
+Two consequences follow, and both are requirements now (FR-012a, FR-012b):
+
+- A **configured** transport that could not be constructed degrades to a discarding sink so the
+  hook cannot fail — and must not then count as stored, or every session started before its broker
+  was up loses its first turns. An **unconfigured** hook is the opposite and must advance: it is
+  discarding by choice, and a held baseline would make the first configured turn report everything.
+- The sink is built **lazily**, only when there is something to emit. A `Stop` hook fires on every
+  turn and many add no tokens; a connection opened to discover that is a connection per turn, and
+  one that can wedge with nothing at stake.
+
 ## Test approach
 
 `tests/test_claude_code_hook.py`, grouped to match the spec's four user stories, with a helper
@@ -202,9 +228,10 @@ the seam the library already publishes for exactly this purpose.
 - **US1 (counts)**: multi-message turn sums; second invocation deltas; duplicate `message.id`
   counted once; sidechain entries counted; `pricing_mode` is `subscription`; the emitted record
   validates against `schema/usage-record.v1.json`.
-- **US2 (never disturbs)**: raising sink; hanging sink against the time budget; garbage stdin;
-  missing/duplicated/truncated transcript; unwritable state dir; stdout is empty; exit code is 0
-  in every one of them.
+- **US2 (never disturbs)**: raising sink; hanging sink against the bounded close; a *conforming*
+  sink that drops without raising (the shape every real adapter has); a configured transport that
+  cannot be constructed; garbage stdin; missing/truncated transcript; unwritable state dir; stdout
+  is empty; exit code is 0 in every one of them.
 - **US3 (attribution)**: each `MADO_*` variable lands in its field; blank and unset both leave
   `None`; an invalid `MADO_PRICING_MODE` still emits, as `subscription`.
 - **US4 (packaging/docs)**: the console script is declared and resolves; importing the module

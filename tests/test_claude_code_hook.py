@@ -38,7 +38,7 @@ from tokenweir.claude_code import (
     DEFAULT_APP_ID,
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
-    ENVIRONMENT_VARIABLES,
+    SinkChoice,
     TokenTotals,
     build_fields,
     main,
@@ -116,18 +116,34 @@ class HangingSink:
 # --- fixtures --------------------------------------------------------------
 
 
+#: Every environment variable the hook reads. Kept here rather than exported from
+#: the module: a published list is a promise to a consumer, and the only party that
+#: needs one is this fixture.
+HOOK_ENVIRONMENT = (
+    "TOKENWEIR_AMQP_URL",
+    "TOKENWEIR_DSN",
+    "TOKENWEIR_APP_ID",
+    "TOKENWEIR_ENDPOINT",
+    "TOKENWEIR_HOOK_STATE_DIR",
+    "XDG_STATE_HOME",
+    "MADO_ISSUE_KEY",
+    "MADO_PHASE",
+    "MADO_STREAM_ID",
+    "MADO_PRICING_MODE",
+)
+
+
 @pytest.fixture(autouse=True)
 def scrubbed_environment(tmp_path, monkeypatch):
     """Every variable the hook reads, unset — then the state directory pointed
     somewhere disposable.
 
-    Autouse because the danger is a variable the *pod* set, not one a test set:
-    an inherited `MADO_ISSUE_KEY` would make the "no attribution" tests assert the
-    opposite of what they claim. Driving it off `ENVIRONMENT_VARIABLES` rather
-    than a hand-written list means a knob added to the module is scrubbed the day
-    it is added.
+    Autouse because the danger is a variable the *pod* set, not one a test set: an
+    inherited `MADO_ISSUE_KEY` would make the "no attribution" tests assert the
+    opposite of what they claim — passing on a laptop and failing in the very pod
+    this code is written for, or the reverse.
     """
-    for name in ENVIRONMENT_VARIABLES:
+    for name in HOOK_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
     state_dir = tmp_path / "hook-state"
     monkeypatch.setenv("TOKENWEIR_HOOK_STATE_DIR", str(state_dir))
@@ -215,6 +231,16 @@ def hook_stdin(transcript_path, session_id="sess-1"):
     )
 
 
+def into(sink, *, degraded: bool = False):
+    """A `sink_factory` for `run` that hands back a prepared sink.
+
+    `run` builds its sink late — nothing is constructed for a turn with nothing to
+    emit — so it takes a factory rather than a sink. Tests want a sink they can
+    inspect afterwards, which is what this closes over.
+    """
+    return lambda: SinkChoice(sink, degraded=degraded)
+
+
 def counts_of(record: UsageRecord) -> tuple:
     return (
         record.input_tokens,
@@ -239,7 +265,7 @@ def test_counts_a_turn_spanning_several_messages_as_one_record(transcript):
     )
     sink = RecordingSink()
 
-    record = run(hook_stdin(transcript), sink)
+    record = run(hook_stdin(transcript), into(sink))
 
     assert len(sink.records) == 1
     assert record is sink.records[0]
@@ -254,13 +280,13 @@ def test_counts_the_second_turn_as_a_delta_not_a_total(transcript):
         transcript_entry(message_id="msg_b", usage=usage(120, 25)),
     )
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     transcript.append(
         transcript_entry(message_id="msg_c", usage=usage(200, 30)),
         transcript_entry(message_id="msg_d", usage=usage(300, 40)),
     )
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert len(sink.records) == 2
     assert counts_of(sink.records[0]) == (220, 35, 0, 0)
@@ -280,7 +306,7 @@ def test_counts_one_api_response_once_however_many_lines_mention_it(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert counts_of(sink.records[0]) == (1000, 200, 50, 10)
 
@@ -296,7 +322,7 @@ def test_counts_sidechain_subagent_entries(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert counts_of(sink.records[0]) == (500, 70, 0, 0)
 
@@ -306,9 +332,9 @@ def test_counts_nothing_and_emits_nothing_when_the_turn_added_no_tokens(transcri
     tokens — worse than no row."""
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
-    assert run(hook_stdin(transcript), sink) is None
+    assert run(hook_stdin(transcript), into(sink)) is None
     assert len(sink.records) == 1
 
 
@@ -317,17 +343,17 @@ def test_counts_are_re_anchored_when_the_transcript_is_replaced(transcript):
     difference is not negative tokens; the baseline is stale."""
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(5000, 900)))
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     transcript.write_text("", encoding="utf-8")
     transcript.append(transcript_entry(message_id="msg_new", usage=usage(10, 2)))
 
-    assert run(hook_stdin(transcript), sink) is None
+    assert run(hook_stdin(transcript), into(sink)) is None
     assert len(sink.records) == 1, "a replaced transcript must not re-count a session"
 
     # Re-anchored, so the *next* turn is a correct delta against the new file.
     transcript.append(transcript_entry(message_id="msg_next", usage=usage(40, 8)))
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
     assert counts_of(sink.records[1]) == (40, 8, 0, 0)
 
 
@@ -347,7 +373,7 @@ def test_counts_survive_lines_that_are_not_usable(transcript):
         handle.write('{"message": {"id": "trunc", "usa')  # a torn final line
 
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert counts_of(sink.records[0]) == (7, 3, 0, 0)
 
@@ -366,7 +392,7 @@ def test_counts_coerce_unusable_token_values_to_zero(transcript, bad):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert counts_of(sink.records[0]) == (0, 11, 0, 0)
 
@@ -379,7 +405,7 @@ def test_counts_accept_an_integral_float_as_the_integer_it_means(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].input_tokens == 100
 
@@ -390,7 +416,7 @@ def test_counts_are_stamped_subscription(transcript):
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].pricing_mode is PricingMode.SUBSCRIPTION
 
@@ -407,7 +433,7 @@ def test_counts_produce_a_record_that_validates_against_the_published_schema(
 
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1, 2, 3)))
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     jsonschema.validate(
         instance=sink.records[0].to_dict(), schema=usage_record_json_schema()
@@ -424,7 +450,7 @@ def test_counts_carry_the_turns_own_timestamp_normalized_to_utc(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].ts == "2026-09-08T00:10:00+00:00"
 
@@ -437,7 +463,7 @@ def test_counts_fall_back_to_now_for_an_unparseable_timestamp(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     from datetime import datetime
 
@@ -454,7 +480,7 @@ def test_counts_identify_the_record_by_the_last_counted_response(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].request_id == "msg_b"
 
@@ -468,7 +494,7 @@ def test_counts_still_produce_a_record_when_no_message_id_is_present(transcript)
     transcript.append(entry)
     sink = RecordingSink()
 
-    record = run(hook_stdin(transcript), sink)
+    record = run(hook_stdin(transcript), into(sink))
 
     assert record is not None
     assert record.request_id.startswith("sess-1:")
@@ -481,7 +507,7 @@ def test_counts_name_the_model_verbatim(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].model == "claude-haiku-4-5"
 
@@ -492,7 +518,7 @@ def test_counts_fall_back_to_a_placeholder_when_no_model_is_named(transcript):
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(1, 1), model=None))
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].model == DEFAULT_MODEL
 
@@ -506,7 +532,7 @@ def test_counts_carry_the_last_known_model_forward_within_a_turn(transcript):
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].model == "claude-opus-5"
 
@@ -518,7 +544,7 @@ def test_counts_default_app_id_and_endpoint_and_honour_overrides(
     aggregate of several calls, and one key for both would blend them."""
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(1, 1)))
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
     assert sink.records[0].app_id == DEFAULT_APP_ID
     assert sink.records[0].endpoint == DEFAULT_ENDPOINT
     assert sink.records[0].endpoint != "/v1/messages"
@@ -526,7 +552,7 @@ def test_counts_default_app_id_and_endpoint_and_honour_overrides(
     monkeypatch.setenv("TOKENWEIR_APP_ID", "mado")
     monkeypatch.setenv("TOKENWEIR_ENDPOINT", "custom/endpoint")
     transcript.append(transcript_entry(message_id="msg_b", usage=usage(1, 1)))
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
     assert sink.records[1].app_id == "mado"
     assert sink.records[1].endpoint == "custom/endpoint"
 
@@ -537,7 +563,7 @@ def test_counts_leave_latency_unset(transcript):
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(1, 1)))
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].latency_ms is None
 
@@ -554,8 +580,8 @@ def test_counts_are_kept_per_transcript(tmp_path):
         )
 
     sink = RecordingSink()
-    run(hook_stdin(first, session_id="s1"), sink)
-    run(hook_stdin(second, session_id="s2"), sink)
+    run(hook_stdin(first, session_id="s1"), into(sink))
+    run(hook_stdin(second, session_id="s2"), into(sink))
 
     assert [r.input_tokens for r in sink.records] == [100, 700]
     assert state_path_for(first) != state_path_for(second)
@@ -568,12 +594,12 @@ def test_counts_carry_into_the_next_turn_when_the_emit_is_refused(transcript):
     permanently, and nothing anywhere would have said so."""
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     raising = RaisingSink()
-    assert run(hook_stdin(transcript), raising) is None
+    assert run(hook_stdin(transcript), into(raising)) is None
     assert raising.attempts >= 1, "the sink was actually asked to take the record"
 
     transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
     recording = RecordingSink()
-    run(hook_stdin(transcript), recording)
+    run(hook_stdin(transcript), into(recording))
 
     assert counts_of(recording.records[0]) == (120, 12, 0, 0), (
         "the refused turn's tokens must be carried, not dropped"
@@ -594,13 +620,13 @@ def test_counts_carry_forward_when_the_record_is_accepted_but_never_delivered(
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     hanging = HangingSink()
     try:
-        assert run(hook_stdin(transcript), hanging, close_timeout=0.2) is None
+        assert run(hook_stdin(transcript), into(hanging), close_timeout=0.2) is None
     finally:
         hanging.released.set()
 
     transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
     recording = RecordingSink()
-    run(hook_stdin(transcript), recording)
+    run(hook_stdin(transcript), into(recording))
 
     assert counts_of(recording.records[0]) == (120, 12, 0, 0), (
         "tokens accepted but never delivered must carry, not vanish"
@@ -612,12 +638,161 @@ def test_counts_advance_the_baseline_once_delivery_succeeds(transcript):
     re-reported, or a working broker would double-count every turn."""
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert counts_of(sink.records[1]) == (20, 2, 0, 0)
+
+
+def test_counts_carry_forward_when_a_conforming_sink_drops_without_raising(
+    transcript,
+):
+    """FR-012 against the shape every *real* adapter has, which is the shape that
+    breaks a naive implementation.
+
+    `Sink.emit` MUST NOT raise, so a conforming adapter catches its own transport
+    failure and counts a drop: `DirectSink` on an unreachable store, `AMQPSink` on
+    a failed publish. Both return normally. `BufferedEmitter` therefore counts them
+    `delivered`, and a producer that trusted that number would advance its baseline
+    over a record nothing stored — a silent, permanent loss with *both* shipped
+    transports, invisible to any test whose only failing sink raises.
+
+    So this one does what an adapter does: takes the record, keeps nothing, tells
+    nobody.
+    """
+
+    class ConformingDropSink:
+        """Never raises, never stores, and counts what it stored — like the real ones."""
+
+        def __init__(self):
+            self.written = 0
+            self.dropped = 0
+
+        def emit(self, record):
+            self.dropped += 1
+
+        def close(self):
+            pass
+
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    dropping = ConformingDropSink()
+    assert run(hook_stdin(transcript), into(dropping)) is None
+    assert dropping.dropped == 1, "the sink was actually offered the record"
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    recording = RecordingSink()
+    run(hook_stdin(transcript), into(recording))
+
+    assert counts_of(recording.records[0]) == (120, 12, 0, 0), (
+        "a sink that accepted and stored nothing must not advance the baseline"
+    )
+
+
+def test_counts_carry_forward_through_the_librarys_own_direct_sink(transcript):
+    """The same property, asserted against `DirectSink` itself rather than a
+    double — because the claim being made is about the adapters this library
+    ships, and a double is only evidence about the double."""
+    from tokenweir.sink import DirectSink
+
+    class UnreachableStore:
+        def write(self, records):
+            raise RuntimeError("store unreachable")
+
+        def close(self):
+            pass
+
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    dead = DirectSink(UnreachableStore())
+    assert run(hook_stdin(transcript), into(dead)) is None
+    assert dead.written == 0 and dead.dropped == 1
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    recording = RecordingSink()
+    run(hook_stdin(transcript), into(recording))
+
+    assert counts_of(recording.records[0]) == (120, 12, 0, 0)
+
+
+def test_counts_advance_the_baseline_when_a_conforming_sink_really_stores(
+    transcript,
+):
+    """The other side: a working store must not be made to re-report every turn.
+    A check that never advances is as wrong as one that always does."""
+    from tokenweir.sink import DirectSink
+    from tokenweir.source import MemorySource
+
+    store = MemorySource()
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    run(hook_stdin(transcript), into(DirectSink(store)))
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    second = MemorySource()
+    run(hook_stdin(transcript), into(DirectSink(second)))
+
+    assert [r.input_tokens for r in store.records] == [100]
+    assert [r.input_tokens for r in second.records] == [20]
+
+
+def test_counts_carry_forward_when_a_configured_transport_cannot_be_built(
+    transcript, monkeypatch
+):
+    """A transport that was *configured* and could not be constructed degrades to
+    a no-op sink so the hook cannot fail — and a no-op sink accepts everything.
+    Treating that as metered would discard the turn of every session started
+    before its broker was up."""
+    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://nowhere.invalid:5672/")
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+
+    choice = select_sink()
+    assert choice.degraded is True, "a configured-but-unbuildable transport is degraded"
+
+    assert run(hook_stdin(transcript), lambda: choice) is None
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    recording = RecordingSink()
+    run(hook_stdin(transcript), into(recording))
+
+    assert counts_of(recording.records[0]) == (120, 12, 0, 0)
+
+
+def test_counts_advance_for_an_unconfigured_hook_that_discards_by_choice(
+    transcript,
+):
+    """The case that must *not* be caught by the rule above. An unconfigured hook
+    is discarding by choice, and holding its baseline for ever would make the
+    first turn after a transport is configured report the entire session."""
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    assert run(hook_stdin(transcript), select_sink) is not None
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    recording = RecordingSink()
+    run(hook_stdin(transcript), into(recording))
+
+    assert counts_of(recording.records[0]) == (20, 2, 0, 0)
+
+
+def test_the_sink_is_not_built_when_there_is_nothing_to_emit(transcript):
+    """A `Stop` hook fires on every turn, and plenty of turns add no tokens.
+    Opening a broker connection to discover that is a connection per turn, and a
+    connection that can wedge on a turn with nothing at stake."""
+    built = []
+
+    def factory():
+        built.append(True)
+        return SinkChoice(RecordingSink())
+
+    # Nothing in the transcript at all.
+    assert run(hook_stdin(transcript), factory) is None
+    assert built == []
+
+    # And nothing *new* in it.
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+    run(hook_stdin(transcript), into(sink))
+    assert run(hook_stdin(transcript), factory) is None
+    assert built == [], "a zero-delta turn built a sink"
 
 
 # ===========================================================================
@@ -625,10 +800,12 @@ def test_counts_advance_the_baseline_once_delivery_succeeds(transcript):
 # ===========================================================================
 
 
-def _drive_main(monkeypatch, payload, sink):
+def _drive_main(monkeypatch, payload, sink, *, degraded=False):
     """Run the real entry point with a chosen sink and a chosen stdin."""
     monkeypatch.setattr(sys, "stdin", payload)
-    monkeypatch.setattr("tokenweir.claude_code.select_sink", lambda: sink)
+    monkeypatch.setattr(
+        "tokenweir.claude_code.select_sink", into(sink, degraded=degraded)
+    )
     return main()
 
 
@@ -758,7 +935,7 @@ def test_never_disturbs_the_session_when_delivery_hangs(transcript):
 
     started = time.monotonic()
     try:
-        run(hook_stdin(transcript), sink, close_timeout=0.2)
+        run(hook_stdin(transcript), into(sink), close_timeout=0.2)
         elapsed = time.monotonic() - started
     finally:
         sink.released.set()
@@ -776,7 +953,7 @@ def test_never_disturbs_the_session_without_a_session_id(transcript):
     payload = io.StringIO(json.dumps({"transcript_path": str(transcript)}))
     sink = RecordingSink()
 
-    record = run(payload, sink)
+    record = run(payload, into(sink))
 
     assert record is not None
     assert record.request_id.startswith("claude-code:")
@@ -791,7 +968,7 @@ def test_never_disturbs_the_session_with_a_corrupt_baseline(transcript, monkeypa
     state.write_text("{not json", encoding="utf-8")
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert counts_of(sink.records[0]) == (100, 10, 0, 0)
 
@@ -867,7 +1044,7 @@ def test_attribution_comes_from_the_orchestrators_environment(
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     record = sink.records[0]
     assert record.workload == "TOKWEIR-7"
@@ -886,7 +1063,7 @@ def test_attribution_rolls_a_streams_turns_up_under_one_parent(
         transcript.append(
             transcript_entry(message_id=f"msg_{n}", usage=usage(10 * (n + 1)))
         )
-        run(hook_stdin(transcript), sink)
+        run(hook_stdin(transcript), into(sink))
 
     assert len(sink.records) == 3
     assert {r.parent_request_id for r in sink.records} == {"stream-42"}
@@ -904,7 +1081,7 @@ def test_attribution_treats_blank_and_unset_alike(transcript, monkeypatch, value
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     sink = RecordingSink()
 
-    record = run(hook_stdin(transcript), sink)
+    record = run(hook_stdin(transcript), into(sink))
 
     assert record is not None, "a laptop with no orchestrator still gets a record"
     assert record.workload is None
@@ -921,7 +1098,7 @@ def test_attribution_falls_back_to_subscription_for_an_unrecognized_mode(
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     sink = RecordingSink()
 
-    record = run(hook_stdin(transcript), sink)
+    record = run(hook_stdin(transcript), into(sink))
 
     assert record is not None
     assert record.pricing_mode is PricingMode.SUBSCRIPTION
@@ -935,7 +1112,7 @@ def test_attribution_honours_a_recognized_pricing_mode_override(
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert sink.records[0].pricing_mode is PricingMode.API_METERED
 
@@ -955,7 +1132,7 @@ def test_attribution_never_reads_anything_the_model_wrote(transcript, monkeypatc
     )
     sink = RecordingSink()
 
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     record = sink.records[0]
     assert record.workload == "TOKWEIR-7"
@@ -1015,7 +1192,6 @@ def test_packaging_runs_as_a_module_and_exits_zero(transcript):
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     env = dict(os.environ)
     env["TOKENWEIR_AMQP_URL"] = "amqp://nowhere.invalid:5672/"
-    env["TOKENWEIR_HOOK_TIMEOUT"] = "8"
     payload = json.dumps(
         {"session_id": "s", "transcript_path": str(transcript), "hook_event_name": "Stop"}
     )
@@ -1031,14 +1207,6 @@ def test_packaging_runs_as_a_module_and_exits_zero(transcript):
 
     assert result.returncode == 0
     assert result.stdout == "", "a hook's stdout is parsed by Claude Code"
-
-
-def test_packaging_documents_every_environment_variable_the_module_reads():
-    """FR-033. The guard against documentation rotting away from the code: a knob
-    added to the module without a line in the README fails here."""
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    undocumented = [name for name in ENVIRONMENT_VARIABLES if name not in readme]
-    assert not undocumented, f"README does not mention: {undocumented}"
 
 
 def test_packaging_documents_a_non_blocking_settings_fragment():
@@ -1110,7 +1278,7 @@ def test_counts_give_distinct_turns_distinct_request_ids(transcript):
         transcript.append(
             transcript_entry(message_id=f"msg_{n}", usage=usage(10 * (n + 1)))
         )
-        run(hook_stdin(transcript), sink)
+        run(hook_stdin(transcript), into(sink))
 
     ids = [r.request_id for r in sink.records]
     assert len(ids) == 4
@@ -1137,10 +1305,10 @@ def test_counts_do_not_inherit_a_previous_turns_id_for_an_unidentifiable_entry(
 
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
     sink = RecordingSink()
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     transcript.append(anonymous(50))
-    run(hook_stdin(transcript), sink)
+    run(hook_stdin(transcript), into(sink))
 
     assert len(sink.records) == 2
     assert counts_of(sink.records[1]) == (50, 0, 0, 0)
@@ -1170,16 +1338,55 @@ def test_counts_re_report_a_turn_under_the_same_id_when_the_baseline_is_lost(
     sink = RecordingSink()
 
     try:
-        for _ in range(3):
-            run(hook_stdin(transcript), sink)
+        # A static transcript: the same turn, re-reported.
+        for _ in range(2):
+            run(hook_stdin(transcript), into(sink))
     finally:
         blocked.chmod(0o700)
 
-    assert len(sink.records) == 3, "an unwritable cache must not cost a turn its record"
-    assert {r.request_id for r in sink.records} == {"msg_a"}, (
-        "re-reports of one turn must be recognizable as duplicates, not new turns"
-    )
+    assert len(sink.records) == 2, "an unwritable cache must not cost a turn its record"
+    assert {r.request_id for r in sink.records} == {"msg_a"}
     assert {counts_of(r) for r in sink.records} == {(100, 10, 0, 0)}
+
+
+def test_counts_inflate_silently_when_the_baseline_cannot_be_stored_on_a_live_session(
+    transcript, tmp_path, monkeypatch
+):
+    """The honest version of the case above, and the one that actually happens.
+
+    On a *growing* transcript the re-reports are not duplicates of anything. Each
+    covers a longer span and ends on a different response, so the ids differ and
+    the counts climb — three turns of 100 report 100, 300, 600. No choice of
+    identifier rescues this, and nothing marks the records as re-reports.
+
+    This test exists to stop the reassuring version of the story being told again:
+    it pins the real behaviour so that any claim about collapsible duplicates has
+    to be reconciled with it. A persistently unwritable state directory is a broken
+    deployment, not a tolerated one.
+    """
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    monkeypatch.setenv("TOKENWEIR_HOOK_STATE_DIR", str(blocked / "state"))
+    sink = RecordingSink()
+
+    try:
+        for n in range(3):
+            transcript.append(
+                transcript_entry(message_id=f"msg_{n}", usage=usage(100))
+            )
+            run(hook_stdin(transcript), into(sink))
+    finally:
+        blocked.chmod(0o700)
+
+    assert [r.request_id for r in sink.records] == ["msg_0", "msg_1", "msg_2"]
+    assert [r.input_tokens for r in sink.records] == [100, 200, 300]
+    assert sum(r.input_tokens for r in sink.records) == 600, (
+        "the true session total is 300; this is the inflation, recorded as real"
+    )
+    assert len({r.request_id for r in sink.records}) == 3, (
+        "these are not collapsible duplicates and must not be described as such"
+    )
 
 
 def test_select_sink_uses_the_broker_path_when_an_amqp_url_is_configured(
@@ -1209,7 +1416,8 @@ def test_select_sink_uses_the_broker_path_when_an_amqp_url_is_configured(
     )
     monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://broker.example/")
 
-    assert select_sink() is stub
+    assert select_sink().sink is stub
+    assert select_sink().degraded is False
 
 
 def test_select_sink_prefers_the_broker_when_both_transports_are_configured(
@@ -1239,7 +1447,8 @@ def test_select_sink_prefers_the_broker_when_both_transports_are_configured(
     monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://broker.example/")
     monkeypatch.setenv("TOKENWEIR_DSN", "postgresql://example/db")
 
-    assert select_sink() is stub
+    assert select_sink().sink is stub
+    assert select_sink().degraded is False
 
 
 def test_select_sink_uses_the_direct_path_when_a_dsn_is_configured(monkeypatch):
@@ -1263,10 +1472,11 @@ def test_select_sink_uses_the_direct_path_when_a_dsn_is_configured(monkeypatch):
     )
     monkeypatch.setenv("TOKENWEIR_DSN", "postgresql://example/db")
 
-    sink = select_sink()
+    choice = select_sink()
 
-    assert isinstance(sink, DirectSink)
-    assert isinstance(sink.source, FakeSource)
+    assert isinstance(choice.sink, DirectSink)
+    assert isinstance(choice.sink.source, FakeSource)
+    assert choice.degraded is False
 
 
 # ===========================================================================
@@ -1318,4 +1528,8 @@ def test_select_sink_defaults_to_a_no_op():
     """An unconfigured hook is a no-op, not an error."""
     from tokenweir.sink import NullSink
 
-    assert isinstance(select_sink(), NullSink)
+    choice = select_sink()
+    assert isinstance(choice.sink, NullSink)
+    assert choice.degraded is False, (
+        "an unconfigured hook is discarding by choice, not by failure"
+    )

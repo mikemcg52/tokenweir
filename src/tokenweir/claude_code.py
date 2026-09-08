@@ -92,8 +92,16 @@ than to this story.
 
 **Nothing is ever written to stdout.** Claude Code parses a hook's stdout, so a
 stray ``print`` is a way for a metering adapter to change the session's behaviour.
-Diagnostics go to this module's logger — which the package fits with a
-``NullHandler`` — and, when ``TOKENWEIR_HOOK_DEBUG`` is set, to stderr.
+Diagnostics go to this module's logger and nowhere else.
+
+Be clear about what that costs, because the package fits the ``tokenweir`` logger
+with a ``NullHandler``: under a Claude Code session that has configured no logging
+for this library, the hook's diagnostics reach **nobody**. That is the package's
+standing decision — where output goes belongs to whoever embeds the library — and
+this module keeps to it rather than carving out an exception with a private
+stderr knob. The consequence is that a *persistently* misconfigured hook is quiet,
+and the operator-facing answer to that is the store: a stream that reports no
+usage is the signal, not a log line nobody collected.
 
 Installing it
 -------------
@@ -115,31 +123,32 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Any, Mapping, Optional, Tuple
+from typing import IO, Any, Callable, Mapping, Optional, Tuple
 
 from tokenweir.contract import PricingMode, UsageRecord
 from tokenweir.emitter import BufferedEmitter
 from tokenweir.sink import NullSink, Sink, emit_usage
 
+#: What this module offers a caller. The baseline machinery — ``read_baseline``,
+#: ``write_baseline``, ``state_path_for``, ``turn_delta`` — is deliberately absent:
+#: the spec calls that state an implementation detail of this producer, and a
+#: published name is a promise to keep it. It stays importable for the tests, which
+#: are inside the project and may know more than a consumer does.
 __all__ = [
     "DEFAULT_APP_ID",
     "DEFAULT_ENDPOINT",
     "DEFAULT_MODEL",
-    "ENVIRONMENT_VARIABLES",
     "HookInput",
     "ScanResult",
+    "SinkChoice",
     "TokenTotals",
     "attribution_from_env",
     "build_fields",
     "main",
-    "read_baseline",
     "read_hook_input",
     "run",
     "scan_transcript",
     "select_sink",
-    "state_path_for",
-    "turn_delta",
-    "write_baseline",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -163,23 +172,6 @@ DEFAULT_MODEL = "unknown"
 #: client's own 5s default: this process exists for one record and must not sit
 #: on a dead broker.
 DEFAULT_CLOSE_TIMEOUT = 3.0
-
-#: Every environment variable this module reads, with a one-line meaning. Public
-#: because the README documents these and a test checks the two agree — a knob
-#: added here without a line in the README fails the suite rather than quietly
-#: becoming folklore.
-ENVIRONMENT_VARIABLES: dict[str, str] = {
-    "TOKENWEIR_AMQP_URL": "AMQP URL; selects the broker path.",
-    "TOKENWEIR_DSN": "Postgres DSN; selects the broker-less direct path.",
-    "TOKENWEIR_APP_ID": f"Overrides app_id (default {DEFAULT_APP_ID!r}).",
-    "TOKENWEIR_ENDPOINT": f"Overrides endpoint (default {DEFAULT_ENDPOINT!r}).",
-    "TOKENWEIR_HOOK_STATE_DIR": "Where the per-transcript baseline is kept.",
-    "XDG_STATE_HOME": "Base for the default state directory when the above is unset.",
-    "MADO_ISSUE_KEY": "Issue being worked; recorded as workload.",
-    "MADO_PHASE": "Phase of the run; recorded as queue.",
-    "MADO_STREAM_ID": "Stream; recorded as parent_request_id.",
-    "MADO_PRICING_MODE": "Overrides pricing_mode; anything unrecognized falls back.",
-}
 
 #: The four contract token fields, in the order they appear on the record.
 _COUNT_FIELDS: Tuple[str, ...] = (
@@ -509,8 +501,9 @@ def write_baseline(path: Any, totals: TokenTotals, *, transcript: Any = None) ->
     """Persist the baseline atomically. Returns whether it was written.
 
     Atomic via a temporary file in the **same directory** and :func:`os.replace`
-    (FR-016). Written in place, an interrupted write — the time budget firing, the
-    process being killed — leaves a truncated file that every later invocation
+    (FR-016). Written in place, an interrupted write — the process being killed by
+    the host's hook timeout, a full disk — leaves a truncated file that every later
+    invocation
     reads as corrupt, so one interruption would cost every subsequent turn its
     baseline. The temp file is in the same directory because ``os.replace`` is only
     atomic within a filesystem.
@@ -526,12 +519,18 @@ def write_baseline(path: Any, totals: TokenTotals, *, transcript: Any = None) ->
     re-reports the whole session from zero, so the over-count compounds for as
     long as the condition lasts.
 
-    What keeps that from being silent is the identity. Each of those re-reports
-    carries the *same* ``request_id`` as the last, because the turn it describes
-    is the same turn — so they are exact duplicates, and a consumer can see that
-    they are (see :func:`build_fields`). Every failure is also noted. The failure
-    is not made harmless; it is made **visible**, which is the most a producer
-    that must not fail can do about it.
+    And the compounding case is **not** self-describing, which is worth stating
+    plainly because the reassuring version of *this* sentence is wrong too. Only a
+    transcript that is not growing produces identical re-reports a consumer could
+    collapse: with a live session the identity is the last response's id, which
+    changes every turn, so the re-reports arrive as distinct records with
+    monotonically inflating counts and nothing marks them as re-reports at all.
+
+    So a persistently unwritable state directory is real, silent inflation. Each
+    failure is noted on the logger, and that is all this function can do about it —
+    the alternative is losing the turn, which FR-017 rules out. It is a broken
+    deployment, and the honest statement is that it must be fixed rather than
+    tolerated.
     """
     payload = {
         "schema": 1,
@@ -715,16 +714,21 @@ def build_fields(
     unique per API response and therefore per turn, and which is *traceable* — a
     row in the store can be found again in the transcript that produced it.
 
-    It is deliberately **stable, not fresh per emission**, and the difference
-    matters in one case. If the baseline cannot be stored, the same turn is
-    re-reported next time; a random discriminator would make those re-reports look
-    like distinct turns and turn a visible duplicate into invisible inflation. A
-    stable id makes them what they are — the same record, twice — which is
-    something a report can collapse. That is also why the store deliberately puts
-    no unique constraint on ``request_id`` (``001_gateway_usage.sql``): it is an
-    append-only log that expects at-least-once delivery, so an identical row
-    arriving twice is an ordinary event with an ordinary remedy, and the id is the
-    key that remedy needs.
+    It is deliberately **stable, not fresh per emission**. A turn re-reported
+    because its record could not be stored keeps its id, so the redelivery arrives
+    as the same record rather than as a new turn — which is what lets a report
+    collapse it, and why the store deliberately puts no unique constraint on
+    ``request_id`` (``001_gateway_usage.sql``): an append-only log expecting
+    at-least-once delivery treats an identical row arriving twice as an ordinary
+    event, and the id is the key that remedy needs.
+
+    Its reach is narrower than it first appears, and the limit belongs here rather
+    than in a footnote. It collapses redeliveries of *one* turn. It does **not**
+    rescue the case where the baseline itself cannot be stored on a live session:
+    there each re-report covers a longer span and ends on a different response, so
+    the ids differ and the records are genuinely different records. That case is
+    unrecoverable by any choice of identifier and is a broken deployment; see
+    :func:`write_baseline`.
 
     Distinct turns never collide, which is the property FR-019 actually protects:
     a turn's id is its last response's id, and no two responses share one.
@@ -767,7 +771,61 @@ def build_fields(
 # --- transport selection ---------------------------------------------------
 
 
-def select_sink() -> Sink:
+@dataclass(frozen=True, slots=True)
+class SinkChoice:
+    """A sink, and whether it is actually metering anything.
+
+    The second field is the point. A *configured* transport that could not be
+    constructed — a dead broker, a missing driver — degrades to
+    :class:`~tokenweir.sink.NullSink` so the hook cannot fail, and a ``NullSink``
+    accepts every record and stores none. Without this flag that is
+    indistinguishable from the deliberately unconfigured case, and the difference
+    decides whether the baseline may advance: an unconfigured hook is discarding
+    records **by choice** and should not hold a baseline for ever, while a broken
+    transport is losing records the deployment expected to keep.
+
+    Attributes:
+        sink: where records go, possibly a ``NullSink`` standing in for a
+            transport that could not be built.
+        degraded: ``True`` when a transport *was* configured and could not be
+            constructed. The turn is then never treated as stored.
+    """
+
+    sink: Sink
+    degraded: bool = False
+
+
+def _stored_count(sink: Any) -> Optional[int]:
+    """How many records this sink says it has actually stored, if it says.
+
+    This exists because :attr:`~tokenweir.emitter.EmitterStats.delivered` cannot
+    answer the question. It counts records the sink took **without raising** — and
+    a conforming ``Sink`` may not raise, by contract, so every adapter in this
+    library catches its own transport failure and counts a drop:
+    :class:`~tokenweir.sink.DirectSink` on an unreachable store,
+    :class:`~tokenweir.amqp.AMQPSink` on a failed publish. Both return normally,
+    both increment ``delivered``, and neither stored anything. Reading that as
+    success is exactly the acceptance-as-delivery the design rejects, one layer
+    further down than the layer where it was rejected.
+
+    So ask the transport instead. Both shipped adapters keep a success counter —
+    ``DirectSink.written``, ``AMQPSink.published`` — incremented only on the path
+    where the record really went somewhere.
+
+    Returns:
+        The counter, or ``None`` for a sink that offers neither. ``None`` is not a
+        failure: it is the honest answer for ``NullSink`` and for a caller's own
+        sink, and the caller falls back to acceptance, which is the strongest
+        signal such a sink makes available.
+    """
+    for name in ("written", "published"):
+        value = getattr(sink, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def select_sink() -> SinkChoice:
     """Choose a sink from the environment (FR-030, FR-031).
 
     ``TOKENWEIR_AMQP_URL`` selects the homelab's broker path; ``TOKENWEIR_DSN``
@@ -784,25 +842,33 @@ def select_sink() -> Sink:
     that is dependency-free by contract.
 
     A sink whose *construction* fails — a malformed URL, a missing driver, a
-    broker that is not there — degrades to :class:`NullSink`. Construction is
-    normally the one place in the emit path where raising is correct, because it
-    is wiring time and somebody is watching. Here nobody is: the caller is a hook
-    whose contract is that it cannot disturb the session, so the failure is noted
-    and metering is skipped for this turn.
+    broker that is not there — degrades to :class:`NullSink` and is returned
+    **marked degraded**. Construction is normally the one place in the emit path
+    where raising is correct, because it is wiring time and somebody is watching.
+    Here nobody is: the caller is a hook whose contract is that it cannot disturb
+    the session. But the turn must not then be treated as metered — a ``NullSink``
+    accepts everything and stores nothing, so without the mark the hook would
+    advance its baseline over a record that went nowhere, which is the loss
+    :func:`run` is arranged to prevent.
 
-    :class:`NullSink` as the default is deliberate. An unconfigured hook is a
-    no-op, not an error; a developer who installs the hook before standing up a
-    broker gets silence rather than a stream of failures.
+    :class:`NullSink` as the *unconfigured* default is deliberate and is a
+    different case. An unconfigured hook is a no-op, not an error; a developer who
+    installs the hook before standing up a broker gets silence rather than a stream
+    of failures, and its baseline advances because it is discarding records by
+    choice rather than by failure.
     """
     url = _env("TOKENWEIR_AMQP_URL")
     if url is not None:
         try:
             from tokenweir.amqp import AMQPSink
 
-            return AMQPSink.from_url(url)
+            return SinkChoice(AMQPSink.from_url(url))
         except Exception:
-            _note("AMQP sink could not be constructed; no metering for this turn")
-            return NullSink()
+            _note(
+                "AMQP sink could not be constructed; this turn is not metered and "
+                "its tokens carry into the next"
+            )
+            return SinkChoice(NullSink(), degraded=True)
 
     dsn = _env("TOKENWEIR_DSN")
     if dsn is not None:
@@ -810,19 +876,25 @@ def select_sink() -> Sink:
             from tokenweir.postgres import PostgresSource
             from tokenweir.sink import DirectSink
 
-            return DirectSink(PostgresSource.from_dsn(dsn), owns_source=True)
+            return SinkChoice(DirectSink(PostgresSource.from_dsn(dsn), owns_source=True))
         except Exception:
-            _note("direct sink could not be constructed; no metering for this turn")
-            return NullSink()
+            _note(
+                "direct sink could not be constructed; this turn is not metered and "
+                "its tokens carry into the next"
+            )
+            return SinkChoice(NullSink(), degraded=True)
 
-    return NullSink()
+    return SinkChoice(NullSink())
 
 
 # --- the pipeline ----------------------------------------------------------
 
 
 def run(
-    stream: IO[str], sink: Sink, *, close_timeout: float = DEFAULT_CLOSE_TIMEOUT
+    stream: IO[str],
+    sink_factory: Optional[Callable[[], SinkChoice]] = None,
+    *,
+    close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
 ) -> Optional[UsageRecord]:
     """Read, count, emit, and only then advance the baseline.
 
@@ -833,16 +905,31 @@ def run(
     permanent, silent loss.
 
     "Taken the record" is deliberately the *strong* reading: the baseline advances
-    only once the emitter reports the record **delivered**, not merely accepted.
-    :class:`~tokenweir.emitter.BufferedEmitter` is fire-and-forget by contract, so
-    a record it accepted may still be dropped later against a dead broker — and
-    accepting that as good enough would quietly reintroduce the loss this design
-    exists to prevent, since the baseline would advance for a record nothing ever
-    stored. This process is short-lived and emits exactly one record, so it can
-    afford what a metered request path cannot: it closes the emitter, which flushes
-    within the bounded timeout, and reads :meth:`BufferedEmitter.stats` to find out
-    what actually happened. A broker that is down therefore carries the turn's
-    tokens forward until it comes back, rather than losing them.
+    only once the record was actually **stored**, not merely accepted. This process
+    is short-lived and emits exactly one record, so it can afford what a metered
+    request path cannot — it closes the emitter, which flushes within the bounded
+    timeout, and then asks what happened.
+
+    **Who it asks is the whole of the correctness here.**
+    :attr:`~tokenweir.emitter.EmitterStats.delivered` is *not* the right question,
+    and asking it was a real defect: it counts records the sink took without
+    raising, and a conforming ``Sink`` may not raise, so
+    :class:`~tokenweir.sink.DirectSink` over a dead store and
+    :class:`~tokenweir.amqp.AMQPSink` against a dead broker both catch their own
+    failure, count a drop, and return normally. Both would have looked delivered.
+    The turn's tokens would have been dropped by the sink and dropped again by the
+    advancing baseline — a silent, permanent loss with both shipped transports.
+
+    So it asks the **transport's own success counter** (:func:`_stored_count`),
+    which increments only where a record really went somewhere. A sink offering no
+    such counter falls back to acceptance, which is the strongest signal it makes
+    available; that is the honest answer for :class:`NullSink` and for a caller's
+    own sink, and it is why an unconfigured hook still advances — it is discarding
+    by choice, not by failure. A *configured* transport that could not be built at
+    all never counts as stored (see :class:`SinkChoice`).
+
+    A broker that is down therefore carries the turn's tokens forward until it
+    comes back, rather than losing them.
 
     That flush is bounded, not unbounded, so this stays inside the hook's own
     budget (FR-027, FR-028) — the wait is the same one ``close`` already promises.
@@ -860,16 +947,25 @@ def run(
     bare ``sink.emit`` (FR-029). Both guarantees already exist in the library; the
     fourth reimplementation of a guarantee is where it stops being one.
 
-    **This closes the sink it is given**, as a consequence of closing the emitter
-    wrapped around it (:meth:`BufferedEmitter.close` closes its sink, from the
-    worker thread, which is what keeps sink access single-threaded). That is the
-    right lifecycle for a hook — one record, then exit — but it is a side effect on
-    a caller's object, so it is stated rather than left to be discovered.
+    **The sink is built late and closed here.** ``sink_factory`` is not called at
+    all unless there is something to emit, so a turn that added no tokens — a
+    common outcome for a ``Stop`` hook — opens no broker connection and can wedge
+    on none. Whatever it returns is then closed, as a consequence of closing the
+    emitter wrapped around it (:meth:`BufferedEmitter.close` closes its sink, from
+    the worker thread, which is what keeps sink access single-threaded). That is
+    the right lifecycle for a hook — one record, then exit — but it is a side
+    effect on the factory's object, so it is stated rather than discovered.
+
+    Args:
+        stream: the hook payload, normally ``sys.stdin``.
+        sink_factory: builds the sink, and is called **only if there is something
+            to emit**. Defaults to :func:`select_sink`, resolved at call time.
+        close_timeout: how long the emitter may spend flushing.
 
     Returns:
         The emitted record, or ``None`` when there was nothing to emit (no
         transcript, no new tokens, a replaced transcript) or the record was not
-        delivered.
+        stored.
     """
     hook_input = read_hook_input(stream)
     if hook_input.transcript_path is None:
@@ -894,22 +990,43 @@ def run(
 
     fields = build_fields(delta, scan, hook_input)
 
+    # Resolved here rather than as a default argument: a default is bound when
+    # this function is *defined*, so `sink_factory=select_sink` would capture the
+    # original and quietly ignore anyone who replaced the module attribute
+    # afterwards — including this project's own tests, which is how the trap was
+    # found rather than shipped.
+    choice = (sink_factory or select_sink)()
+    sink = choice.sink
+    before = _stored_count(sink)
+
     emitter = BufferedEmitter(sink, close_timeout=close_timeout)
     try:
         record = emit_usage(emitter, fields)
     finally:
-        # Closing flushes within `close_timeout` and is what turns "accepted" into
-        # a knowable "delivered" below. In a `finally` so that a guarded seam that
-        # somehow raised still leaves no worker thread behind.
+        # Closing flushes within `close_timeout` and is what makes the counters
+        # below meaningful. In a `finally` so that a guarded seam that somehow
+        # raised still leaves no worker thread behind.
         emitter.close()
 
-    delivered = emitter.stats().delivered
+    after = _stored_count(sink)
+    if before is not None and after is not None:
+        stored = after - before >= 1
+    else:
+        # No counter to ask. Acceptance is the strongest signal this sink offers.
+        stored = emitter.stats().delivered >= 1
 
-    if record is None or delivered < 1:
-        # Refused at the seam (a malformed record, a sink that raised) or accepted
-        # and then not delivered (a dead broker). Either way the baseline stays
-        # where it is, so these tokens are reported next turn instead of vanishing.
-        _note("record was not delivered; its tokens carry into the next turn")
+    if choice.degraded:
+        # A transport was configured and could not be built. The record went into
+        # a stand-in that keeps nothing, so whatever the counters say, nothing was
+        # metered.
+        stored = False
+
+    if record is None or not stored:
+        # Refused at the seam (a malformed record, a sink that raised), or taken
+        # and not stored (a dead broker, an unreachable store, a transport that
+        # could not be constructed). Either way the baseline stays where it is, so
+        # these tokens are reported next turn instead of vanishing.
+        _note("record was not stored; its tokens carry into the next turn")
         return None
 
     write_baseline(state_path, scan.totals, transcript=hook_input.transcript_path)
@@ -942,18 +1059,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     del argv  # the hook takes no arguments; the payload arrives on stdin
     try:
-        sink = select_sink()
-        try:
-            run(sys.stdin, sink)
-        finally:
-            # `BufferedEmitter.close` already closed it — this is for the paths
-            # that never reached the emitter (no transcript, no new tokens), where
-            # a constructed sink would otherwise hold a connection until the
-            # process exits.
-            try:
-                sink.close()
-            except Exception:
-                pass
+        run(sys.stdin)
     except Exception:
         _note("hook failed; exiting 0 so the session is untouched", exc_info=True)
     return 0

@@ -2,7 +2,7 @@
 
 **Feature Branch**: `TOKWEIR-7-stop-hook-usage-emitter`
 **Created**: 2026-09-08
-**Status**: Draft
+**Status**: Draft — revised during implementation; see *Revision log* at the end.
 **Jira**: TOKWEIR-7 (Story) — "Stop-hook usage emitter (transcript delta → tokenweir)"
 **Input**: The Jira story, read with `mado-jira read TOKWEIR-7` on 2026-09-08 against the
 `default` account (`https://bostoncio-cto.atlassian.net`) and quoted verbatim below rather than
@@ -161,7 +161,8 @@ an empty stdout every time.
 5. **Given** a state directory that cannot be written, **When** the hook runs, **Then** it still
    emits the record and exits `0`.
 6. **Given** a sink whose delivery hangs indefinitely, **When** the hook runs, **Then** it returns
-   within its own time budget rather than waiting for Claude Code's `timeout` to kill it.
+   within the emitter's bounded close rather than waiting on the sink. *(Revised — see the
+   revision log; the original demanded a time budget the hook no longer implements.)*
 
 ---
 
@@ -275,9 +276,23 @@ capability is what is being built; the documentation makes it reachable.
   that baseline.
 - **FR-011**: The hook MUST keep one baseline per transcript path, so two concurrent Claude Code
   sessions do not consume each other's deltas.
-- **FR-012**: The hook MUST advance the persisted baseline **only after** the emitter reports the
-  record **delivered** — not merely accepted — so that a turn refused at the seam, or accepted and
-  then lost against a dead transport, is carried into the next turn rather than dropped.
+- **FR-012**: The hook MUST advance the persisted baseline **only after** the record was actually
+  **stored** — not merely accepted — so that a turn refused at the seam, or accepted and then lost
+  against a dead transport, is carried into the next turn rather than dropped. "Stored" MUST be
+  measured by the **transport's own success counter** (`DirectSink.written`,
+  `AMQPSink.published`), never by `EmitterStats.delivered`: a conforming `Sink` may not raise, so
+  both shipped adapters catch their own transport failure, count a drop and return normally, and
+  the emitter counts them delivered. A sink exposing no such counter falls back to acceptance,
+  which is the strongest signal it offers.
+- **FR-012a**: A transport that was **configured** and could not be constructed MUST NOT count as
+  stored. It degrades to a discarding sink so the hook cannot fail, and a discarding sink accepts
+  everything — so without this the first turns of every session started before its broker was up
+  would be deleted. An **unconfigured** hook is the opposite case and MUST advance: it is
+  discarding by choice, and holding the baseline would make the first turn after a transport is
+  configured report the whole session.
+- **FR-012b**: The sink MUST NOT be constructed when there is nothing to emit. A `Stop` hook fires
+  on every turn and many add no tokens; opening a transport to discover that is a connection per
+  turn, and one that can wedge with nothing at stake.
 - **FR-013**: The hook MUST emit nothing when every token delta is zero.
 - **FR-014**: The hook MUST treat a cumulative total below the stored baseline as a replaced
   transcript: reset the baseline to the current totals and emit nothing.
@@ -289,7 +304,11 @@ capability is what is being built; the documentation makes it reachable.
   being emitted, and each failure MUST be logged. The **cost** is that the turn is re-reported
   until the baseline can be stored: a single failure over-counts one turn, and a persistent one
   re-reports the whole session every turn. That cost MUST be documented accurately wherever it is
-  described — an understated one ("it costs one turn") reads as a bounded loss and is not.
+  described — an understated one ("it costs one turn") reads as a bounded loss and is not, and so
+  does a claim that the re-reports are collapsible duplicates. They are only duplicates while the
+  transcript is **static**; on a live session each re-report ends on a different response, so the
+  ids differ, the counts climb, and nothing marks them as re-reports. The documentation MUST say
+  that, and a test MUST pin it.
 
 **The record**
 
@@ -430,3 +449,25 @@ Recorded because the story did not specify them and a reasonable default was cho
 - **The `Unverified` parity check stands.** ADR-0001 records that subscription-vs-API-key token
   parity is unconfirmed. This story captures what the transcript reports; it does not verify that
   the transcript's numbers match an API-key session's, which the ADR keeps as its own item.
+
+## Revision log
+
+This document was written before the implementation and **edited twice while the branch was open**.
+That is worth stating plainly rather than leaving to `git log`: a criteria document revised by its
+own implementer is not an independent authority over the code, and a reader grading the branch
+should know which clauses were written after the fact and why.
+
+| Round | Clause | Change | Why |
+|---|---|---|---|
+| Fix 1 | FR-012 | "handed to the emitter" → "reported delivered" | The weaker wording let a buffered emitter's *acceptance* count as success, which is the loss the cumulative baseline exists to prevent, one layer down. |
+| Fix 1 | FR-019 | "unique to the turn" → stable, non-colliding, with the reasoning | The original was ambiguous between "identifies the turn" and "distinct per emission", and the two want opposite implementations. |
+| Fix 1 | FR-017 | Added the accuracy obligation | Review 1 found the documented cost understated. |
+| Fix 2 | FR-027 | "MUST bound its own run time" → "MUST NOT implement a competing timer" | Review 2 found the self-imposed budget to be scope the story does not carry; the story assigns the bound to Claude Code's own `timeout`. **This is a reversal, not a clarification.** |
+| Fix 2 | SC-005 | Rewritten around the emitter's close timeout | Followed FR-027. |
+| Fix 2 | FR-005, FR-006, FR-030 | Added the decisions the code had made silently | Selection is on "carries usage" not `type`; duplicate ids resolve take-first; the broker wins over a DSN. |
+| Fix 3 | US2 scenario 6 | Reconciled with FR-027 | Missed in fix 2 — it still demanded the removed budget. |
+| Fix 3 | FR-012, +FR-012a, +FR-012b | Named *how* "stored" is measured; added the degraded-transport and lazy-construction rules | Review 3 found FR-012 unmet by both shipped transports: `EmitterStats.delivered` means "did not raise", and a conforming sink never raises. |
+| Fix 3 | FR-017 | Added the live-session clause | Review 3 found the "collapsible duplicates" remedy does not exist once the transcript grows. |
+
+The story itself (quoted at the top, re-read from Jira each round) is unchanged throughout and is
+the scope ceiling these revisions were measured against.

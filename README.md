@@ -554,8 +554,7 @@ rely on the console script being on `PATH`.
 The hook **always exits 0** and never writes to stdout. That is not politeness, it is
 the contract: ADR-0001 requires non-blocking capture and explicitly forbids `exit 2`
 (Claude Code's *blocking* status), because no failure of a metering adapter is worth
-stopping a session over. `"async": true` is safe to add if your Claude Code supports
-it; the hook does not need it, because it bounds its own runtime.
+stopping a session over. `"async": true` is safe to add if your Claude Code supports it.
 
 ### Where records go
 
@@ -567,6 +566,12 @@ it; the hook does not need it, because it bounds its own runtime.
 
 With **both** set the broker wins. A deployment that configured one has said where records should
 survive an outage, and writing past it to the store would discard that.
+
+A transport that is *configured* but cannot be constructed — a dead broker, a missing driver — does
+not fail the hook; it falls back to discarding, and the turn's tokens are carried into the next one
+rather than counted as metered. That is the difference between a broken transport and no transport:
+an unconfigured hook is discarding by choice and moves on, a broken one is losing records the
+deployment expected to keep and holds them.
 
 Neither driver is imported unless the matching variable is set, so an unconfigured
 hook touches no transport library at all. A sink that cannot be *constructed* — a bad
@@ -622,10 +627,16 @@ Two decisions in that sentence are load-bearing:
 - **De-duplicated on `message.id`.** One API response can appear as several transcript
   lines, each repeating the same `usage` object. Summing lines over-counts a turn, and
   every line is individually well-formed, so nothing about the result looks wrong.
-- **A cumulative baseline, advanced only once the record is *delivered*.** A file
+- **A cumulative baseline, advanced only once the record is actually *stored*.** A file
   cursor advances whether or not the emit succeeded, which silently deletes a turn's
   tokens forever. A cumulative baseline is self-correcting: a turn that could not be
-  delivered is merged into the next one. Late and coarse beats gone.
+  stored is merged into the next one. Late and coarse beats gone.
+
+  "Stored" is measured by the **transport's own counter** (`DirectSink.written`,
+  `AMQPSink.published`), not by the emitter's `delivered`. The difference is not
+  pedantry: a conforming `Sink` may not raise, so both adapters catch their own
+  transport failure, count a drop, and return normally — they look delivered. Reading
+  the emitter's number would have meant a dead broker silently deleting every turn.
 
 Losing the state file **once** over-counts exactly one turn — the session's tokens land
 in one record — and everything after it is correct again. A state directory that is
@@ -633,12 +644,20 @@ in one record — and everything after it is correct again. A state directory th
 metering cache is not a reason to lose a turn), but it re-reports the whole session on
 every turn for as long as the condition lasts.
 
-Those re-reports are exact duplicates and they carry the **same `request_id`**, because
-they describe the same turn. That is deliberate: a fresh id per emission would make them
-look like distinct turns and turn a visible duplicate into invisible inflation. The store
-puts no unique constraint on `request_id` precisely because it is an append-only log that
-expects at-least-once delivery, so a report can collapse them. Each failure is logged as
-well — the condition is made visible rather than harmless.
+**Those re-reports are not collapsible, and it is worth being blunt about that.** On a
+static transcript they are identical records sharing a `request_id`. On a *live* session —
+the case that actually happens — each re-report covers a longer span and ends on a
+different response, so the ids differ and the counts climb: three turns of 100 tokens
+report 100, 300 and 600. Nothing marks them as re-reports, and no choice of identifier
+would.
+
+So a persistently unwritable state directory is real, silent inflation. Each failure is
+logged, and that is the whole of the mitigation — the alternative is losing the turn, which
+is worse. It is a broken deployment and needs fixing, not tolerating.
+
+(The stable `request_id` still earns its keep for the case it *does* cover: an
+at-least-once transport redelivering one record. The store puts no unique constraint on the
+column for exactly that reason, so a report can collapse those.)
 
 The same "duplicates beat losses" rule decides one other case. The baseline advances only if
 the record is delivered within the emitter's close timeout (3 seconds by default). A sink still

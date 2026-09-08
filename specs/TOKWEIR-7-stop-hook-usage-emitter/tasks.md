@@ -62,6 +62,13 @@ so the entry point has nothing left to invent.
       regression.
 - [x] **T010** Wire emission through `BufferedEmitter` + `emit_usage` with a bounded
       `close_timeout` (FR-028, FR-029). No bare sink call anywhere in the module.
+- [x] **T010a** *(added at review 3)* Decide "stored" from the transport's own counter
+      (`DirectSink.written` / `AMQPSink.published`), not `EmitterStats.delivered`, which means
+      only "did not raise" and is therefore true of every conforming sink that dropped the
+      record (FR-012).
+- [x] **T010b** *(added at review 3)* Mark a configured-but-unconstructable transport degraded
+      so it never counts as stored, and build the sink lazily so a turn with nothing to emit
+      opens no connection (FR-012a, FR-012b).
 - [x] **T011 [P]** `tests/test_claude_code_hook.py`: a `write_transcript` helper and a recording
       sink; the three-message turn summing to `350/75/5/140` (SC-001).
 - [x] **T012 [P]** Test: a second invocation after appending emits only the new messages' tokens,
