@@ -253,9 +253,11 @@ capability is what is being built; the documentation makes it reachable.
 - **FR-005**: The hook MUST sum `message.usage.input_tokens`, `.output_tokens`,
   `.cache_creation_input_tokens` and `.cache_read_input_tokens` across the transcript's entries.
   The test applied is **"does this entry carry a usage object"**, not "is this entry typed
-  `assistant`" — the two select the same lines in practice (in a real 472-line transcript, every
-  one of the 148 usage-bearing entries was an assistant entry), and the former is the property that
-  actually matters and the one least likely to be invalidated by a transcript-format change.
+  `assistant`" — the former is the property that actually matters and the one least likely to be
+  invalidated by a transcript-format change. Two independent reviews checked the two against a live
+  Claude Code transcript in this pod and found them to select the same lines; that transcript is
+  session data and is **not** checked in, so no test in this repo exercises real transcript output
+  (see the verification gap noted in the revision log).
 - **FR-006**: The hook MUST count each distinct API response exactly once, keyed on `message.id`,
   even when the transcript holds several entries carrying that id. Where two entries share an id,
   the **first** is counted and the rest skipped: the case this exists for is one response repeated
@@ -278,12 +280,18 @@ capability is what is being built; the documentation makes it reachable.
   sessions do not consume each other's deltas.
 - **FR-012**: The hook MUST advance the persisted baseline **only after** the record was actually
   **stored** — not merely accepted — so that a turn refused at the seam, or accepted and then lost
-  against a dead transport, is carried into the next turn rather than dropped. "Stored" MUST be
-  measured by the **transport's own success counter** (`DirectSink.written`,
-  `AMQPSink.published`), never by `EmitterStats.delivered`: a conforming `Sink` may not raise, so
-  both shipped adapters catch their own transport failure, count a drop and return normally, and
-  the emitter counts them delivered. A sink exposing no such counter falls back to acceptance,
-  which is the strongest signal it offers.
+  against a dead transport, is carried into the next turn rather than dropped. The test MUST be
+  **acceptance plus the absence of a reported drop** — `EmitterStats.delivered` together with the
+  transport's own `dropped` counter — and MUST NOT be a success counter. `EmitterStats.delivered`
+  alone is insufficient (a conforming `Sink` may not raise, so both shipped adapters catch their
+  own transport failure, count a drop and return normally). A success counter is unsound in both
+  directions: `AMQPSink.published` counts frames handed to a socket over a transport with no
+  publisher confirms, and any conforming sink that keeps no such counter would look permanently
+  failed. A sink exposing no `dropped` counter MUST NOT be consulted, and its acceptance stands.
+
+  **The limit of the claim MUST be documented**: a live broker with a missing exchange accepts the
+  frame and reports no drop, so those tokens are lost and nothing in the hook can see it. The
+  requirement is "the transport did not report losing it", not "a store holds it".
 - **FR-012a**: A transport that was **configured** and could not be constructed MUST NOT count as
   stored. It degrades to a discarding sink so the hook cannot fail, and a discarding sink accepts
   everything — so without this the first turns of every session started before its broker was up
@@ -442,10 +450,11 @@ Recorded because the story did not specify them and a reasonable default was cho
   advances only if the emitter reports the record delivered within `close_timeout`. A sink that is
   still publishing when that expires, and then *succeeds*, gets the record while the baseline stays
   put — so the next turn re-reports it. The window is the close timeout (3 seconds by default) and
-  it is narrow, but it is not zero. Erring the other way — assuming success on a timeout — would
-  turn the same window into a silent **loss**, and this design's whole premise is that a duplicate
-  is recoverable where a loss is not: duplicates share a `request_id` (FR-019) and a report can
-  collapse them, while a turn that vanished leaves nothing behind to notice.
+  it is narrow, but it is not zero. That re-report is **not** a collapsible duplicate: it covers a
+  longer span and ends on a different response, so it carries a different `request_id` and a larger
+  count, and the store holds both. Erring the other way — assuming success on a timeout — would
+  turn the same window into a silent **loss**, which is worse: an overstatement can be checked
+  against the transcript that produced it, and a turn that vanished leaves nothing to check.
 - **The `Unverified` parity check stands.** ADR-0001 records that subscription-vs-API-key token
   parity is unconfirmed. This story captures what the transcript reports; it does not verify that
   the transcript's numbers match an API-key session's, which the ADR keeps as its own item.
@@ -468,6 +477,24 @@ should know which clauses were written after the fact and why.
 | Fix 3 | US2 scenario 6 | Reconciled with FR-027 | Missed in fix 2 — it still demanded the removed budget. |
 | Fix 3 | FR-012, +FR-012a, +FR-012b | Named *how* "stored" is measured; added the degraded-transport and lazy-construction rules | Review 3 found FR-012 unmet by both shipped transports: `EmitterStats.delivered` means "did not raise", and a conforming sink never raises. |
 | Fix 3 | FR-017 | Added the live-session clause | Review 3 found the "collapsible duplicates" remedy does not exist once the transcript grows. |
+| Fix 4 | FR-012 | Success counter → **acceptance plus no reported drop**, with the limit of the claim made a requirement | Review 4 showed the success counter unsound both ways: `AMQPSink.published` counts socket frames (no publisher confirms — `amqp.py` documents this), and a conforming sink keeping no such counter would look permanently failed. |
+| Fix 4 | Assumptions (close-timeout window) | Struck the "duplicates share an id" defence | Review 4 found the same live-session error review 3 had corrected elsewhere, left standing here. |
 
 The story itself (quoted at the top, re-read from Jira each round) is unchanged throughout and is
 the scope ceiling these revisions were measured against.
+
+### A verification gap, stated rather than closed
+
+The story's first acceptance clause — *"a Max-authenticated Claude Code turn produces exactly one
+usage record with correct token deltas"* — is exercised in this repo only against **synthetic**
+transcripts built by the test helper, which encodes the same format assumption the parser makes. A
+review running in this pod did drive the hook against a live Claude Code transcript and reported
+one correct record, and reported that de-duplication was doing real work there (50 of 82
+usage-bearing ids appeared on more than one line; summing lines would have over-counted by 80%) —
+but that transcript is a developer's own session data and is not checked in, so nothing in CI
+proves it.
+
+The check that would close this is one redacted real transcript committed as a fixture with an
+expected-total assertion. It is deliberately not done here: redacting session content reliably is
+its own piece of work, and doing it carelessly is how a test fixture ends up carrying somebody's
+conversation into a public repository. **Treat AC 1 as verified in a pod and unverified in CI.**

@@ -632,11 +632,22 @@ Two decisions in that sentence are load-bearing:
   tokens forever. A cumulative baseline is self-correcting: a turn that could not be
   stored is merged into the next one. Late and coarse beats gone.
 
-  "Stored" is measured by the **transport's own counter** (`DirectSink.written`,
-  `AMQPSink.published`), not by the emitter's `delivered`. The difference is not
-  pedantry: a conforming `Sink` may not raise, so both adapters catch their own
-  transport failure, count a drop, and return normally — they look delivered. Reading
-  the emitter's number would have meant a dead broker silently deleting every turn.
+  The test applied is **"was it accepted, and did the transport not report losing
+  it?"** — the emitter's acceptance plus the adapter's own `dropped` counter. The
+  emitter's number alone is not enough: a conforming `Sink` may not raise, so both
+  adapters catch their own transport failure, count a drop, and return normally, and
+  reading `delivered` would have meant a dead broker silently deleting every turn.
+
+  It asks about **drops rather than successes**, and that is deliberate. A counted
+  drop is a fact the adapter is certain of. A success counter is not:
+  `AMQPSink.published` counts frames handed to a socket, and this adapter does not
+  enable publisher confirms — so **a live broker with a missing exchange or a wrong
+  routing key accepts the frame, reports no drop, and the tokens are lost.** Nothing
+  inside the hook can see that. If you need that case covered, the answer is
+  publisher confirms in the adapter, not a guess here.
+
+  Asking about drops also means a sink that keeps no such counter is simply believed
+  rather than assumed to have failed for ever.
 
 Losing the state file **once** over-counts exactly one turn — the session's tokens land
 in one record — and everything after it is correct again. A state directory that is
@@ -659,11 +670,14 @@ is worse. It is a broken deployment and needs fixing, not tolerating.
 at-least-once transport redelivering one record. The store puts no unique constraint on the
 column for exactly that reason, so a report can collapse those.)
 
-The same "duplicates beat losses" rule decides one other case. The baseline advances only if
-the record is delivered within the emitter's close timeout (3 seconds by default). A sink still
-publishing when that expires, which then succeeds, gets the record while the baseline stays put,
-so the next turn re-reports it. That window is narrow but real, and erring the other way would
-convert it into a silent loss instead.
+One other case falls the same way. The baseline advances only if the record survives the
+emitter's close timeout (3 seconds by default); a sink still publishing when that expires, which
+then succeeds, gets the record while the baseline stays put, so the next turn re-reports it. That
+re-report is **not** a collapsible duplicate either — it covers a longer span, ends on a different
+response, and carries a different id — so the store holds both and their sum overstates the
+session. The window is narrow, and the run still errs this way on purpose: assuming success on a
+timeout turns it into a silent loss, and an overstatement can at least be checked against the
+transcript it came from.
 
 A transcript that *regresses* below its baseline is taken as a replaced file: the baseline
 is re-anchored and nothing is emitted for that transition.

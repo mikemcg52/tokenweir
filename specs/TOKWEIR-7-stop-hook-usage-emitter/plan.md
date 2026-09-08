@@ -21,8 +21,8 @@ never had to answer before:
    remembered baseline.
 2. **Whose turn was it?** — attribution read from the orchestrator's environment, never from the
    model.
-3. **How do we guarantee we cannot hurt the session?** — exit 0 on every path, a self-imposed time
-   budget, a bounded flush, and nothing on stdout.
+3. **How do we guarantee we cannot hurt the session?** — exit 0 on every path, a bounded flush,
+   nothing on stdout, and the host's own hook `timeout` for the rest.
 
 ## Technical Context
 
@@ -202,9 +202,14 @@ store, `AMQPSink` on a failed publish. Both increment `delivered`, both stored n
 advanced on that number deletes the turn, permanently and silently, in exactly the outage the
 carry-forward design exists for.
 
-So the run asks the **transport's own success counter** — `DirectSink.written`,
-`AMQPSink.published` — sampled either side of the emit. A sink offering neither falls back to
-acceptance, which is the strongest signal it makes available and the honest answer for `NullSink`.
+So the run combines acceptance with the transport's own **drop** counter, sampled either side of
+the emit — a negative signal, chosen after review 4 showed the success-counter version unsound in
+both directions. `AMQPSink.published` counts frames handed to a socket over a transport with no
+publisher confirms (`amqp.py` documents that a publish to a missing exchange returns normally), so
+it over-claims; and any conforming sink keeping a `written` it does not increment per record would
+look permanently failed, so it under-claims. "Did you lose it?" is answerable; "did you store it?"
+is not, from inside this process. The residual — a live broker with a missing exchange — is stated
+in the README rather than papered over.
 
 Two consequences follow, and both are requirements now (FR-012a, FR-012b):
 

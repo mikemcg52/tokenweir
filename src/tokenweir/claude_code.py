@@ -795,33 +795,42 @@ class SinkChoice:
     degraded: bool = False
 
 
-def _stored_count(sink: Any) -> Optional[int]:
-    """How many records this sink says it has actually stored, if it says.
+def _dropped_count(sink: Any) -> Optional[int]:
+    """How many records this sink says it has **lost**, if it says.
 
-    This exists because :attr:`~tokenweir.emitter.EmitterStats.delivered` cannot
-    answer the question. It counts records the sink took **without raising** — and
-    a conforming ``Sink`` may not raise, by contract, so every adapter in this
-    library catches its own transport failure and counts a drop:
-    :class:`~tokenweir.sink.DirectSink` on an unreachable store,
-    :class:`~tokenweir.amqp.AMQPSink` on a failed publish. Both return normally,
-    both increment ``delivered``, and neither stored anything. Reading that as
-    success is exactly the acceptance-as-delivery the design rejects, one layer
-    further down than the layer where it was rejected.
+    A negative signal, and the direction is the whole design. The obvious version
+    of this function asks a success counter — ``DirectSink.written``,
+    ``AMQPSink.published`` — and it is wrong in both directions:
 
-    So ask the transport instead. Both shipped adapters keep a success counter —
-    ``DirectSink.written``, ``AMQPSink.published`` — incremented only on the path
-    where the record really went somewhere.
+    - It over-claims. ``AMQPSink.published`` counts frames handed to the socket,
+      not records a broker stored. This adapter does not enable publisher confirms,
+      and ``amqp.py`` says so in its own words: *"a publish to a nonexistent
+      exchange returns normally, and the broker's ``channel.close`` arrives a round
+      trip later"*. A live connection to a missing exchange increments
+      ``published`` and stores nothing.
+    - It under-claims, which is worse. Any sink exposing an integer named
+      ``written`` that it does not increment per record — a perfectly conforming
+      third-party sink — would look permanently undelivered, so the baseline would
+      never advance and every turn would re-report the whole session.
+
+    Asking what was **dropped** has neither failure. A counted drop is a fact the
+    adapter is certain of: :class:`~tokenweir.sink.DirectSink` counts one when the
+    store raised, :class:`~tokenweir.amqp.AMQPSink` when the publish failed or the
+    channel was not live. It is never a guess. And a sink that offers no drop
+    counter simply is not consulted, rather than being assumed to have failed.
+
+    What this deliberately does **not** promise: that a record not counted as
+    dropped reached a store. Nothing inside this process can know that over a
+    transport without confirms. The claim is narrower and true — *the transport did
+    not tell us it lost this record* — and the residual is written down in the
+    README rather than dressed up.
 
     Returns:
-        The counter, or ``None`` for a sink that offers neither. ``None`` is not a
-        failure: it is the honest answer for ``NullSink`` and for a caller's own
-        sink, and the caller falls back to acceptance, which is the strongest
-        signal such a sink makes available.
+        The counter, or ``None`` for a sink that offers none.
     """
-    for name in ("written", "published"):
-        value = getattr(sink, name, None)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
+    value = getattr(sink, "dropped", None)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
     return None
 
 
@@ -910,26 +919,36 @@ def run(
     request path cannot — it closes the emitter, which flushes within the bounded
     timeout, and then asks what happened.
 
-    **Who it asks is the whole of the correctness here.**
-    :attr:`~tokenweir.emitter.EmitterStats.delivered` is *not* the right question,
-    and asking it was a real defect: it counts records the sink took without
-    raising, and a conforming ``Sink`` may not raise, so
+    **What it asks, and what that can honestly mean.**
+    :attr:`~tokenweir.emitter.EmitterStats.delivered` alone is not enough, and
+    trusting it was a real defect: it counts records the sink took without raising,
+    and a conforming ``Sink`` may not raise — so
     :class:`~tokenweir.sink.DirectSink` over a dead store and
     :class:`~tokenweir.amqp.AMQPSink` against a dead broker both catch their own
-    failure, count a drop, and return normally. Both would have looked delivered.
-    The turn's tokens would have been dropped by the sink and dropped again by the
-    advancing baseline — a silent, permanent loss with both shipped transports.
+    failure, count a drop, and return normally. Both looked delivered. The tokens
+    would have been dropped by the sink and dropped again by the advancing
+    baseline: a silent, permanent loss with both shipped transports.
 
-    So it asks the **transport's own success counter** (:func:`_stored_count`),
-    which increments only where a record really went somewhere. A sink offering no
-    such counter falls back to acceptance, which is the strongest signal it makes
-    available; that is the honest answer for :class:`NullSink` and for a caller's
-    own sink, and it is why an unconfigured hook still advances — it is discarding
-    by choice, not by failure. A *configured* transport that could not be built at
-    all never counts as stored (see :class:`SinkChoice`).
+    So the emitter's acceptance is combined with the transport's own **drop**
+    counter (:func:`_dropped_count`) — a negative signal, deliberately. A counted
+    drop is a fact the adapter is certain of; a success counter is not, because
+    ``AMQPSink.published`` counts frames handed to a socket over a transport with
+    no publisher confirms. Asking "did you lose it?" is answerable. Asking "did you
+    store it?" is not, from inside this process.
 
-    A broker that is down therefore carries the turn's tokens forward until it
-    comes back, rather than losing them.
+    The claim is therefore narrower than "stored", and stating it exactly is the
+    point: **the record was accepted and the transport did not report losing it.**
+    A broker that is down, or a store that raised, carries the turn's tokens
+    forward until it recovers. A broker that is *up* but misconfigured — a missing
+    exchange — accepts the frame, reports no drop, and the tokens are lost; nothing
+    in this process can see that without publisher confirms, and the README says so
+    rather than implying otherwise.
+
+    A sink offering no drop counter is not consulted at all, which is what stops a
+    conforming third-party sink from being assumed to have failed for ever. A
+    *configured* transport that could not be built never counts (see
+    :class:`SinkChoice`); an unconfigured hook does, because it is discarding by
+    choice rather than by failure.
 
     That flush is bounded, not unbounded, so this stays inside the hook's own
     budget (FR-027, FR-028) — the wait is the same one ``close`` already promises.
@@ -938,10 +957,17 @@ def run(
     publishing when ``close_timeout`` expires, which then *succeeds*, has the
     record while the baseline stays put — so the next turn re-reports it. The
     window is ``close_timeout`` (3 seconds by default) and it is narrow, but it is
-    not zero. The run errs this way deliberately: assuming success on a timeout
-    would turn the same window into a silent **loss**, and a duplicate is
-    recoverable where a loss is not — duplicates share a ``request_id`` and a
-    report can collapse them, while a turn that vanished leaves nothing to notice.
+    not zero.
+
+    And the re-report is **not** a collapsible duplicate, for the same reason the
+    unwritable-baseline case is not: the next turn covers a longer span and ends on
+    a different response, so it carries a different ``request_id`` and a larger
+    count. The store ends up holding both, and their sum overstates the session.
+
+    The run still errs this way deliberately, because the alternative is worse:
+    assuming success on a timeout turns the same window into a silent **loss**, and
+    an overstatement is at least visible against the transcript it came from, while
+    a turn that vanished leaves nothing behind to check against.
 
     Emission goes through the buffered client and the guarded seam rather than a
     bare ``sink.emit`` (FR-029). Both guarantees already exist in the library; the
@@ -997,7 +1023,7 @@ def run(
     # found rather than shipped.
     choice = (sink_factory or select_sink)()
     sink = choice.sink
-    before = _stored_count(sink)
+    dropped_before = _dropped_count(sink)
 
     emitter = BufferedEmitter(sink, close_timeout=close_timeout)
     try:
@@ -1008,25 +1034,30 @@ def run(
         # raised still leaves no worker thread behind.
         emitter.close()
 
-    after = _stored_count(sink)
-    if before is not None and after is not None:
-        stored = after - before >= 1
-    else:
-        # No counter to ask. Acceptance is the strongest signal this sink offers.
-        stored = emitter.stats().delivered >= 1
+    # Accepted at the seam, and the transport did not report losing it.
+    kept = record is not None and emitter.stats().delivered >= 1
+
+    dropped_after = _dropped_count(sink)
+    if dropped_before is not None and dropped_after is not None:
+        if dropped_after > dropped_before:
+            # The adapter is certain it lost this record: the store raised, or the
+            # publish failed. This is the case `EmitterStats.delivered` cannot see,
+            # because a conforming sink may not raise and so returns normally after
+            # counting its own drop.
+            kept = False
 
     if choice.degraded:
-        # A transport was configured and could not be built. The record went into
-        # a stand-in that keeps nothing, so whatever the counters say, nothing was
-        # metered.
-        stored = False
+        # A transport was configured and could not be built. The record went into a
+        # stand-in that keeps nothing and counts nothing, so no counter would say
+        # so; the flag is the only thing that knows.
+        kept = False
 
-    if record is None or not stored:
-        # Refused at the seam (a malformed record, a sink that raised), or taken
-        # and not stored (a dead broker, an unreachable store, a transport that
-        # could not be constructed). Either way the baseline stays where it is, so
-        # these tokens are reported next turn instead of vanishing.
-        _note("record was not stored; its tokens carry into the next turn")
+    if not kept:
+        # Refused at the seam (a malformed record, a sink that raised), reported
+        # lost by the transport, or handed to a stand-in for a transport that could
+        # not be constructed. The baseline stays where it is, so these tokens are
+        # reported next turn instead of vanishing.
+        _note("record was not kept; its tokens carry into the next turn")
         return None
 
     write_baseline(state_path, scan.totals, transcript=hook_input.transcript_path)

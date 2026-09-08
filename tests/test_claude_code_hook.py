@@ -664,10 +664,9 @@ def test_counts_carry_forward_when_a_conforming_sink_drops_without_raising(
     """
 
     class ConformingDropSink:
-        """Never raises, never stores, and counts what it stored — like the real ones."""
+        """Never raises, never stores, and counts its own losses — like the real ones."""
 
         def __init__(self):
-            self.written = 0
             self.dropped = 0
 
         def emit(self, record):
@@ -733,6 +732,41 @@ def test_counts_advance_the_baseline_when_a_conforming_sink_really_stores(
 
     assert [r.input_tokens for r in store.records] == [100]
     assert [r.input_tokens for r in second.records] == [20]
+
+
+def test_counts_advance_for_a_conforming_sink_that_reports_no_drops(transcript):
+    """The failure the *success*-counter version of this check had, pinned.
+
+    A probe that asked "did your `written` counter go up?" would condemn any
+    conforming sink that keeps no such counter, or keeps one it does not increment
+    per record: the baseline would never advance and every turn would re-report the
+    whole session. Asking about drops instead means a sink that reports none is
+    simply believed."""
+
+    class QuietStore:
+        """Stores everything, keeps a `written` counter it never moves."""
+
+        def __init__(self):
+            self.records = []
+            self.written = 0  # deliberately never incremented
+            self.dropped = 0
+
+        def emit(self, record):
+            self.records.append(record)
+
+        def close(self):
+            pass
+
+    store = QuietStore()
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    assert run(hook_stdin(transcript), into(store)) is not None
+
+    transcript.append(transcript_entry(message_id="msg_b", usage=usage(20, 2)))
+    run(hook_stdin(transcript), into(store))
+
+    assert [counts_of(r) for r in store.records] == [(100, 10, 0, 0), (20, 2, 0, 0)], (
+        "a sink that reported no drops must not be treated as having failed"
+    )
 
 
 def test_counts_carry_forward_when_a_configured_transport_cannot_be_built(
@@ -994,13 +1028,18 @@ def test_never_disturbs_the_session_and_writes_the_baseline_atomically(
         replacements.append((Path(src), Path(dst)))
         return real_replace(src, dst, *args, **kwargs)
 
+    # `tokenweir.claude_code.os` *is* the global `os` module, so patching through
+    # it patches `os.replace` process-wide for the duration. Asserting membership
+    # rather than a count keeps this honest if anything else in the process renames
+    # a file while the patch is up.
     monkeypatch.setattr("tokenweir.claude_code.os.replace", spy)
 
     assert write_baseline(state, TokenTotals(1, 2, 3, 4), transcript=transcript)
 
     assert read_baseline(state) == TokenTotals(1, 2, 3, 4)
-    assert len(replacements) == 1, "the target was not reached by an atomic replace"
-    source, destination = replacements[0]
+    ours = [pair for pair in replacements if pair[1] == state]
+    assert len(ours) == 1, "the target was not reached by an atomic replace"
+    source, destination = ours[0]
     assert destination == state
     assert source.parent == state.parent, (
         "os.replace is atomic only within a filesystem, so the temporary file "
@@ -1210,12 +1249,19 @@ def test_packaging_runs_as_a_module_and_exits_zero(transcript):
 
 
 def test_packaging_documents_a_non_blocking_settings_fragment():
-    """FR-033. ADR-0001 forbids `exit 2` and asks for a short timeout; the
-    documented fragment is what a reader will actually paste."""
+    """FR-033 and US4 AC1. ADR-0001 forbids `exit 2` and asks for a short timeout,
+    and the documented fragment is what a reader will actually paste — so the
+    number in it is checked, not merely its presence. A fragment saying
+    `"timeout": 300` would satisfy a grep and none of the requirement."""
+    import re
+
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "tokenweir-claude-code-hook" in readme
     assert '"Stop"' in readme
-    assert '"timeout"' in readme
+
+    timeouts = [int(value) for value in re.findall(r'"timeout":\s*(\d+)', readme)]
+    assert timeouts, "the settings fragment does not set a timeout"
+    assert max(timeouts) <= 30, f"documented timeout exceeds the ~30s guidance: {timeouts}"
 
 
 def test_packaging_reads_the_transcript_incrementally(transcript, monkeypatch):
