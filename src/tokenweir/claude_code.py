@@ -62,8 +62,8 @@ That set is per-scan and never persisted — the cumulative baseline is what cro
 invocations, so the state file stays four integers rather than growing with the
 session.
 
-Three separate guarantees that the session is never disturbed
--------------------------------------------------------------
+Two guarantees that the session is never disturbed, and one that is not ours
+----------------------------------------------------------------------------
 
 They are separate because they fail separately:
 
@@ -71,14 +71,24 @@ They are separate because they fail separately:
   in this module. It deliberately does **not** catch ``BaseException``: a
   ``KeyboardInterrupt`` means the process is being torn down, and swallowing that
   would be worse than the failure.
-- A **self-imposed time budget** (``SIGALRM``). Covers the case where nothing
-  raises and nothing returns — a DNS lookup into a black hole, a connect to a dead
-  broker. Claude Code's own ``timeout`` would eventually kill the process, but
-  being killed is the worse outcome: it is louder in the session and it skips the
-  state write.
 - A **bounded emitter close**. Covers a sink that accepted the record and cannot
   deliver it. :meth:`~tokenweir.emitter.BufferedEmitter.close` already implements
   the bound; this module only has to choose a small number.
+
+The third case — nothing raises and nothing returns, a connect into a black hole —
+is bounded by **Claude Code's own hook ``timeout``**, which the documented
+``settings.json`` fragment sets to 30 seconds. That is deliberately not
+re-implemented here. ADR-0001 and the story both name the host's timeout as the
+mechanism, and a second timer inside the hook would be a competing bound with its
+own failure modes: an alarm is one-shot, every guard in this module catches
+``Exception``, and the obvious implementation is therefore absorbed by its own
+error handling and silently spent.
+
+There is a real argument on the other side — a synchronous ``Stop`` hook that
+wedges delays the next turn by the whole of the host's timeout, and giving up at
+ten seconds would cost the developer twenty fewer — but it is a separate question
+from capturing usage, and it belongs to whoever takes it up deliberately rather
+than to this story.
 
 **Nothing is ever written to stdout.** Claude Code parses a hook's stdout, so a
 stray ``print`` is a way for a metering adapter to change the session's behaviour.
@@ -99,10 +109,8 @@ import hashlib
 import json
 import logging
 import os
-import signal
 import sys
 import tempfile
-import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -151,11 +159,6 @@ DEFAULT_ENDPOINT = "claude-code/stop-hook"
 #: by contract, and a record whose model is unknown is worth more than no record.
 DEFAULT_MODEL = "unknown"
 
-#: Seconds the whole hook is allowed to take before it gives up and exits 0.
-#: Well inside the ~30s hook timeout ADR-0001 recommends, because being killed by
-#: Claude Code is a worse outcome than returning early.
-DEFAULT_HOOK_TIMEOUT = 10.0
-
 #: Seconds :meth:`BufferedEmitter.close` may spend flushing. Smaller than the
 #: client's own 5s default: this process exists for one record and must not sit
 #: on a dead broker.
@@ -172,8 +175,6 @@ ENVIRONMENT_VARIABLES: dict[str, str] = {
     "TOKENWEIR_ENDPOINT": f"Overrides endpoint (default {DEFAULT_ENDPOINT!r}).",
     "TOKENWEIR_HOOK_STATE_DIR": "Where the per-transcript baseline is kept.",
     "XDG_STATE_HOME": "Base for the default state directory when the above is unset.",
-    "TOKENWEIR_HOOK_TIMEOUT": f"Total time budget in seconds (default {DEFAULT_HOOK_TIMEOUT}).",
-    "TOKENWEIR_HOOK_DEBUG": "When set, also write diagnostics to stderr.",
     "MADO_ISSUE_KEY": "Issue being worked; recorded as workload.",
     "MADO_PHASE": "Phase of the run; recorded as queue.",
     "MADO_STREAM_ID": "Stream; recorded as parent_request_id.",
@@ -195,24 +196,20 @@ _COUNT_FIELDS: Tuple[str, ...] = (
 def _note(message: str, *, exc_info: bool = False) -> None:
     """Record a diagnostic. Never raises, never touches stdout.
 
-    The logger is the primary channel and the package attaches a ``NullHandler``
-    to it, so an application that configured no logging is not written to — the
-    same decision ``tokenweir/__init__.py`` documents. ``TOKENWEIR_HOOK_DEBUG``
-    adds stderr, which is where a hook's diagnostics are visible in Claude Code's
-    debug output.
+    The logger is the only channel, and that is a decision rather than an
+    omission. The package attaches a ``NullHandler`` to the ``tokenweir`` logger
+    so that an application which configured no logging is not written to — where
+    output goes is the embedding application's call, not the library's, and
+    ``tokenweir/__init__.py`` sets out the reasoning. A hook is embedded in Claude
+    Code, so a private stderr knob here would be this module overriding that
+    decision on the package's behalf.
 
-    Both writes are guarded: a hostile logging configuration, or a closed stderr,
-    must not become the thing that breaks a hook whose entire purpose is to be
-    unable to break anything.
+    Guarded, because a hostile logging configuration must not become the thing
+    that breaks a hook whose entire purpose is to be unable to break anything.
     """
     try:
         _logger.warning(message, exc_info=exc_info)
     except Exception:  # pragma: no cover - a hostile logging configuration
-        pass
-    try:
-        if os.environ.get("TOKENWEIR_HOOK_DEBUG"):
-            print(f"tokenweir-claude-code-hook: {message}", file=sys.stderr)
-    except Exception:  # pragma: no cover - a closed stderr
         pass
 
 
@@ -371,7 +368,20 @@ def scan_transcript(path: Any) -> ScanResult:
     De-duplication is on ``message.id`` (FR-006), falling back to the entry's own
     ``uuid``. An entry with neither is counted on its own: it cannot be shown to be
     a duplicate of anything, and under-counting a turn is the worse error of the
-    two available.
+    two available. Where two entries *do* share an id, the **first** is counted and
+    the rest are skipped — the case this exists for is one response repeated
+    verbatim, so first and last are the same value; a genuine disagreement between
+    two entries claiming one response id would be a transcript-format change, and
+    picking a winner is not something to guess at silently.
+
+    Note the asymmetry in what carries forward across entries, which is deliberate.
+    ``last_model`` and ``last_timestamp`` keep the last *known* value, because a
+    later entry that names no model has not stopped the turn from running on one.
+    ``last_message_id`` does **not**: it becomes the record's ``request_id``, which
+    must identify *this* turn, and inheriting the previous turn's id would hand two
+    distinct turns the same identity — the precise thing FR-019 forbids, and worse
+    than the uuid4 fallback because a consumer collapsing duplicates would delete a
+    real turn.
 
     Entries are not filtered by ``type``. The question this asks is "does this
     entry carry usage", which is the property that matters and the one least likely
@@ -425,7 +435,7 @@ def scan_transcript(path: Any) -> ScanResult:
                 totals = totals + TokenTotals.from_mapping(usage)
                 counted += 1
                 last_model = _text(message.get("model")) or last_model
-                last_message_id = identity or last_message_id
+                last_message_id = identity
                 last_timestamp = _text(entry.get("timestamp")) or last_timestamp
     except Exception:
         # A read error part-way through. What was counted before it is still
@@ -761,7 +771,11 @@ def select_sink() -> Sink:
     """Choose a sink from the environment (FR-030, FR-031).
 
     ``TOKENWEIR_AMQP_URL`` selects the homelab's broker path; ``TOKENWEIR_DSN``
-    selects the broker-less direct path; neither selects :class:`NullSink`.
+    selects the broker-less direct path; neither selects :class:`NullSink`. With
+    **both** set the broker wins, deliberately and not by accident of ordering: the
+    broker is the durable path, so a deployment that has configured one has said
+    where records should survive an outage, and quietly writing past it to the
+    store would discard that.
 
     Both transport imports are **inside** the branch that selects them, so
     importing this module — or running an unconfigured hook — never touches
@@ -846,9 +860,16 @@ def run(
     bare ``sink.emit`` (FR-029). Both guarantees already exist in the library; the
     fourth reimplementation of a guarantee is where it stops being one.
 
+    **This closes the sink it is given**, as a consequence of closing the emitter
+    wrapped around it (:meth:`BufferedEmitter.close` closes its sink, from the
+    worker thread, which is what keeps sink access single-threaded). That is the
+    right lifecycle for a hook — one record, then exit — but it is a side effect on
+    a caller's object, so it is stated rather than left to be discovered.
+
     Returns:
         The emitted record, or ``None`` when there was nothing to emit (no
-        transcript, no new tokens, a replaced transcript) or the emit was refused.
+        transcript, no new tokens, a replaced transcript) or the record was not
+        delivered.
     """
     hook_input = read_hook_input(stream)
     if hook_input.transcript_path is None:
@@ -895,82 +916,6 @@ def run(
     return record
 
 
-# --- the time budget -------------------------------------------------------
-
-
-class _BudgetExpiredError(BaseException):
-    """Raised on the main thread when the hook's own time budget runs out.
-
-    **A ``BaseException``, deliberately, and this is load-bearing.** Every
-    blocking operation in this module sits inside a broad ``except Exception``
-    — :func:`select_sink`, :func:`scan_transcript`, :func:`read_baseline`,
-    :func:`write_baseline` — because each of them must degrade to "no metering
-    for this turn" rather than propagate. An ordinary ``Exception`` raised by
-    the alarm is absorbed by whichever of those guards it lands in, and since
-    the alarm is one-shot and nothing re-arms it, the budget is then *spent*:
-    the next blocking call runs unbounded, and the process waits to be killed by
-    Claude Code's own timeout. That is the exact outcome the budget exists to
-    prevent — being killed skips the state write and is louder in the session.
-
-    Inheriting from ``BaseException`` puts it in the same category as
-    ``KeyboardInterrupt``, which is the honest classification: like an interrupt,
-    it is a decision to stop that no local ``try`` may overrule. :func:`main`
-    catches it by name, ahead of its own ``except Exception``, and turns it into
-    the ordinary exit 0.
-    """
-
-
-def _budget_seconds() -> float:
-    """The configured budget, falling back to the default for anything unusable."""
-    raw = _env("TOKENWEIR_HOOK_TIMEOUT")
-    if raw is None:
-        return DEFAULT_HOOK_TIMEOUT
-    try:
-        value = float(raw)
-    except ValueError:
-        _note(f"TOKENWEIR_HOOK_TIMEOUT={raw!r} is not a number; using the default")
-        return DEFAULT_HOOK_TIMEOUT
-    if value != value or value <= 0 or value == float("inf"):
-        _note(f"TOKENWEIR_HOOK_TIMEOUT={raw!r} is not a usable budget; using the default")
-        return DEFAULT_HOOK_TIMEOUT
-    return value
-
-
-def _arm_budget(seconds: float) -> Optional[Any]:
-    """Arm the alarm, or return ``None`` where it cannot be armed (FR-027).
-
-    ``SIGALRM`` exists on POSIX and only on the main thread. Where either is
-    untrue the budget is simply not armed — degrading to no budget is correct,
-    since the alternative (refusing to run) would trade a bounded risk for a
-    certain failure. Everything else in :func:`main` still holds.
-    """
-    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
-        return None
-    if threading.current_thread() is not threading.main_thread():
-        return None
-
-    def _fire(signum: int, frame: Any) -> None:
-        raise _BudgetExpiredError(f"hook exceeded its {seconds}s budget")
-
-    try:
-        previous = signal.signal(signal.SIGALRM, _fire)
-        signal.setitimer(signal.ITIMER_REAL, seconds)
-        return previous
-    except Exception:  # pragma: no cover - platform-dependent
-        return None
-
-
-def _disarm_budget(previous: Optional[Any]) -> None:
-    """Cancel the alarm and put the previous handler back. Never raises."""
-    try:
-        if hasattr(signal, "setitimer"):
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        if previous is not None:
-            signal.signal(signal.SIGALRM, previous)
-    except Exception:  # pragma: no cover - platform-dependent
-        pass
-
-
 # --- the entry point -------------------------------------------------------
 
 
@@ -986,11 +931,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ``Exception`` is caught; ``BaseException`` is not. ``KeyboardInterrupt`` and
     ``SystemExit`` mean the process is being torn down, and a metering guard that
     swallowed them would be a worse bug than the one it fixes — the same line
-    :mod:`tokenweir.sink` and :mod:`tokenweir.emitter` draw. The budget's own
-    exception is an ordinary ``Exception`` and lands in the same handler.
+    :mod:`tokenweir.sink` and :mod:`tokenweir.emitter` draw.
+
+    **What bounds a wedged hook is Claude Code's own ``timeout``**, which the
+    documented ``settings.json`` fragment sets, and not anything here. That is the
+    story's own answer — *"exit 0, short timeout (~30s), optionally `async: true`"*
+    — and it is the right one: a hook that re-implemented the timeout would be a
+    second mechanism for a bound the host already applies, with its own failure
+    modes to get wrong.
     """
     del argv  # the hook takes no arguments; the payload arrives on stdin
-    previous = _arm_budget(_budget_seconds())
     try:
         sink = select_sink()
         try:
@@ -1004,15 +954,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sink.close()
             except Exception:
                 pass
-    except _BudgetExpiredError:
-        # Named explicitly because it is a `BaseException`: the clause below
-        # cannot catch it, and it must not escape — an unhandled one would exit
-        # non-zero, which is the one thing this hook may never do.
-        _note("hook exceeded its time budget; exiting without disturbing the session")
     except Exception:
         _note("hook failed; exiting 0 so the session is untouched", exc_info=True)
-    finally:
-        _disarm_budget(previous)
     return 0
 
 

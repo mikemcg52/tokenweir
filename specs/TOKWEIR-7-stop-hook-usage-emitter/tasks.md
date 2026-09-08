@@ -84,9 +84,10 @@ so the entry point has nothing left to invent.
 
 - [x] **T017** Add `main(argv=None)`: catch `Exception` (never `BaseException`), return `0` on
       every path, and write diagnostics only to stderr (FR-004, FR-025, FR-026).
-- [x] **T018** Arm the time budget: `SIGALRM` at `TOKENWEIR_HOOK_TIMEOUT` (default 10s) with a
-      handler that unwinds into the exit-0 path, skipped where the platform or thread cannot arm
-      it (FR-027).
+- [~] **T018** ~~Arm a self-imposed `SIGALRM` time budget.~~ **Removed at review 2** as scope the
+      story does not carry: FR-027 is satisfied by Claude Code's own hook `timeout`, which the
+      documented `settings.json` fragment sets. Recorded rather than deleted so the next reader
+      knows it was tried and why it went.
 - [x] **T019** Add `select_sink()`: `TOKENWEIR_AMQP_URL` → `AMQPSink.from_url`, else
       `TOKENWEIR_DSN` → `DirectSink(PostgresSource)`, else `NullSink`; transport imports inside
       the branch; a construction failure degrades to `NullSink` (FR-030, FR-031).

@@ -766,120 +766,20 @@ def test_never_disturbs_the_session_when_delivery_hangs(transcript):
     assert elapsed < 5, f"a hanging sink held the hook for {elapsed:.1f}s"
 
 
-requires_alarm = pytest.mark.skipif(
-    not hasattr(__import__("signal"), "SIGALRM"), reason="POSIX alarm required"
-)
+def test_never_disturbs_the_session_without_a_session_id(transcript):
+    """FR-003 — "and MUST work without it". Claude Code supplies `session_id`, but
+    the hook's contract does not require it, and the fallback identity branch is
+    only reachable when it is absent."""
+    entry = transcript_entry(message_id=None, usage=usage(10, 1))
+    entry.pop("uuid")  # no `message.id` *and* no entry uuid: nothing to be stable about
+    transcript.append(entry)
+    payload = io.StringIO(json.dumps({"transcript_path": str(transcript)}))
+    sink = RecordingSink()
 
+    record = run(payload, sink)
 
-@requires_alarm
-def test_never_disturbs_the_session_when_the_main_thread_wedges(
-    transcript, monkeypatch, capsys
-):
-    """FR-027, SC-005 — the case a bounded close does *not* cover.
-
-    Nothing raises and nothing returns: a connect into a black hole, on the hook's
-    own thread. Claude Code's `timeout` would eventually kill the process, but
-    being killed skips the state write and is louder in the session, so the hook
-    gives up on its own first.
-
-    The wedge is placed **inside a real guarded path** — `select_sink` calling a
-    transport's `from_url`, exactly where a dead broker wedges a real hook — and
-    not by replacing `select_sink` itself. That distinction is the whole test: an
-    unguarded `time.sleep` standing in for the code path passes whether or not the
-    budget can survive contact with the module's own `except Exception` guards,
-    which is the thing that actually needs proving.
-    """
-    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
-    monkeypatch.setenv("TOKENWEIR_HOOK_TIMEOUT", "1")
-    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://nowhere.invalid:5672/")
-    monkeypatch.setattr(sys, "stdin", hook_stdin(transcript))
-
-    import tokenweir.amqp
-
-    monkeypatch.setattr(
-        tokenweir.amqp.AMQPSink,
-        "from_url",
-        classmethod(lambda cls, *a, **k: time.sleep(60)),
-    )
-
-    started = time.monotonic()
-    status = main()
-    elapsed = time.monotonic() - started
-
-    assert status == 0
-    assert elapsed < 20, f"the time budget did not fire; took {elapsed:.1f}s"
-    assert capsys.readouterr().out == ""
-
-
-@requires_alarm
-def test_never_disturbs_the_session_when_a_second_operation_also_wedges(
-    transcript, monkeypatch, capsys
-):
-    """FR-027, and the reason the budget's exception is a `BaseException`.
-
-    The budget is a one-shot alarm and every blocking call in the module sits
-    inside a broad `except Exception`. An ordinary exception is therefore absorbed
-    by whichever guard it lands in and the budget is *spent* — after which the
-    next blocking call runs unbounded and the process waits to be killed, which is
-    precisely the outcome the budget exists to prevent. One wedge cannot show
-    that: the first alarm fires, the guard swallows it, the rest of the hook is
-    fast, and the run looks bounded.
-
-    So: wedge twice, both inside real guarded paths — `select_sink` calling a
-    transport factory, then `scan_transcript` opening the transcript.
-
-    Both wedges are **bounded sleeps**, not unbounded blocks, so a regression
-    fails this test at the assertion rather than hanging the suite behind it.
-    """
-    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
-    monkeypatch.setenv("TOKENWEIR_HOOK_TIMEOUT", "1")
-    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://nowhere.invalid:5672/")
-    monkeypatch.setattr(sys, "stdin", hook_stdin(transcript))
-
-    import tokenweir.amqp
-
-    monkeypatch.setattr(
-        tokenweir.amqp.AMQPSink,
-        "from_url",
-        classmethod(lambda cls, *a, **k: time.sleep(25)),
-    )
-
-    real_open = open
-    wedged_path = str(transcript)
-
-    def slow_open(file, *args, **kwargs):
-        if str(file) == wedged_path:
-            time.sleep(25)
-        return real_open(file, *args, **kwargs)
-
-    monkeypatch.setattr("builtins.open", slow_open)
-
-    started = time.monotonic()
-    status = main()
-    elapsed = time.monotonic() - started
-
-    assert status == 0
-    assert elapsed < 20, (
-        f"the budget was spent on the first wedge and did not bound the second; "
-        f"took {elapsed:.1f}s"
-    )
-    assert capsys.readouterr().out == ""
-
-
-@requires_alarm
-def test_the_budget_is_not_absorbable_by_the_modules_own_guards():
-    """The property above, asserted directly rather than only through its symptom.
-
-    Every guard in this module catches `Exception`, deliberately, so that a
-    failure degrades to "no metering for this turn". The budget must be outside
-    that category or those guards swallow it.
-    """
-    from tokenweir.claude_code import _BudgetExpiredError
-
-    assert issubclass(_BudgetExpiredError, BaseException)
-    assert not issubclass(_BudgetExpiredError, Exception), (
-        "an Exception here is absorbed by the module's own except-Exception guards"
-    )
+    assert record is not None
+    assert record.request_id.startswith("claude-code:")
 
 
 def test_never_disturbs_the_session_with_a_corrupt_baseline(transcript, monkeypatch):
@@ -1217,6 +1117,38 @@ def test_counts_give_distinct_turns_distinct_request_ids(transcript):
     assert len(set(ids)) == 4, f"distinct turns shared an id: {ids}"
 
 
+def test_counts_do_not_inherit_a_previous_turns_id_for_an_unidentifiable_entry(
+    transcript,
+):
+    """FR-019, on the path the scan's own fallback creates.
+
+    An entry carrying neither `message.id` nor `uuid` is counted (it cannot be
+    shown to be a duplicate). If the *last* such entry also supplied the record's
+    identity by inheritance, a second turn would be stamped with the first turn's
+    id — two distinct turns sharing an identity, which is worse than the uuid
+    fallback: a consumer collapsing duplicate ids, which is exactly the remedy
+    FR-019 promises, would delete the second turn's tokens outright.
+    """
+
+    def anonymous(tokens):
+        entry = transcript_entry(message_id=None, usage=usage(tokens))
+        entry.pop("uuid")
+        return entry
+
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    sink = RecordingSink()
+    run(hook_stdin(transcript), sink)
+
+    transcript.append(anonymous(50))
+    run(hook_stdin(transcript), sink)
+
+    assert len(sink.records) == 2
+    assert counts_of(sink.records[1]) == (50, 0, 0, 0)
+    assert sink.records[1].request_id != sink.records[0].request_id, (
+        "a new turn inherited the previous turn's request_id"
+    )
+
+
 def test_counts_re_report_a_turn_under_the_same_id_when_the_baseline_is_lost(
     transcript, tmp_path, monkeypatch
 ):
@@ -1248,6 +1180,66 @@ def test_counts_re_report_a_turn_under_the_same_id_when_the_baseline_is_lost(
         "re-reports of one turn must be recognizable as duplicates, not new turns"
     )
     assert {counts_of(r) for r in sink.records} == {(100, 10, 0, 0)}
+
+
+def test_select_sink_uses_the_broker_path_when_an_amqp_url_is_configured(
+    monkeypatch,
+):
+    """FR-030's first branch — the homelab's production transport.
+
+    Without this, replacing the whole AMQP branch with `return NullSink()` leaves
+    the suite green: the only other AMQP test asserts the *failure* degradation,
+    which passes trivially in an environment with no `pika` because `from_url`
+    raises there anyway. Monkeypatching the factory is what makes the branch
+    observable without a driver or a broker."""
+    import tokenweir.amqp
+
+    class StubSink:
+        def emit(self, record):
+            pass
+
+        def close(self):
+            pass
+
+    stub = StubSink()
+    monkeypatch.setattr(
+        tokenweir.amqp.AMQPSink,
+        "from_url",
+        classmethod(lambda cls, url, **kwargs: stub),
+    )
+    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://broker.example/")
+
+    assert select_sink() is stub
+
+
+def test_select_sink_prefers_the_broker_when_both_transports_are_configured(
+    monkeypatch,
+):
+    """A deployment that configured a broker said where records should survive an
+    outage; writing past it to the store would quietly discard that."""
+    import tokenweir.amqp
+    import tokenweir.postgres
+
+    class StubSink:
+        def emit(self, record):
+            pass
+
+        def close(self):
+            pass
+
+    stub = StubSink()
+    monkeypatch.setattr(
+        tokenweir.amqp.AMQPSink, "from_url", classmethod(lambda cls, url, **kw: stub)
+    )
+    monkeypatch.setattr(
+        tokenweir.postgres.PostgresSource,
+        "from_dsn",
+        classmethod(lambda cls, dsn, **kw: pytest.fail("the store was chosen over the broker")),
+    )
+    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://broker.example/")
+    monkeypatch.setenv("TOKENWEIR_DSN", "postgresql://example/db")
+
+    assert select_sink() is stub
 
 
 def test_select_sink_uses_the_direct_path_when_a_dsn_is_configured(monkeypatch):

@@ -565,6 +565,9 @@ it; the hook does not need it, because it bounds its own runtime.
 | `TOKENWEIR_DSN` | Write straight to Postgres (the broker-less path). Needs `tokenweir[postgres]`. |
 | *neither* | `NullSink` — the hook runs and discards. An unconfigured hook is a no-op, not an error. |
 
+With **both** set the broker wins. A deployment that configured one has said where records should
+survive an outage, and writing past it to the store would discard that.
+
 Neither driver is imported unless the matching variable is set, so an unconfigured
 hook touches no transport library at all. A sink that cannot be *constructed* — a bad
 URL, a missing driver, a broker that is not there — degrades to the no-op sink with a
@@ -603,8 +606,6 @@ column would say the field was populated.
 | `TOKENWEIR_ENDPOINT` | Overrides `endpoint` (default `claude-code/stop-hook`). |
 | `TOKENWEIR_HOOK_STATE_DIR` | Where the per-transcript baseline is kept. |
 | `XDG_STATE_HOME` | Base for the default state directory when the above is unset (falls back to `~/.local/state`). |
-| `TOKENWEIR_HOOK_TIMEOUT` | The hook's own time budget in seconds (default `10`). |
-| `TOKENWEIR_HOOK_DEBUG` | Also write diagnostics to stderr. |
 
 `endpoint` deliberately is **not** `/v1/messages`: a turn is an aggregate of several
 API calls, and labelling the aggregate with a single-call endpoint would let a report
@@ -651,15 +652,19 @@ is re-anchored and nothing is emitted for that transition.
 A turn that added no new tokens emits nothing at all. A zero-token record would inflate
 the request count while adding no tokens.
 
-### Three separate guarantees that it cannot disturb a session
+### Two guarantees that it cannot disturb a session, and one that is not its own
 
 They are separate because they fail separately:
 
 | Guarantee | Covers |
 |---|---|
 | `main` catches `Exception` and returns `0` | A bug in the hook itself. `BaseException` still propagates — a metering guard that swallowed `KeyboardInterrupt` would be the worse bug. |
-| A self-imposed `SIGALRM` budget | Nothing raises and nothing returns — a connect into a black hole. Being killed by Claude Code's own `timeout` skips the state write and is louder in the session. |
 | A bounded emitter close | A sink that accepted the record and cannot deliver it. |
+
+The third case — nothing raises and nothing returns, a connect into a black hole — is bounded by
+**Claude Code's own `timeout`**, which is why the fragment above sets it. The hook deliberately does
+not run a competing timer: a second bound inside a process the host already bounds is a failure
+surface without a failure it uniquely fixes.
 
 ### What it does not do
 

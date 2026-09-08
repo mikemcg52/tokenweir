@@ -148,24 +148,28 @@ this story's to spend. `queue` is nullable, unconstrained, and semantically the 
 "which lane did this work go through". It is documented in the module, in the spec's Assumptions
 and in the README, so a future v2 can move it deliberately rather than find it.
 
-### 5. Three independent guarantees that the session is never disturbed
+### 5. Two guarantees that the session is never disturbed, and one that is not ours
 
 They are separate because they fail separately:
 
 - **`main()` catches `Exception` and returns 0.** Covers every bug in the hook's own logic. It
   deliberately does not catch `BaseException`: `KeyboardInterrupt` and `SystemExit` mean the
   process is being torn down and swallowing them would be worse than the failure.
-- **A self-imposed time budget** (`SIGALRM`, default 10s, `TOKENWEIR_HOOK_TIMEOUT`). Covers the
-  case where nothing raises and nothing returns — a DNS lookup into a black hole, a TCP connect to
-  a dead broker. Claude Code's own `timeout` would eventually kill the process, but being killed
-  is a worse outcome than returning: it is louder in the transcript and it skips the state write.
-  Where `SIGALRM` is unavailable, the budget is simply not armed.
 - **A bounded emitter close** (`close_timeout`, default 3s). Covers a sink that accepted the record
   and cannot deliver it. `BufferedEmitter.close` already implements exactly this bound; the hook
   just has to choose a small number rather than the 5s default.
 
-Together they make FR-027's claim testable: with a sink that never completes, the hook still
-returns.
+The third case — nothing raises and nothing returns — is bounded by **Claude Code's own hook
+`timeout`**, and is deliberately not re-implemented here.
+
+*Revised after review 2.* The first draft added a self-imposed `SIGALRM` budget. It was over-scope:
+the story's non-blocking clause names the host's timeout as the mechanism, and the second timer
+brought its own failure surface — an alarm is one-shot and every guard in this module catches
+`Exception`, so the natural implementation was absorbed by its own error handling and silently
+spent, which review 1 found. Fixing that required a `BaseException` subclass, which then leaked a
+temp file past the state write's cleanup and falsified four separate documentation claims. The
+argument for giving up early rather than being killed is real — a synchronous hook that wedges
+costs the developer the whole 30 seconds — and is recorded as a follow-up rather than built here.
 
 ### 6. Sink selection is environment-driven, and defaults to nothing
 
@@ -214,6 +218,10 @@ perfectly well-formed.
 
 ## Complexity Tracking
 
-No constitutional deviations to record. The two pieces of deliberate complexity, both justified
-above: the `SIGALRM` budget (decision 5) and the atomic state write (FR-016). Each exists to close
-a specific failure that the simpler version leaves open.
+No constitutional deviations to record. The one piece of deliberate complexity is the atomic state
+write (FR-016), which exists to close a specific failure the simpler version leaves open: an
+interrupted in-place write leaves a truncated file that every later invocation reads as corrupt.
+
+The `SIGALRM` budget was the other, and it was removed at review 2 for being scope the story did
+not carry — recorded here rather than quietly dropped, because "we tried this and took it out"
+is more useful to the next reader than silence about it.

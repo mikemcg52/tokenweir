@@ -250,10 +250,16 @@ capability is what is being built; the documentation makes it reachable.
 **Summing the turn**
 
 - **FR-005**: The hook MUST sum `message.usage.input_tokens`, `.output_tokens`,
-  `.cache_creation_input_tokens` and `.cache_read_input_tokens` across the transcript's assistant
-  entries.
+  `.cache_creation_input_tokens` and `.cache_read_input_tokens` across the transcript's entries.
+  The test applied is **"does this entry carry a usage object"**, not "is this entry typed
+  `assistant`" — the two select the same lines in practice (in a real 472-line transcript, every
+  one of the 148 usage-bearing entries was an assistant entry), and the former is the property that
+  actually matters and the one least likely to be invalidated by a transcript-format change.
 - **FR-006**: The hook MUST count each distinct API response exactly once, keyed on `message.id`,
-  even when the transcript holds several entries carrying that id.
+  even when the transcript holds several entries carrying that id. Where two entries share an id,
+  the **first** is counted and the rest skipped: the case this exists for is one response repeated
+  verbatim, so first and last are the same value, and a genuine disagreement between two entries
+  claiming one response id would be a format change rather than something to pick a winner for.
 - **FR-007**: The hook MUST skip transcript lines that are blank, are not JSON, are not JSON
   objects, carry no usage, or carry a usage object that is not a mapping — and MUST continue
   reading the rest of the file rather than abandoning it.
@@ -296,7 +302,10 @@ capability is what is being built; the documentation makes it reachable.
   re-report MUST carry the same id, so that a duplicate is recognizable as a duplicate rather
   than appearing as a new turn. The store deliberately puts no unique constraint on the column
   (`001_gateway_usage.sql`) because it is an append-only log expecting at-least-once delivery;
-  this requirement is what makes that tolerance usable.
+  this requirement is what makes that tolerance usable. A turn whose last counted entry carries no
+  identity MUST fall back to a fresh identifier rather than inherit the previous turn's — an
+  inherited id hands two distinct turns one identity, which is worse than an unstable one, because
+  the consumer-side remedy above would then delete a real turn.
 - **FR-020**: The record MUST carry `model` taken from the most recent counted assistant message,
   and MUST fall back to a non-blank placeholder when the transcript names none — a record the
   contract would refuse is worse than one whose model is unknown.
@@ -316,8 +325,13 @@ capability is what is being built; the documentation makes it reachable.
   NEVER exit `2` (Claude Code's blocking status).
 - **FR-026**: No exception raised by transcript reading, state handling, record construction,
   sink construction or emission may escape the hook.
-- **FR-027**: The hook MUST bound its own total run time to a budget well inside Claude Code's
-  hook `timeout`, and MUST exit `0` when that budget expires.
+- **FR-027**: The hook's total run time MUST be bounded by Claude Code's own hook `timeout`, which
+  the documented `settings.json` fragment sets. The hook MUST NOT implement a competing timer of
+  its own: the story's non-blocking clause names the host's timeout as the mechanism, and a second
+  bound inside the hook is scope this story does not carry. *(Revised after review 2, which found
+  the self-imposed budget to be over-scope. The case for giving up early rather than being killed —
+  a synchronous hook that wedges costs the developer the whole 30 seconds — is real and is recorded
+  in the run's report as a follow-up, not built here.)*
 - **FR-028**: The hook MUST bound the emitter's flush at exit, so an unreachable broker delays the
   process by a bounded interval rather than indefinitely.
 - **FR-029**: Emission MUST go through the library's guarded seam and the buffered client, not
@@ -327,7 +341,10 @@ capability is what is being built; the documentation makes it reachable.
 **Transport and packaging**
 
 - **FR-030**: The hook MUST select its sink from the environment: an AMQP URL when one is given, a
-  Postgres DSN when one is given, and a no-op sink when neither is.
+  Postgres DSN when one is given, and a no-op sink when neither is. With **both** given the broker
+  MUST win — a deployment that configured one has said where records should survive an outage, and
+  writing past it to the store would discard that. Each branch MUST be tested positively, not only
+  through its failure path.
 - **FR-031**: Importing the hook's module MUST NOT import `pika` or `psycopg`. The core stays
   dependency-light (ADR-0001 Pillar 2); a transport is imported only when the environment selects
   it.
@@ -359,8 +376,8 @@ capability is what is being built; the documentation makes it reachable.
 - **SC-003**: 100% of hook invocations exit `0`, including those where the sink raises, the
   transcript is missing or malformed, stdin is garbage, or the state directory is unwritable.
 - **SC-004**: The hook writes zero bytes to stdout on every path.
-- **SC-005**: With a sink that never completes, the hook still returns within its own time
-  budget — measured in seconds, and below Claude Code's configured `timeout`.
+- **SC-005**: With a sink that never completes, the hook still returns within the emitter's close
+  timeout — measured in seconds, and well below Claude Code's configured `timeout`.
 - **SC-006**: Every emitted record validates against the published v1 usage-record schema and
   carries `pricing_mode=subscription`.
 - **SC-007**: With the `MADO_*` variables set, 100% of records carry the issue key and phase; with
