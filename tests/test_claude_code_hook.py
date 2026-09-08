@@ -322,9 +322,20 @@ def test_counts_one_api_response_once_however_many_lines_mention_it(transcript):
     )
 
 
-def test_counts_sidechain_subagent_entries(transcript):
-    """A subagent's tokens come out of the same subscription window. Excluding
-    them would under-report precisely the runs this exists to measure."""
+def test_a_sidechain_entry_would_be_counted_if_the_file_held_one(transcript):
+    """The High the terminal review found (H2): this is a mechanical fact about
+    `scan_transcript`'s selection rule, not a claim that subagent usage is
+    captured in practice. The rule selects on "does this entry carry usage",
+    not on `type` or `isSidechain`, so an inline sidechain entry sums exactly
+    like an ordinary one *if it is in the file this function reads*.
+
+    In current Claude Code versions it never is: a subagent's usage lives in
+    sibling `<session>/subagents/*.jsonl` files, not inline at
+    `transcript_path`, and this fixture's shape — an `isSidechain: true` entry
+    inside the main transcript — does not occur in a real one. Do not read
+    this test as evidence that subagent tokens are metered; see
+    `scan_transcript`'s docstring for what actually happens.
+    """
     transcript.append(
         transcript_entry(message_id="msg_main", usage=usage(100, 10)),
         transcript_entry(
@@ -366,6 +377,35 @@ def test_counts_are_re_anchored_when_the_transcript_is_replaced(transcript):
     transcript.append(transcript_entry(message_id="msg_next", usage=usage(40, 8)))
     run(hook_stdin(transcript), into(sink))
     assert counts_of(sink.records[1]) == (40, 8, 0, 0)
+
+
+def test_an_unreadable_transcript_does_not_reset_the_baseline(transcript):
+    """The High the terminal review found (H1). `scan_transcript` cannot open
+    the file — `EMFILE` under a busy orchestrator, a permission blip, rotation
+    in progress — and returns empty totals exactly as a genuinely fresh file
+    would. Without `ScanResult.readable`, `run` cannot tell the two apart and
+    takes the re-anchor branch: the baseline is zeroed, and the next
+    successful read re-reports the whole session as though it were one turn.
+    """
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(5000, 900)))
+    sink = RecordingSink()
+    run(hook_stdin(transcript), into(sink))
+
+    transcript.path.chmod(0o000)
+    try:
+        assert run(hook_stdin(transcript), into(sink)) is None
+    finally:
+        transcript.path.chmod(0o600)
+    assert len(sink.records) == 1, "an unreadable transcript must not emit a record"
+
+    # The baseline must still be where turn 1 left it, so the next readable
+    # turn reports only its own small delta -- not the whole session again.
+    transcript.append(transcript_entry(message_id="msg_next", usage=usage(40, 8)))
+    run(hook_stdin(transcript), into(sink))
+    assert len(sink.records) == 2
+    assert counts_of(sink.records[1]) == (40, 8, 0, 0), (
+        "an unreadable turn must not re-anchor the baseline to zero"
+    )
 
 
 def test_counts_survive_lines_that_are_not_usable(transcript):

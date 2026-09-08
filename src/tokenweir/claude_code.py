@@ -318,6 +318,17 @@ class ScanResult:
     The three ``last_*`` fields describe the most recent counted response, which is
     what the record is stamped from: its model, its id (the record's identity) and
     its timestamp.
+
+    ``readable`` is what tells the caller *why* ``totals`` might be low. It is
+    ``False`` when the file could not be opened at all, or when reading it ended
+    in an exception before reaching EOF — a transient failure (``EMFILE`` under a
+    busy orchestrator, a permission blip, the file mid-rotation) that says nothing
+    about the transcript's actual contents. It is ``True`` whenever the read ran to
+    completion, even over zero matching lines: an empty or genuinely short
+    transcript is a fact about the file, not a failure to read one, and the two
+    must not be confused. A transcript that could not be read has ``totals`` of
+    zero for a reason that has nothing to do with the session, and treating that
+    zero as ground truth is exactly the defect this field exists to prevent.
     """
 
     totals: TokenTotals = TokenTotals()
@@ -325,6 +336,7 @@ class ScanResult:
     last_model: Optional[str] = None
     last_message_id: Optional[str] = None
     last_timestamp: Optional[str] = None
+    readable: bool = True
 
 
 def _text(value: Any) -> Optional[str]:
@@ -381,28 +393,39 @@ def scan_transcript(path: Any) -> ScanResult:
 
     Entries are not filtered by ``type``. The question this asks is "does this
     entry carry usage", which is the property that matters and the one least likely
-    to be invalidated by a transcript-format change. Sidechain (subagent) entries
-    are therefore counted, deliberately: they spend the same subscription budget in
-    the same window, and excluding them would under-report precisely the runs this
-    exists to measure.
+    to be invalidated by a transcript-format change. An ``isSidechain`` entry
+    *would* be counted by this rule if the file handed to this function held one —
+    but in current Claude Code versions it never does: a subagent's usage is
+    written to sibling ``<session>/subagents/*.jsonl`` files, not inline in the
+    transcript at ``transcript_path``, and this function is only ever given the
+    latter. **Subagent token usage is therefore not currently captured**, contrary
+    to an earlier claim here. Measured against a live session directory: every
+    ``isSidechain`` entry in the main transcript was ``false``; every entry with
+    ``isSidechain: true`` and a ``usage`` object lived in a ``subagents/`` file this
+    function never opens. Reading those files is real, separate work — a Stop hook
+    fires once per main-thread turn, and knowing which subagent files (and how much
+    of each) belong to *this* turn needs its own tracking, not a side effect of
+    scanning one path — and is not done here.
 
     Returns:
         A :class:`ScanResult`. A missing or unreadable file yields an empty one
-        rather than raising — every failure here is "no metering for this turn".
+        rather than raising — every failure here is "no metering for this turn" —
+        with :attr:`ScanResult.readable` set to ``False`` so the caller can tell
+        that emptiness apart from a transcript that genuinely has nothing new.
     """
-    result = ScanResult()
     seen: set[str] = set()
     try:
         handle = open(path, "r", encoding="utf-8", errors="replace")
     except Exception:
         _note(f"transcript could not be opened; no metering for this turn: {path!r}")
-        return result
+        return ScanResult(readable=False)
 
     totals = TokenTotals()
     counted = 0
     last_model = None
     last_message_id = None
     last_timestamp = None
+    readable = True
     try:
         with handle:
             for line in handle:
@@ -436,8 +459,11 @@ def scan_transcript(path: Any) -> ScanResult:
     except Exception:
         # A read error part-way through. What was counted before it is still
         # true, and returning it is better than discarding a whole session
-        # because the tail was unreadable.
+        # because the tail was unreadable — but the read did not reach EOF, so
+        # `totals` is not the transcript's actual cumulative total and must not
+        # be trusted as one by the caller.
         _note("transcript read ended early; counting what was read", exc_info=True)
+        readable = False
 
     return ScanResult(
         totals=totals,
@@ -445,6 +471,7 @@ def scan_transcript(path: Any) -> ScanResult:
         last_model=last_model,
         last_message_id=last_message_id,
         last_timestamp=last_timestamp,
+        readable=readable,
     )
 
 
@@ -1034,6 +1061,16 @@ def run(
 
     delta = turn_delta(scan.totals, baseline)
     if delta is None:
+        if not scan.readable:
+            # The file could not be opened, or reading it ended in an
+            # exception — a transient failure that says nothing about the
+            # transcript's actual contents. `scan.totals` is not a trustworthy
+            # cumulative total here, so it must not overwrite a baseline that
+            # is: re-anchoring on it would be the same silent reset FR-014
+            # exists to prevent, one step removed. Leave the baseline exactly
+            # where it is and try again next turn.
+            _note("transcript unreadable this turn; leaving baseline untouched, no record")
+            return None
         # The transcript at this path is not the one the baseline describes.
         # Re-anchor and emit nothing (FR-014).
         _note("transcript regressed below its baseline; re-anchoring, no record")

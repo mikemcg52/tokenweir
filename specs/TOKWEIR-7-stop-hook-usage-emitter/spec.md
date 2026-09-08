@@ -228,8 +228,11 @@ capability is what is being built; the documentation makes it reachable.
   again.
 - **Two hooks racing on one transcript**: the state write must not leave a half-written file that
   poisons every later invocation.
-- **A turn spanning more than one model** (a Haiku subagent inside an Opus turn): the counts are
-  summed across models and the record names one model — see Assumptions.
+- **A turn spanning more than one model** (a plan-mode draft on a cheaper model, finalized on the
+  primary one, both inline in the same transcript): the counts are summed across models and the
+  record names one model — see Assumptions. (An earlier version of this bullet used a subagent as
+  the example; that was wrong for the reason the Revision log's subagent-capture entry explains,
+  and the example is corrected rather than the mechanism, which was never at issue.)
 - **A very large transcript**: the file is read in a streaming fashion; the hook must not need to
   hold the whole session in memory to add up four integers.
 - **`transcript_path` pointing outside the session** (absent from stdin, empty, a directory): no
@@ -428,8 +431,12 @@ Recorded because the story did not specify them and a reasonable default was cho
 - **`ephemeral_5m` / `ephemeral_1h` cache fields are not stored.** The v1 contract has four token
   fields and this story does not change the contract. They are subsumed by
   `cache_creation_input_tokens`, which is what the contract has a place for.
-- **Sidechain (subagent) entries are counted.** They consume the same subscription budget in the
-  same window, and excluding them would under-report exactly the runs MADO cares about most.
+- **Sidechain (subagent) entries would be counted if the transcript held one inline** — the
+  selection rule is "carries usage", not `type` or `isSidechain`. **This was believed to mean
+  subagent usage is captured; it does not.** In current Claude Code versions a subagent's usage is
+  written to sibling `<session>/subagents/*.jsonl` files, never inline at `transcript_path`, so the
+  case this bullet describes does not occur and subagent tokens are not currently metered by this
+  hook. See the Revision log's subagent-capture entry.
 - **One record per turn even when a turn spans several models.** The story's acceptance says
   "exactly one usage record"; splitting per model would produce several. The counts are summed and
   `model` names the most recent counted message. A per-model breakdown is a contract question
@@ -484,6 +491,8 @@ should know which clauses were written after the fact and why.
 | Fix 4 | Assumptions (close-timeout window) | Struck the "duplicates share an id" defence | Review 4 found the same live-session error review 3 had corrected elsewhere, left standing here. |
 | Fix 5 | Header | Struck the claim that a reviewer cannot reach the Jira account | It was false, and it discouraged the one check that keeps this document honest. |
 | Fix 5 | FR-006 | De-duplication is on `message.id` **only** | The entry-`uuid` fallback de-duplicated nothing `message.id` had not already caught, while widening what counts as an identity, and no test held it. |
+| Fix 6 | `ScanResult`, `run` | Added `ScanResult.readable`; `run` no longer re-anchors the baseline on an unreadable transcript | Terminal review, High (H1). An unopenable file and a genuinely fresh one both scanned to empty totals, and `run` could not tell them apart — a transient `EMFILE`/permission blip zeroed the baseline exactly as a real rotation would, and the next successful read re-reported the whole session as one turn. |
+| Fix 6 | `scan_transcript` docstring, Edge Cases, Assumptions | Corrected the "sidechain entries are counted" claim | Terminal review, High (H2). The claim was measured against a real session directory and found false: subagent usage lives in sibling `subagents/*.jsonl` files never handed to this hook, not inline in the main transcript. The code was not wrong — it would count such an entry if one existed — the claim and its test's fixture shape were. See the subsection below. |
 
 The story itself (quoted at the top, re-read from Jira each round) is unchanged throughout and is
 the scope ceiling these revisions were measured against.
@@ -534,3 +543,36 @@ A reviewer who still considers the layer out of scope is not wrong to; it is a j
 where this story ends, and the counter-argument is that deleting it knowingly ships a data-loss
 path. **The follow-up that would settle it is publisher confirms in `AMQPSink`**, which would make
 the answer authoritative instead of merely honest, and which is genuinely a separate story.
+
+### The subagent-capture claim was false, and is corrected here
+
+Fix round 5 shipped a docstring, an Edge Case bullet, an Assumption and a test all asserting the
+same thing: sidechain (subagent) entries are inline in the transcript, tagged `isSidechain: true`,
+and are therefore summed into the turn's usage. The terminal review checked this against a live
+Claude Code session directory and found it false — 162 distinct subagent message ids, none of them
+in the main transcript file — and the fix-round cap was reached before it could be corrected on
+this branch.
+
+The check was repeated independently while fixing it, against a different real session directory on
+the reviewing machine: the main transcript held 111 `isSidechain` entries, **all `false`**; every
+entry with `isSidechain: true` and a `usage` object lived in a sibling `subagents/agent-*.jsonl`
+file that `scan_transcript` is never handed. Two independent measurements against two different real
+sessions agree.
+
+**What was actually wrong, precisely.** `scan_transcript`'s selection rule — "does this entry carry
+usage", not `type` or `isSidechain` — was never the defect; it would sum an inline sidechain entry
+correctly if one existed. What was wrong is the belief that one ever does. The shipped test,
+`test_counts_sidechain_subagent_entries`, fabricated exactly the entry shape the review found does
+not occur, so it measured the selection rule against a fixture reality doesn't produce and called
+that "subagent usage is captured" — a claim no fixture built from real data could have supported.
+
+**What this fix does, and does not, do.** The docstring, the Edge Case bullet and the Assumption
+above are corrected to say plainly that subagent tokens are not currently metered. The misleading
+test is kept — the selection rule is still correctly mechanical — but retitled and re-documented so
+it cannot be read as evidence of a capability that does not exist. **Actually capturing subagent
+usage is not done here.** It needs its own design: discovering which `subagents/*.jsonl` files
+belong to *this* turn (a Stop hook fires once per main-thread turn, not once per subagent), reading
+files that may still be open for writing on the same schedule this module already handles for the
+main transcript, and its own de-duplication and baseline state per subagent file. That is real,
+separate work, named here as the follow-up the terminal review already suggested rather than
+attempted as part of a claim-correction fix.
