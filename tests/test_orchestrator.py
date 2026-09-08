@@ -85,7 +85,23 @@ def test_a_bare_kind_keeps_no_occurrence(kind):
     assert normalize_phase(kind) == kind
 
 
-@pytest.mark.parametrize("blank", [None, "", "   ", "\t\n", " "])
+@pytest.mark.parametrize(
+    "blank",
+    [
+        None,
+        "",
+        "   ",
+        "\t\n",
+        " ",
+        # Review 3, Med-2: separator-only. `_collapse` folds these to nothing, so they
+        # are the same claim as `""` written with different characters — and the two
+        # ends must agree about that, or a phase goes missing between them.
+        "_",
+        "#",
+        "__ ##",
+        "_ #",
+    ],
+)
 def test_blank_is_no_phase_and_not_a_label(blank):
     """FR-006, and TOKWEIR-7's FR-022 preserved. An orchestrator exporting
     `MADO_PHASE=""` is saying "no phase"; turning that into a label would say the
@@ -287,7 +303,19 @@ def test_the_block_passes_an_unrecognized_phase_through():
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("issue_key", "   "), ("stream_id", "  "), ("phase", "   ")],
+    [
+        ("issue_key", "   "),
+        ("stream_id", "  "),
+        ("phase", "   "),
+        # Review 3, Med-2. The producer judged blankness with `str.strip()` while the
+        # reader judged it with `_collapse`, and the gap between the two definitions was
+        # exactly the separator characters: `"_"` passed this check, normalized to
+        # `None`, and was exported as `''` — a phase lost at both ends, silently, which
+        # is the one thing this module says must never happen.
+        ("phase", "_"),
+        ("phase", "#"),
+        ("phase", "__ ##"),
+    ],
 )
 def test_the_block_rejects_a_value_that_is_present_but_blank(field, value):
     """FR-012. Blank-but-present is a value that was computed and came out empty. The
@@ -444,7 +472,8 @@ def test_the_block_passes_a_signed_occurrence_on_an_unknown_kind_through(phase):
     `review +1` is in this list deliberately: it is a positive occurrence in a spelling
     nobody uses, and FR-012 is about occurrences that cannot exist, not about spellings
     we would rather they had not chosen."""
-    assert attribution_env(issue_key="TOKWEIR-8", phase=phase)[ATTRIBUTION_ENV["phase"]]
+    exported = attribution_env(issue_key="TOKWEIR-8", phase=phase)[ATTRIBUTION_ENV["phase"]]
+    assert exported == normalize_phase(phase), "an unknown phase is passed on, not edited"
 
 
 @pytest.mark.parametrize("phase", [7, 7.0, ["review"], object()])

@@ -75,6 +75,10 @@ sequential — the hook and the docs both depend on the new module existing.
 - [x] **T019** (review 2) `MappingProxyType` on `ATTRIBUTION_ENV`; document and test the
   whitespace strip on the issue key and stream id.
 
+- [x] **T020** (review 3) One definition of an empty phase across both ends, so a
+  separator-only value cannot fall through the gap between `str.strip()` and `_collapse`;
+  document the `mado`→`tokenweir` version-skew behaviour in the README.
+
 ## Explicit non-goals
 
 Not tasks, listed so their absence is a decision rather than an oversight:

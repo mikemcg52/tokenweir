@@ -667,6 +667,15 @@ fail a session, while a producer is a program with a bug worth surfacing.
 So the orchestrator's obligation is: **export the whole block, on every iteration,
 before the turn**, into the environment Claude Code inherits.
 
+**Version skew.** The orchestrator takes an ordinary runtime dependency on this
+package, and the two ends are deployed separately — so they can disagree about the
+taxonomy. The disagreement is deliberately harmless in the direction it will happen:
+a producer whose `tokenweir` knows a kind the reader's does not exports a canonical
+label, and the older reader keeps it verbatim and logs it as unrecognized. The record is
+never lost and never rewritten; a report just shows one lane it cannot name yet, until
+the pod's `tokenweir` catches up. Adding a kind is therefore additive at both ends, and
+neither end needs to be upgraded first.
+
 > **The orchestrator-side change is not in this repository.** MADO's orchestrator is
 > `services/orchestrator/` in the `mado` repo. TOKWEIR-8 delivers the contract here —
 > the taxonomy, the builder, and the hook's conformance to it — and the export itself is

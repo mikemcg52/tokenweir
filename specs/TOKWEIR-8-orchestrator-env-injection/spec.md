@@ -222,10 +222,16 @@ canonical label grammar and the per-iteration timing are stated.
 - **FR-004**: Normalization MUST NOT invent an occurrence number for a kind written without one,
   and MUST NOT drop one from a kind written with one.
 - **FR-005**: Normalization of a value it does not recognize MUST return that value with its
-  whitespace normalized rather than `None`, so no attribution is lost, and MUST be distinguishable
-  by the caller from a recognized label.
-- **FR-006**: Normalization MUST treat `None`, the empty string and a whitespace-only string
-  alike, returning `None` — "no phase" is not a label.
+  **separators folded** — the same folding a recognized value gets, so `deploy_step` and
+  `deploy step` are one unknown phase rather than two — and never `None`, so no attribution is
+  lost. The result MUST be distinguishable by the caller from a recognized label. (Reworded after
+  review 3, Low-3: this said "with its whitespace normalized", which did not license the folding
+  the Edge Cases describe and the code performs.)
+- **FR-006**: Normalization MUST treat `None`, the empty string, a whitespace-only string and a
+  string made only of folded separators (`_`, `#`) alike, returning `None` — "no phase" is not a
+  label. The producer MUST reject all of the non-`None` cases by the *same* definition of empty
+  (FR-012): two definitions of blank leave a gap the width of the difference between them, and a
+  phase falls through it. (Extended after review 3, Med-2, which found exactly that gap.)
 - **FR-007**: An occurrence that is zero, negative or not a whole number MUST NOT produce a
   canonical label.
 
@@ -295,8 +301,10 @@ canonical label grammar and the per-iteration timing are stated.
   label that went into it, verified end to end from builder to record.
 - **SC-004**: A phase outside the taxonomy loses no attribution: the record still carries the
   value, in 100% of cases.
-- **SC-005**: The variable names appear exactly once as literals in the library; producer and
-  consumer both resolve them from that one definition.
+- **SC-005**: The variable names appear exactly once as a **code literal** in the library;
+  producer and consumer both resolve them from that one definition. Prose is exempt and
+  deliberately so — a docstring cannot drift into reading the wrong variable, and only code
+  references can. (Reworded after review 3, Low-6, to say what the enforcing test checks.)
 - **SC-006**: The contract module imports nothing beyond the standard library and
   `tokenweir.contract`, so the orchestrator can adopt it without inheriting a transport dependency
   — verified by reading the module's own imports rather than `sys.modules`.
@@ -399,3 +407,33 @@ The reviewer's second Med is a status finding rather than a defect, and this rou
 where it will actually be read: a comment on TOKWEIR-8 itself, naming what the branch delivers,
 what it does not, and MADO-419 as the other half. It is not enough for the deferral to be true
 and documented in a repo — the person closing the issue is looking at Jira.
+
+### Review 3 (2026-09-08) — one phase, two definitions of empty
+
+`_collapse` folds `_` and `#` to nothing, but the producer's blank check used `str.strip()`,
+which does not. The gap between the two definitions was exactly the separator characters:
+`MADO_PHASE=_` passed the producer's check, normalized to `None`, and was exported as `''` — so
+a phase disappeared at *both* ends, and because the hook only warns about a phase it can see, it
+disappeared silently. That is the one outcome this module says must never happen, and it was
+reachable from a one-character typo.
+
+The fix is one definition rather than a new guard: the producer now judges an empty phase with
+`_collapse`, the same function the reader judges it by. A separator-only phase is "no phase" —
+the same claim as `""` in different characters — so the producer refuses it and tells the caller
+to pass `None`, and the reader treats it as unset without a diagnostic. Both ends are tested on
+the same inputs.
+
+Three amendments to this document, listed because a requirement edited to fit the code is worth
+a reader knowing about:
+
+- **FR-005** said "with its whitespace normalized", which never licensed the separator folding
+  the Edge Cases describe and the code performs. Reworded to match. The round-1 entry above
+  amended the Edge Case and did not list the amendment; this does.
+- **FR-006** now names separator-only strings and, more importantly, requires both ends to use
+  one definition of empty — the property whose absence was review 3's Med-2.
+- **FR-014 and SC-006** were reworded in round 1 to permit the `tokenweir.contract` import that
+  `plan.md` always intended; **SC-005** is reworded here to say "code literal", which is what its
+  enforcing test checks and what can actually drift.
+
+Review 3's remaining Med is the deferral, unchanged and reported for the third time: the story's
+"for the iteration" clause needs MADO-419.

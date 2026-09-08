@@ -340,9 +340,12 @@ def normalize_phase(value: Optional[str]) -> Optional[str]:
     Never raises and never discards. Three outcomes, and the caller can tell them apart
     with :func:`is_canonical_phase`:
 
-    - ``None``, empty or whitespace-only → ``None``. Unset and blank mean "no phase",
-      which is the reading TOKWEIR-7 already gives them (FR-022 there); a blank must
-      not become a label.
+    - ``None``, empty, whitespace-only, or made only of the separators :func:`_collapse`
+      folds (``"_"``, ``"#"``, ``"__ ##"``) → ``None``. Unset and blank mean "no
+      phase", which is the reading TOKWEIR-7 already gives them (FR-022 there); a blank
+      must not become a label. Separator-only is the same claim written with different
+      characters, and :func:`attribution_env` refuses it for the same reason it refuses
+      ``""`` — a producer that means "no phase" should pass ``None`` and say so.
     - A phase this taxonomy recognizes → its canonical label. ``1st review``,
       ``review 1``, ``Review #1``, ``REVIEW-1`` and ``review_1`` all become
       ``'review-1'``.
@@ -475,7 +478,13 @@ def attribution_env(
             f"phase must be a PhaseKind, a string or None; "
             f"got {type(phase).__name__} {phase!r}"
         )
-    if isinstance(phase, str) and not phase.strip():
+    if isinstance(phase, str) and not _collapse(phase):
+        # `_collapse`, not `str.strip()`: this module has *one* definition of an empty
+        # phase and it is the one :func:`normalize_phase` reads by. Judging blankness
+        # with `strip()` while the reader judged it with `_collapse` left a gap exactly
+        # the width of the separator characters — `"_"` passed the producer's check,
+        # normalized to `None`, and was exported as `''`, so a phase went missing at
+        # both ends with nothing logged (review 3, Med-2).
         raise ValueError("phase was given as blank; pass None to leave it unknown")
     if isinstance(phase, str) and _parse_phase(_collapse(phase).lower()).bad_occurrence:
         raise ValueError(
