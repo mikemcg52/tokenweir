@@ -12,6 +12,7 @@ codes, not about the database. What the runner then does with a real connection 
 
 import pytest
 
+from tokenweir import reconcile
 from tokenweir.migrations import MigrationChecksumError, discover
 from tokenweir.migrations import __main__ as cli
 
@@ -336,3 +337,190 @@ def test_no_subcommand_is_a_usage_error():
     with pytest.raises(SystemExit) as excinfo:
         cli.main([])
     assert excinfo.value.code == 2
+
+
+# --- `reconcile` (TOKWEIR-10) -------------------------------------------------
+#
+# Stubbed like everything above: this file is about argument handling and exit
+# codes. What the reconciler does to a real database is `test_reconcile.py`, and
+# nothing here is offered as a substitute for it.
+
+
+def _plan(*discrepancies, baseline=None, observations=()):
+    return reconcile.ReconciliationPlan(
+        discrepancies=tuple(discrepancies),
+        observations=tuple(observations),
+        baseline_effective_from=baseline,
+    )
+
+
+def _automatic(statement="ALTER TABLE gateway_usage ADD COLUMN schema_version integer"):
+    return reconcile.Discrepancy(
+        relation="gateway_usage",
+        description="column schema_version (integer) is missing",
+        resolution=reconcile.Resolution.AUTOMATIC,
+        statements=(statement,),
+    )
+
+
+def _manual():
+    return reconcile.Discrepancy(
+        relation="model_pricing_rates",
+        description="rate card is current-valued",
+        resolution=reconcile.Resolution.MANUAL,
+        remedy="re-run with a baseline date",
+    )
+
+
+@pytest.fixture
+def stub_reconciler(monkeypatch):
+    """Records what the CLI asked the reconciler to do, and what it passed."""
+
+    calls = {"plan": [], "apply": []}
+    planned = _plan(_automatic())
+
+    def fake_plan(connection, *, baseline_effective_from=None):
+        calls["plan"].append(baseline_effective_from)
+        return calls.get("planned", planned)
+
+    def fake_apply(connection, existing_plan=None, **kwargs):
+        calls["apply"].append(existing_plan)
+        return existing_plan if existing_plan is not None else planned
+
+    monkeypatch.setattr(cli.reconciler, "plan", fake_plan)
+    monkeypatch.setattr(cli.reconciler, "apply", fake_apply)
+    calls["planned"] = planned
+    return calls
+
+
+def test_reconcile_plans_and_changes_nothing_without_apply(
+    stub_connect, stub_reconciler, capsys
+):
+    """The default is the safe one. An operator who types the command wrong gets a
+    report, not a migration."""
+    assert cli.main(["reconcile", "--dsn", "postgresql:///s"]) == 0
+
+    assert stub_reconciler["plan"] == [None]
+    assert stub_reconciler["apply"] == []
+    out = capsys.readouterr().out
+    assert "schema_version" in out
+    assert "--apply" in out
+
+
+def test_reconcile_applies_the_plan_it_printed(stub_connect, stub_reconciler, capsys):
+    """Printed first and whether or not it applied, so a log of a run that changed
+    the database still says what it changed."""
+    assert cli.main(["reconcile", "--dsn", "postgresql:///s", "--apply"]) == 0
+
+    assert stub_reconciler["apply"] == [stub_reconciler["planned"]]
+    out = capsys.readouterr().out
+    assert "schema_version" in out
+    assert "reconciled: 1 discrepancy" in out
+
+
+def test_reconcile_says_so_when_there_is_nothing_to_do(
+    stub_connect, stub_reconciler, capsys
+):
+    stub_reconciler["planned"] = _plan()
+    assert cli.main(["reconcile", "--dsn", "postgresql:///s", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "already matches" in out
+
+
+def test_a_plan_needing_a_decision_is_a_message_and_a_non_zero_exit(
+    stub_connect, stub_reconciler, monkeypatch, capsys
+):
+    """A refusal to act exits 1 and reads as a sentence. The reconciler's refusals
+    are `ReconcileError`s, which the CLI had no reason to know about before this
+    subcommand existed — without the widened `except` they would have come out as
+    `error: ManualResolutionError: ...`, which is a traceback with better
+    manners."""
+    stub_reconciler["planned"] = _plan(_automatic(), _manual())
+
+    def refuse(connection, existing_plan=None, **kwargs):
+        raise reconcile.ManualResolutionError(
+            "refusing to reconcile: 1 discrepancy needs a decision"
+        )
+
+    monkeypatch.setattr(cli.reconciler, "apply", refuse)
+
+    assert cli.main(["reconcile", "--dsn", "postgresql:///s", "--apply"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: refusing to reconcile")
+    assert "ManualResolutionError" not in captured.err
+
+
+def test_a_plan_needing_a_decision_still_exits_zero_when_only_planning(
+    stub_connect, stub_reconciler, capsys
+):
+    """A report succeeds even when what it reports is bad news — the same rule
+    `status` follows for a database with pending migrations."""
+    stub_reconciler["planned"] = _plan(_manual())
+    assert cli.main(["reconcile", "--dsn", "postgresql:///s"]) == 0
+    assert "MANUAL" in capsys.readouterr().out
+
+
+def test_the_baseline_reaches_the_reconciler_normalised(stub_connect, stub_reconciler):
+    assert (
+        cli.main(
+            [
+                "reconcile",
+                "--dsn",
+                "postgresql:///s",
+                "--baseline-effective-from",
+                "  2024-01-01  ",
+            ]
+        )
+        == 0
+    )
+    assert stub_reconciler["plan"] == ["2024-01-01"]
+
+
+def test_the_documented_negative_infinity_form_reaches_the_reconciler(
+    stub_connect, stub_reconciler
+):
+    """`-infinity` is the one value the flag documents besides a date, and argparse
+    reads its leading dash as an option — so the spaced form the README used to
+    show fails with "expected one argument" before the command ever connects.
+
+    The `=` form is what works, and it is now what everything documents. This test
+    exists because the recovery an operator reaches for when the spaced form fails
+    is dropping the dash, and `infinity` used to be accepted — silently unpricing
+    every historical row.
+    """
+    assert (
+        cli.main(
+            ["reconcile", "--dsn", "postgresql:///s", "--baseline-effective-from=-infinity"]
+        )
+        == 0
+    )
+    assert stub_reconciler["plan"] == ["-infinity"]
+
+
+def test_a_positive_infinity_baseline_is_a_usage_error(stub_connect):
+    """Rejected by argparse, so the command never opens a connection to find out —
+    and the message says what to write instead."""
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["reconcile", "--dsn", "postgresql:///s", "--baseline-effective-from", "infinity"])
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize("given", ["not-a-date", "01/01/2024"])
+def test_a_baseline_that_is_not_a_date_is_a_usage_error(given, stub_connect):
+    """Exit 2, not 1: a typo in an argument is argparse's to reject, and rejecting
+    it there means the command never opens a connection to find out."""
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["reconcile", "--dsn", "postgresql:///s", "--baseline-effective-from", given])
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["reconcile", "--dsn", "postgresql:///scratch"],
+        ["--dsn", "postgresql:///scratch", "reconcile"],
+    ],
+)
+def test_the_dsn_is_accepted_on_either_side_of_reconcile(argv, stub_connect, stub_reconciler):
+    assert cli.main(argv) == 0
+    assert stub_connect == ["postgresql:///scratch"]

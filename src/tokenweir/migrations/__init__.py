@@ -426,11 +426,23 @@ def _check_applied(
     # caller that most needs to hear it was the one guaranteed not to.
     adopted = sorted(v for v, checksum in applied.items() if checksum is None)
     if adopted:
+        # The second sentence is the one that matters, and it was missing until
+        # TOKWEIR-10. "Treated as applied" is a statement about the *record*, and
+        # the record is exactly what cannot be trusted here: these rows were
+        # written by another tool, about migrations this library did not run, and
+        # nothing has compared them to what the database actually contains. A
+        # warning that stopped at the first sentence read as reassurance — it told
+        # an operator their adopted database was fine, at the one moment tokenweir
+        # knows it has no idea whether it is.
         _logger.warning(
             "tokenweir: migration version(s) %s were applied without a recorded "
             "checksum and cannot be verified against the shipped files; they are "
             "treated as applied. This is expected the first time tokenweir takes "
-            "over a schema the AI Gateway migrated.",
+            "over a schema the AI Gateway migrated — but 'applied' here means "
+            "'recorded as applied by something else'. Nothing has checked that the "
+            "objects match what tokenweir's migrations produce, and where they do "
+            "not, every migration in this set is an idempotent no-op that will not "
+            "fix them. Run `python -m tokenweir.migrations reconcile` to find out.",
             adopted,
         )
 

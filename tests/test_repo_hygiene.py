@@ -326,3 +326,63 @@ def test_generated_coverage_artifacts_do_not_dirty_the_tree(tmp_path):
         for directory in created_dirs:
             if not any(directory.iterdir()):
                 directory.rmdir()
+
+
+# --- What the README must not stop saying (TOKWEIR-10) ------------------------
+
+
+def test_the_readme_documents_reconciling_a_mismatched_database():
+    """FR-026. Adoption is not the end of the job, and the README used to imply it
+    was — "Nothing is re-applied and nothing is dropped … What the runner does from
+    then on is ordinary" is true and, read by an operator pointing `apply` at the
+    live gateway database, wrong: every migration is an idempotent no-op against
+    objects that already exist, so the run succeeds and changes nothing.
+
+    Asserted rather than left to review because this repository already treats
+    README content as testable (`test_optional_drivers.py`), and because the
+    section is the only place an operator is told the command exists.
+    """
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "Reconciling a database that does not match" in readme
+    assert "python -m tokenweir.migrations reconcile" in readme
+    for claim in (
+        # The two classifications, which are the whole contract of the plan.
+        "AUTOMATIC",
+        "MANUAL",
+        # That planning is the default and the safe order is plan-first.
+        "restored dump",
+        # SC-006: the residual this branch could not close. The legacy shape the
+        # suite reconciles against is a reconstruction, and an operator about to
+        # run this against production is owed that in the place they will read it.
+        "LEGACY_SQL",
+        "ai_gateway_metrics",
+    ):
+        assert claim in readme, f"README no longer says {claim!r}"
+
+
+def test_the_readme_names_the_ways_a_reconciled_database_differs():
+    """A reconciled database is not byte-identical to a fresh one, in **four** ways
+    that are decisions rather than defects. Each is named here because each was
+    found by a review reading the code rather than the docs — `BIGSERIAL` in the
+    story, the kept gateway columns in FR-009, the column ordering that a test
+    docstring claimed did not exist, and the surviving index and constraint names
+    that the docstring's replacement then miscounted the same way."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    # Bounded at the next heading. Splitting on the opening sentence alone ran the
+    # "section" to end of file, so `grants` — which occurs three more times in the
+    # paragraphs after it — stayed green with the whole bullet list deleted. An
+    # anchor satisfied by unrelated text is not an anchor.
+    section = readme.split("A reconciled database is not identical to a fresh one")[-1]
+    section = section.split("\n#")[0]
+
+    # Anchors, not prose. Following the rule `tests/conftest.py`'s
+    # `OptionalDriver.anchors` established for the same reason (TOKWEIR-31): a check
+    # against whole English sentences fails on a reword, which trains the next
+    # person to delete the check rather than keep the claim. Each of these is an
+    # identifier the claim is *about*, and none survives a reword that drops the
+    # deviation it names — including the fourth, which had no anchor at all until
+    # review 4 counted them.
+    for anchor in ("BIGSERIAL", "populate", "order", "matched by what they"):
+        assert anchor in section, f"README no longer names {anchor!r}"

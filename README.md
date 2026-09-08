@@ -525,6 +525,10 @@ python -m tokenweir.migrations apply --dsn postgresql:///gateway
 python -m tokenweir.migrations status --verify-checksums
 ```
 
+On a database somebody else migrated — the AI Gateway's, which is the first one
+this was ever pointed at — `apply` is not enough on its own and succeeds anyway.
+See [Reconciling a database that does not match](#reconciling-a-database-that-does-not-match).
+
 Connection options are accepted on **either side** of the subcommand, and each
 falls back to an environment variable, so a deploy script can set them once:
 
@@ -535,7 +539,10 @@ falls back to an environment variable, so a deploy script can set them once:
 | `--verbose` | — | log each migration as it is applied |
 
 An explicit flag beats the environment. `status` also takes `--verify-checksums`,
-which is the only way to be *told* about a drifted database rather than shown one.
+which is the only way to be *told* about a drifted database rather than shown one;
+`apply` takes `--allow-destructive` and `--no-advisory-lock`; and `reconcile` takes
+`--apply` and `--baseline-effective-from`, both described
+[below](#reconciling-a-database-that-does-not-match).
 
 Six forward-only migrations ship **inside the package** — unlike
 [`schema/usage-record.v1.json`](#versioning), which is a repository artifact, these
@@ -590,6 +597,106 @@ somebody else ran would be a claim this library cannot make.
 
 Nothing is re-applied and nothing is dropped. What the runner does from then on is
 ordinary: new migrations get real checksums, and drift detection applies to those.
+
+**Adoption is not the end of the job, and this is the part to read twice.** Those
+adopted rows say six migrations were applied. They are the *gateway's* rows, about
+the gateway's migrations, and nothing has compared them to what the database
+actually contains — the schema here was redesigned during the extraction, not
+copied, so the two are known to differ. Every migration in this set is
+`CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE VIEW`, which means that against
+objects that already exist they are **no-ops by construction**. Point `apply` at
+such a database and it succeeds, changes nothing, reports `pending: (none)` — and
+leaves you with a `gateway_usage` that has no `schema_version` column, which the
+writer names in every `INSERT`. The first batch fails and nothing before it said a
+word.
+
+That is what `reconcile` is for.
+
+#### Reconciling a database that does not match
+
+```bash
+python -m tokenweir.migrations reconcile --dsn "$DSN"            # plans; changes nothing
+python -m tokenweir.migrations reconcile --dsn "$DSN" --apply \
+    --baseline-effective-from 2024-01-01
+```
+
+`reconcile` ignores `schema_migrations` entirely and compares the database's
+**actual catalog contents** against the schema tokenweir's migrations produce —
+which it obtains by building that schema in a scratch schema on the connection and
+rolling it back, so there is no second description of the schema to go stale. Every
+difference is classified as one of two things and there is no third:
+
+| | |
+|---|---|
+| `AUTOMATIC` | tokenweir can resolve it with no data loss and no decision |
+| `MANUAL` | a human must decide; **nothing at all is applied while one is outstanding** |
+
+Run it against a **restored dump of the database first**, read the plan, and only
+then point it at production. Planning is read-only — that is what makes the safe
+order the easy one — and `--apply` is the operator review, the same way
+`--allow-destructive` is on `apply`.
+
+Three things it will not do:
+
+- **It never drops a column, a table or a row.** A column the gateway has and
+  tokenweir does not is the gateway's data: it is reported, kept, and left alone,
+  and tokenweir's writer will not populate it. The only `DROP` `reconcile` emits
+  that removes a **relation** is of the rollup *view* — and even that becomes a
+  decision the moment anything depends on it. (It emits others that remove nothing
+  stored: `DROP DEFAULT` after a back-fill, and `DROP CONSTRAINT` on the rate
+  card's old primary key.)
+- **It will not date your rate card for you.** `model_pricing_rates` moves from
+  current-valued `(model, pricing_mode)` to effective-dated `(model,
+  effective_from)`, and back-filling the existing rows needs a baseline date that
+  decides which historical usage those rates are taken to have covered. There is no
+  default: `--baseline-effective-from` is required, and `-infinity` is accepted and
+  means "these were always the rates" — write it as
+  `--baseline-effective-from=-infinity`, with the equals sign, or argparse reads the
+  leading dash as an option. Positive `infinity` is **refused**: it is in force on no
+  day that has happened, so every existing row would quietly stop pricing. If two
+  rows share a model — the old key
+  allowed one per pricing mode, the new schema has no `pricing_mode` — it refuses
+  and names them, because one of those rows has nowhere to go and choosing is a
+  decision about money.
+- **It will not half-finish.** The whole plan runs in one transaction, and a single
+  `MANUAL` discrepancy blocks the `AUTOMATIC` ones too. A partly reconciled database
+  reports itself done and is not.
+
+Re-running it is a no-op, so it is safe to leave in a deploy script — though the
+plan-first order above is the one to use the first time.
+
+**A reconciled database is not identical to a fresh one, in four named ways**, and
+none of them is a defect:
+
+- `gateway_usage.id` stays `BIGSERIAL` rather than becoming `GENERATED ALWAYS AS
+  IDENTITY`. Converting it is a full table rewrite for a property that only matters
+  if rows are ever rebuilt — where restoring the old ids needs `OVERRIDING SYSTEM
+  VALUE` and a sequence reset anyway.
+- Columns the gateway owns are still there, and tokenweir's writer will not
+  populate them.
+- Added columns land at the end of the table rather than in the migration's order.
+  Column *position* is not something anything here reads, and reordering would mean
+  rewriting the table.
+- Indexes and constraints the gateway named itself keep those names. Both are
+  matched by what they *do* — an index by its shape, a constraint by its definition
+  — so one already doing tokenweir's job under another name satisfies the
+  requirement and is left alone. Creating a duplicate beside it would cost write
+  throughput to serve nothing.
+
+`reconcile` also does not re-issue grants. Dropping and recreating the rollup view
+discards its SELECT grants, and `--reader-role` does not reach it — the grant lives
+in migration 005, which reconcile executes without a reader role set. The plan names
+the roles that will need re-granting; the statement is in "Granting a reader role
+later" above.
+
+**One limit, stated because you are about to run this against a real database.**
+tokenweir's own migrations were reconstructed during the extraction rather than
+copied from the gateway, and the legacy shape the test suite reconciles against is
+likewise a reconstruction — `tests/test_reconcile.py`'s `LEGACY_SQL`, which is in
+one place precisely so it can be corrected once. **Nothing here has been run
+against a dump of the live `ai_gateway_metrics`.** That comparison is still yours to
+do, and it is why `reconcile` introspects rather than assumes: a shape it has not
+seen produces a refusal it names, not a reconciliation that guesses.
 
 #### Granting a reader role later
 
