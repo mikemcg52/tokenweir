@@ -655,8 +655,13 @@ env.update(attribution_env(
 the caller does not have. That is the load-bearing part: a block that omitted what it
 had nothing to say about would leave the previous iteration's phase standing during the
 next one, and the resulting record would be well-formed, plausible and wrong. A blank
-issue key, a blank stream id, a non-positive occurrence on a known kind (`review-0`,
-`0th fix`) or an unrecognized pricing mode raises instead of being exported — the hook tolerates such values because it may not
+issue key, a blank stream id, a blank phase, a non-positive occurrence on a known kind
+(`review-0`, `review 0`, `0th fix`, `review -1`) or an unrecognized pricing mode raises
+instead of being exported. Surrounding whitespace on the issue key and stream id is
+stripped rather than exported, since `' TOKWEIR-8 '` and `'TOKWEIR-8'` are one issue to
+a reader and two rows to anything grouping by the column. A phase the taxonomy does not
+*recognize* is not in that list — `deploy` passes through, because the lifecycle is
+MADO's to extend — the hook tolerates such values because it may not
 fail a session, while a producer is a program with a bug worth surfacing.
 
 So the orchestrator's obligation is: **export the whole block, on every iteration,

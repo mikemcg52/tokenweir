@@ -396,7 +396,22 @@ def _collapse_for_test(value: str) -> str:
     return " ".join(value.replace("_", " ").replace("#", " ").split())
 
 
-@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix", "fix-0"])
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "review-0",
+        "review 0",
+        "0th fix",
+        "fix-0",
+        # Review 2, Med-1: the signed spellings reached neither guard. `f"{kind} {n}"`
+        # with a counter running backwards is the same producer bug as `n == 0`, and
+        # the spec makes no distinction between the two — so neither does the parser.
+        "review -1",
+        "fix -0",
+        "review - 3",
+        "review--2",
+    ],
+)
 def test_the_block_rejects_a_kind_with_an_impossible_occurrence(phase):
     """FR-012, review 1 High-1. The spec's Edge Cases: "the label is rejected at the
     producer and left as written at the consumer", and the README promises the same to
@@ -409,7 +424,7 @@ def test_the_block_rejects_a_kind_with_an_impossible_occurrence(phase):
         attribution_env(issue_key="TOKWEIR-8", phase=phase)
 
 
-@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix"])
+@pytest.mark.parametrize("phase", ["review-0", "review 0", "0th fix", "review -1", "fix -0"])
 def test_the_consumer_keeps_what_the_producer_refuses(phase):
     """The other half of the same rule, asserted alongside it so a later edit that
     "made them consistent" would have to take one of the two properties away in plain
@@ -419,6 +434,19 @@ def test_the_consumer_keeps_what_the_producer_refuses(phase):
     assert not is_canonical_phase(normalize_phase(phase))
 
 
+@pytest.mark.parametrize("phase", ["deploy -1", "triage 0", "review +1"])
+def test_the_block_passes_a_signed_occurrence_on_an_unknown_kind_through(phase):
+    """The bound on the rule above. A sign only makes a phase a *producer* bug when the
+    kind is one the taxonomy knows — `deploy -1` is a phase this library has not met,
+    spelled however its own orchestrator spells it, and refusing it would be this
+    library legislating for a lifecycle it does not define.
+
+    `review +1` is in this list deliberately: it is a positive occurrence in a spelling
+    nobody uses, and FR-012 is about occurrences that cannot exist, not about spellings
+    we would rather they had not chosen."""
+    assert attribution_env(issue_key="TOKWEIR-8", phase=phase)[ATTRIBUTION_ENV["phase"]]
+
+
 @pytest.mark.parametrize("phase", [7, 7.0, ["review"], object()])
 def test_the_block_rejects_a_phase_that_is_not_a_phase(phase):
     """Review 1, Low-4. The documented failure is `ValueError`; without a guard this
@@ -426,6 +454,24 @@ def test_the_block_rejects_a_phase_that_is_not_a_phase(phase):
     about phases."""
     with pytest.raises(ValueError, match="phase"):
         attribution_env(issue_key="TOKWEIR-8", phase=phase)
+
+
+def test_the_contract_mapping_cannot_be_edited_by_a_caller():
+    """Review 2, Low-2. The names are re-exported at package level, so a plain dict
+    would be one assignment away from redirecting producer *and* consumer together —
+    SC-005's drift arriving through the mechanism meant to prevent it."""
+    with pytest.raises(TypeError):
+        ATTRIBUTION_ENV["phase"] = "SOMETHING_ELSE"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("field", ["issue_key", "stream_id"])
+def test_the_block_strips_surrounding_whitespace(field):
+    """Review 2, Low-3 — behaviour that existed but was neither documented nor tested.
+    `' TOKWEIR-8 '` and `'TOKWEIR-8'` are the same issue to a reader and two different
+    strings to anything grouping by the column: the duplicate-lane problem the phase
+    taxonomy exists to solve, one field over."""
+    kwargs = {"issue_key": "TOKWEIR-8", field: "  spaced  "}
+    assert attribution_env(**kwargs)[ATTRIBUTION_ENV[field]] == "spaced"
 
 
 def test_the_hook_resolves_the_variable_names_from_the_contract():

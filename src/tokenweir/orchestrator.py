@@ -54,7 +54,10 @@ metering — so an unrecognized phase is carried through as written rather than 
 
 **Nothing here imports the hook**, and nothing here imports outside the standard library
 except :mod:`tokenweir.contract` — itself stdlib-only — for the one enum both ends must
-agree on. The
+agree on. That is a property of *this module*: ``import tokenweir.orchestrator`` still
+initializes the package, which re-exports these names alongside the emitter and the
+sinks, so the guarantee an adopter gets is "no transport driver and no hook", not "these
+two modules alone" (review 2, Low-5). The
 orchestrator runs in another codebase and another cluster namespace; it should be able to
 depend on this contract without inheriting a capture path or a transport driver. The
 dependency runs one way — :mod:`tokenweir.claude_code` imports this module, never the
@@ -66,6 +69,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Mapping, Optional, Union
 
 from tokenweir.contract import PricingMode
@@ -145,12 +149,19 @@ _KIND_BY_WORD: dict[str, PhaseKind] = {
 #: than an error at either. A test asserts the hook spells none of these itself; until
 #: review 1 the hook hard-coded all four while this comment claimed otherwise, and two
 #: hard-codings agree right up until someone edits one of them.
-ATTRIBUTION_ENV: Mapping[str, str] = {
-    "issue_key": "MADO_ISSUE_KEY",
-    "phase": "MADO_PHASE",
-    "stream_id": "MADO_STREAM_ID",
-    "pricing_mode": "MADO_PRICING_MODE",
-}
+#:
+#: Read-only, and for the same reason it exists: a plain dict re-exported at package
+#: level is one `tokenweir.ATTRIBUTION_ENV["phase"] = ...` away from redirecting both
+#: ends at once — SC-005's drift, arriving through the mechanism meant to prevent it.
+#: `contract.py` already keeps its equivalent constants immutable (review 2, Low-2).
+ATTRIBUTION_ENV: Mapping[str, str] = MappingProxyType(
+    {
+        "issue_key": "MADO_ISSUE_KEY",
+        "phase": "MADO_PHASE",
+        "stream_id": "MADO_STREAM_ID",
+        "pricing_mode": "MADO_PRICING_MODE",
+    }
+)
 
 #: A canonical label: a kind, optionally followed by ``-`` and a positive occurrence.
 #: Anchored, and ``[1-9]\d*`` rather than ``\d+`` so ``review-0`` and ``review-01`` are
@@ -171,6 +182,14 @@ _CANONICAL_RE = re.compile(
 #: happened (review 1, Med-2).
 _LEADING_ORDINAL_RE = re.compile(r"^(\d+)(st|nd|rd|th)\s+(.*)$", re.IGNORECASE)
 _TRAILING_NUMBER_RE = re.compile(r"^(.*?)(?:-| +)(\d+)$")
+
+#: The same shape carrying a minus sign — ``review -1``, ``fix -0``, ``review - 3``.
+#: Matched **only** to be refused: a signed occurrence is never a label, but on a known
+#: kind it is not an unknown phase either. It is what ``f"{kind} {n}"`` produces when a
+#: round counter runs backwards, which is the producer bug FR-012 exists to catch, and
+#: review 2 found it slipping past the guard because the negative spelling never
+#: reached :data:`_TRAILING_NUMBER_RE`'s kind lookup at all.
+_NEGATIVE_TRAILING_RE = re.compile(r"^(.*?)(?:-| +)- ?(\d+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +285,13 @@ def _parse_phase(lowered: str) -> _ParsedPhase:
             if number < 1:
                 return _ParsedPhase(kind=kind, bad_occurrence=True)
             return _ParsedPhase(kind=kind, occurrence=number)
+
+    negative = _NEGATIVE_TRAILING_RE.match(lowered)
+    if negative is not None and _KIND_BY_WORD.get(negative.group(1)) is not None:
+        # A kind with a negative occurrence, reported the same way `review-0` is: the
+        # producer raises, the consumer keeps the string as written. One guard, read
+        # two ways, rather than a second check bolted onto `attribution_env`.
+        return _ParsedPhase(kind=_KIND_BY_WORD[negative.group(1)], bad_occurrence=True)
 
     return _ParsedPhase()
 
@@ -373,6 +399,11 @@ def _required_text(name: str, value: Optional[str]) -> str:
     that was computed and came out empty, and exporting it would attribute a record to
     whitespace while looking, at every later stage, exactly like a record that was
     attributed properly.
+
+    Surrounding whitespace is stripped rather than exported: ``' TOKWEIR-8 '`` and
+    ``'TOKWEIR-8'`` are the same issue to everyone who reads the record and two
+    different strings to anything that groups by it — the duplicate-lane problem the
+    phase taxonomy exists to solve, one column over.
     """
     if value is None:
         return ""

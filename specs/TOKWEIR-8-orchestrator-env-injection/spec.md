@@ -369,3 +369,33 @@ TOKWEIR-8 with a `Relates` link. It is not a duplicate of MADO-235, which covers
 `X-App-ID` / `X-Workload` **header** path for API-metered capture at the gateway — a different
 mechanism for the same attribution. TOKWEIR-8 should not be closed as delivering end-to-end
 attribution while MADO-419 is open.
+
+### Review 2 (2026-09-08) — the same rule, the spelling it did not cover
+
+Review 1's fix for `review -3` made the trailing-number parser refuse a sign, which was right
+for the consumer and left a hole at the producer: `review -1` and `fix -0` now matched no shape
+at all, so they never reached the `bad_occurrence` branch and were exported — while FR-012, the
+Edge Cases and the README all said a non-positive occurrence on a known kind raises. The two
+fixes had been made one round apart and had not been read against each other.
+
+The reviewer offered both resolutions: narrow the promise, or widen the guard. The guard was
+widened, because the two spellings come from the same producer bug — `f"{kind} {n}"` with a
+counter running backwards — and a rule that catches `n == 0` but not `n == -1` is not a rule
+anyone can hold in their head. It is still **one** guard: `_parse_phase` reports the case, the
+producer raises on it and the consumer keeps the string, exactly as for `review-0`.
+
+The bound is now tested from the other side too: a sign only makes a phase a producer bug when
+the kind is one the taxonomy knows. `deploy -1` passes through, because the lifecycle is MADO's
+to extend and this library does not legislate for it.
+
+Also from review 2: `ATTRIBUTION_ENV` is a `MappingProxyType` (a mutable dict re-exported at
+package level is one assignment from redirecting both ends at once — SC-005's drift arriving
+through the mechanism meant to prevent it); the whitespace strip on the issue key and stream id
+is documented and tested rather than merely happening; `tasks.md` is ticked, per the convention
+every other spec in this repo follows; and the module says plainly that its stdlib-only guarantee
+is about *this module*, since importing it still initializes the package.
+
+The reviewer's second Med is a status finding rather than a defect, and this round discharged it
+where it will actually be read: a comment on TOKWEIR-8 itself, naming what the branch delivers,
+what it does not, and MADO-419 as the other half. It is not enough for the deferral to be true
+and documented in a repo — the person closing the issue is looking at Jira.
