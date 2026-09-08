@@ -14,6 +14,14 @@ keywords = ["usage", "metering", "cost", "observability", "llm"]
 # Core stays dependency-light by contract (ADR-0001 Pillar 2): no transport libs here.
 dependencies = []
 
+# The subscription capture adapter's entry point (TOKWEIR-7). Claude Code's
+# `settings.json` names a command, so the hook has to *be* one — and a console
+# script is the only form that stays correct across a venv, a pipx install and a
+# wheel, where a hard-coded path to a checkout does not. `python -m
+# tokenweir.claude_code` is the same entry point for anyone who prefers it.
+[project.scripts]
+tokenweir-claude-code-hook = "tokenweir.claude_code:main"
+
 [project.optional-dependencies]
 # Transport adapters ship as optional extras so the core never compiles in pika.
 amqp = ["pika>=1.3"]

@@ -113,7 +113,7 @@ Ownership of `gateway_usage` and its forward-only migrations (001–006) moves i
 2. [x] File the extraction epic + stories in the new project (contract, emitter client, writer+migrations, transport adapters, subscription hook adapter).
 3. [ ] Rewrite MADO-216 story 1: target the cloud-edge / `tokenweir` consumer instead of assuming the homelab gateway; add the reconciliation note and the AIGWAY-003 dependency.
 4. [ ] Refactor AI Gateway to consume `tokenweir` (move schema/migrations out; pin a version).
-5. [ ] Build the subscription capture adapter: `Stop` hook → transcript delta → `tokenweir` emitter; orchestrator injects `MADO_*` env per iteration.
+5. [x] Build the subscription capture adapter: `Stop` hook → transcript delta → `tokenweir` emitter; orchestrator injects `MADO_*` env per iteration — landed as `tokenweir.claude_code` (TOKWEIR-7). The orchestrator half is MADO's to inject; the hook reads whatever of it is present.
 6. [ ] Verify subscription vs API-key transcript token parity (the `Unverified` check) before trusting Max numbers.
 7. [ ] Defer: %-of-limit capacity model; OSS license selection.
 
@@ -131,7 +131,15 @@ checked, and these are the commits that make it true rather than stated:
   fire-and-forget contract; `DirectSink`, the broker-less path this ADR names as
   Pillar 2's consequence; and `tokenweir.amqp`, the homelab's transport, under the
   `tokenweir[amqp]` extra with no `pika` in the core.
+- **TOKWEIR-7** — `tokenweir.claude_code`, the subscription capture adapter: a
+  deterministic `Stop` hook that turns a transcript delta into one record per turn
+  under `pricing_mode=subscription`. It is a producer only — it consumes the emit
+  side above and changes nothing in it — and it carries no third-party import, so
+  Pillar 2's dependency-light core still holds with it in the package.
 
-Still outstanding on the consumer side: item 4 (the gateway consumes `tokenweir`)
-and item 5 (the subscription `Stop`-hook adapter). Both now have a client to adopt
-rather than an interface to re-implement.
+Still outstanding on the consumer side: item 4 (the gateway consumes `tokenweir`).
+Item 6 — the `Unverified` parity check — is **unaffected by TOKWEIR-7 and still
+open**: the hook faithfully reports what a Max transcript says, which is a different
+claim from those numbers agreeing with an API-key session's on the same model and
+context. Pillar 4 says to do that diff before trusting subscription figures, and
+shipping the capture path does not do it.

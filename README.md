@@ -510,6 +510,150 @@ deployment that needs durability across a store outage wants the broker path.
 Ownership follows `PostgresSource`'s rule — a source passed in stays yours and
 `close()` leaves it open; pass `owns_source=True` to hand it over.
 
+## Subscription capture — the Claude Code Stop hook
+
+Everything above assumes a producer that can *see* the call it is metering. Under a
+**Claude Max subscription** nothing can: the auth is OAuth, there is no
+base-URL-swappable API path, and no proxy is ever in the way. ADR-0001 Pillar 4's
+answer is to capture from Claude Code's own record instead, with a **deterministic
+hook** — not an LLM skill, which would burn tokens into the very window being
+measured.
+
+`tokenweir.claude_code` is that hook. On each `Stop` event it reads the session
+transcript, works out how many tokens the turn that just ended consumed, and emits
+one record with `pricing_mode=subscription`. It is a producer and nothing more: the
+guarded seam, the buffered client, the transports and the store are the same ones
+the rest of this README describes.
+
+It imports **no third-party package**, so a bare `pip install tokenweir` can run it.
+
+### Install it
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tokenweir-claude-code-hook",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`python -m tokenweir.claude_code` is the same entry point if you would rather not
+rely on the console script being on `PATH`.
+
+The hook **always exits 0** and never writes to stdout. That is not politeness, it is
+the contract: ADR-0001 requires non-blocking capture and explicitly forbids `exit 2`
+(Claude Code's *blocking* status), because no failure of a metering adapter is worth
+stopping a session over. `"async": true` is safe to add if your Claude Code supports
+it; the hook does not need it, because it bounds its own runtime.
+
+### Where records go
+
+| Variable | Effect |
+|---|---|
+| `TOKENWEIR_AMQP_URL` | Publish over AMQP (the homelab path). Needs `tokenweir[amqp]`. |
+| `TOKENWEIR_DSN` | Write straight to Postgres (the broker-less path). Needs `tokenweir[postgres]`. |
+| *neither* | `NullSink` — the hook runs and discards. An unconfigured hook is a no-op, not an error. |
+
+Neither driver is imported unless the matching variable is set, so an unconfigured
+hook touches no transport library at all. A sink that cannot be *constructed* — a bad
+URL, a missing driver, a broker that is not there — degrades to the no-op sink with a
+logged note rather than failing the hook.
+
+### Attribution, and where it comes from
+
+Hooks inherit Claude Code's process environment, so MADO's orchestrator exports the
+context per iteration and the hook reads it onto the record. **Nothing is read from
+the transcript's content** — attribution comes from the orchestrator, not from the
+model.
+
+| Variable | Record field | Meaning |
+|---|---|---|
+| `MADO_ISSUE_KEY` | `workload` | The issue being worked. |
+| `MADO_PHASE` | `queue` | The phase of the run. See the note below. |
+| `MADO_STREAM_ID` | `parent_request_id` | The stream, so its turns roll up. |
+| `MADO_PRICING_MODE` | `pricing_mode` | Overrides the default; anything unrecognized falls back to `subscription`. |
+
+Unset and **blank** are treated alike: the field is left `None`, never `''`. An
+orchestrator exporting `MADO_PHASE=""` is saying "no phase", and a blank string in the
+column would say the field was populated.
+
+> **`queue` carrying the phase is a documented compromise, not a natural fit.** The v1
+> contract has no phase field, and adding one is a `SCHEMA_VERSION` bump plus a
+> migration plus every consumer — Pillar 5 work. `queue` is nullable, unconstrained,
+> and the nearest available sense of "which lane did this go through". It is written
+> down here, in the module, and in the story's spec so a future v2 can move it
+> deliberately rather than find it.
+
+### Everything else it reads
+
+| Variable | Effect |
+|---|---|
+| `TOKENWEIR_APP_ID` | Overrides `app_id` (default `claude-code`). |
+| `TOKENWEIR_ENDPOINT` | Overrides `endpoint` (default `claude-code/stop-hook`). |
+| `TOKENWEIR_HOOK_STATE_DIR` | Where the per-transcript baseline is kept (default under `$XDG_STATE_HOME`). |
+| `TOKENWEIR_HOOK_TIMEOUT` | The hook's own time budget in seconds (default `10`). |
+| `TOKENWEIR_HOOK_DEBUG` | Also write diagnostics to stderr. |
+
+`endpoint` deliberately is **not** `/v1/messages`: a turn is an aggregate of several
+API calls, and labelling the aggregate with a single-call endpoint would let a report
+blend the two under one key.
+
+### How the delta is computed, and why it is a baseline
+
+A transcript is append-only and holds the **whole session**. The turn's number is the
+difference between the transcript's current de-duplicated totals and the cumulative
+total the hook has already emitted, which it keeps in a small JSON file per transcript.
+
+Two decisions in that sentence are load-bearing:
+
+- **De-duplicated on `message.id`.** One API response can appear as several transcript
+  lines, each repeating the same `usage` object. Summing lines over-counts a turn, and
+  every line is individually well-formed, so nothing about the result looks wrong.
+- **A cumulative baseline, advanced only once the record is *delivered*.** A file
+  cursor advances whether or not the emit succeeded, which silently deletes a turn's
+  tokens forever. A cumulative baseline is self-correcting: a turn that could not be
+  delivered is merged into the next one. Late and coarse beats gone.
+
+The state file is disposable — losing it over-counts exactly one turn (the session's
+tokens land in one record) and costs nothing after that. A transcript that *regresses*
+below its baseline is taken as a replaced file: the baseline is re-anchored and nothing
+is emitted for that transition.
+
+A turn that added no new tokens emits nothing at all. A zero-token record would inflate
+the request count while adding no tokens.
+
+### Three separate guarantees that it cannot disturb a session
+
+They are separate because they fail separately:
+
+| Guarantee | Covers |
+|---|---|
+| `main` catches `Exception` and returns `0` | A bug in the hook itself. `BaseException` still propagates — a metering guard that swallowed `KeyboardInterrupt` would be the worse bug. |
+| A self-imposed `SIGALRM` budget | Nothing raises and nothing returns — a connect into a black hole. Being killed by Claude Code's own `timeout` skips the state write and is louder in the session. |
+| A bounded emitter close | A sink that accepted the record and cannot deliver it. |
+
+### What it does not do
+
+Raw counts per turn, and nothing else — matching Pillar 4's "scope now". No
+percentage-of-limit, no capacity modelling, no cost: Max tiers and weekly caps are
+volatile, and cost is derived at report time from the rate card, as everywhere else in
+this project.
+
+It also does not verify that a Max transcript's numbers agree with an API-key session's
+on the same model and context. ADR-0001 records that parity as `Unverified` and keeps it
+as its own item; this hook faithfully reports what the transcript says.
+
 ## The store — schema, migrations and the writer
 
 `tokenweir` **owns** the usage schema. That ownership moved here from the AI
