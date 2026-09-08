@@ -336,7 +336,7 @@ def test_the_block_rejects_a_pricing_mode_that_is_not_one():
         attribution_env(issue_key="TOKWEIR-8", pricing_mode="flat_rate")
 
 
-@pytest.mark.parametrize("field", ["issue_key", "stream_id"])
+@pytest.mark.parametrize("field", ["issue_key", "stream_id", "pricing_mode"])
 def test_the_block_treats_none_as_unknown_rather_than_as_an_error(field):
     """FR-013. Absent and unusable are different, and only one of them is a bug."""
     kwargs = {"issue_key": "TOKWEIR-8", field: None}
@@ -544,8 +544,17 @@ def test_the_contract_module_imports_nothing_but_the_stdlib_and_the_contract():
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            imported.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # A relative import resolves inside this package, so `from .postgres
+                # import ...` is a `tokenweir` import wearing different clothes. The
+                # first version of this check skipped every one of them — `node.level
+                # == 0` — so the criterion it names was enforced for one import style
+                # out of two, and review 5 got `from .postgres import *` past a green
+                # suite. `node.module` is empty for `from . import x`, hence the or.
+                imported.add("tokenweir." + (node.module or ""))
+            elif node.module:
+                imported.add(node.module)
 
     for module in imported:
         root = module.split(".")[0]

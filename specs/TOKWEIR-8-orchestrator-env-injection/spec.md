@@ -232,6 +232,14 @@ canonical label grammar and the per-iteration timing are stated.
   lost. The result MUST be distinguishable by the caller from a recognized label. (Reworded after
   review 3, Low-3: this said "with its whitespace normalized", which did not license the folding
   the Edge Cases describe and the code performs.)
+
+  Two bounds on "never `None`", both deliberate. A value that folds to **nothing** is empty, not
+  unrecognized, and FR-006 governs it — with FR-016's diagnostic covering the loss. And **case is
+  not folded** in a preserved value: `Deploy` stays `Deploy`. Folding separators is repairing a
+  spelling of the same word; folding case would be editing what an unknown phase is called, and
+  the further this library goes rewriting vocabulary it does not define, the less "preserved"
+  means. (Both stated after review 5, Low-1 and Med-2, which found them true of the code and
+  absent from the requirement.)
 - **FR-006**: Normalization MUST treat `None`, the empty string, a whitespace-only string and a
   string made only of folded separators (`_`, `#`) alike, returning `None` — "no phase" is not a
   label. The producer MUST reject all of the non-`None` cases by the *same* definition of empty
@@ -279,7 +287,11 @@ canonical label grammar and the per-iteration timing are stated.
   record, so a record written by an orchestrator that predates this contract still carries a
   canonical label.
 - **FR-016**: The hook MUST note a diagnostic when the phase it read is not a recognized label,
-  and MUST still emit the record carrying that phase.
+  and MUST still emit the record carrying that phase. It MUST also note one when a phase that had
+  content folded away to nothing (`MADO_PHASE=_`), where there is no phase left to carry: before
+  this story that value reached the record as `'_'`, and turning visible junk into an invisible
+  absence is a regression unless something says so. The diagnostic MUST NOT fire for an unset or
+  blank phase, which is the ordinary unattributed run. (Extended after review 5, Med-2.)
 - **FR-017**: This story MUST NOT change which record field carries which variable, nor the
   treatment of unset and blank established by TOKWEIR-7.
 
@@ -495,3 +507,37 @@ disagreement is recorded here rather than resolved by churn:
 Review 4's concrete complaint about those tests is fixed rather than argued with: they read the
 source tree, so like `_readme()` they now **skip** where there is none instead of raising
 `FileNotFoundError` in a tests-without-source install.
+
+### Review 5 (2026-09-08) — the check that was enforcing half a rule, and the drop nobody was told about
+
+**The import-isolation test was blind to relative imports.** `node.level == 0` skipped every
+`from .x import y`, so SC-006 — the criterion the spec calls "verified by reading the module's own
+imports" — was enforced for one import style out of two. The reviewer got
+`from .postgres import *` past a green suite. A relative import now resolves to its
+`tokenweir.` name and goes through the same assertion; the same mutation fails now.
+
+**A separator-only phase was being dropped silently.** Round 3 made `_` and `#` fold to nothing at
+both ends, which is right and is what FR-006 says. What it did not notice is that the *reader* then
+had a third way to end up with no phase, and unlike the other two it followed a value that had
+content: on `main`, `MADO_PHASE=_` reached the record as `'_'`. Round 3 turned visible junk into an
+invisible absence, on the only live path, with nothing logged — and the likeliest way to produce
+`_` is a template that expanded to nothing, which is the fault an operator most needs to hear
+about and least likely to spot in an empty column.
+
+Fixed both ways the reviewer offered, because they answer different questions: the hook now notes
+the fold (FR-016 extended to require it, and to require silence on the ordinary unattributed run,
+which is tested), and the README says plainly that `_`/`#` count as blank at both ends. The
+producer's refusal was already there; what was missing was the reader admitting to it.
+
+This is the round's lesson worth keeping: a change that makes two ends agree can still be a
+regression at one of them. Round 3 checked that the producer and the consumer now shared a
+definition, and did not check what the consumer had done *before*.
+
+Low findings closed with it: `pricing_mode` joins the "`None` is unknown, not an error" test table
+(FR-013's third field had no test); the README no longer claims the diagnostic names the value "as
+you exported it", since `_env` trims the ends first; and FR-005 now states that case is
+deliberately not folded in a preserved value.
+
+Review 5's remaining Med is the deferral, reported for the fifth time and confirmed adequate by
+the reviewer's own independent check of every disclosure. The only action left on it belongs to
+whoever closes TOKWEIR-8: close it on the contract, not on end-to-end attribution.

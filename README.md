@@ -637,8 +637,16 @@ and logged — the lifecycle may grow a phase before this library hears about it
 record carrying `deploy` is worth more than a record carrying nothing. Separators are
 folded in the preserved value too (`deploy_step` is kept as `deploy step`), so an
 unknown phase does not split into as many lanes as it has spellings; the log names the
-value as you exported it, so you can still find it in your own configuration. Unset and
-blank still mean "no phase" and still leave the field `None`.
+value as read — as you exported it, minus surrounding whitespace — so you can still find
+it in your own configuration. Case is left alone in a preserved value (`Deploy` stays
+`Deploy`): folding separators repairs a spelling of the same word, while folding case
+would be editing what an unknown phase is called.
+
+Unset and blank still mean "no phase" and still leave the field `None` — and so does a
+value made only of the separators that get folded (`_`, `#`, `__ ##`), at both ends: the
+builder refuses it, and the hook records no phase and **logs that it did**, since a
+template that expanded to nothing is the likeliest way to produce one and an empty column
+is the hardest place to notice it.
 
 **Writing is strict.** The producer builds the block from the contract rather than
 spelling the variable names by hand, and hears about a value it cannot use:

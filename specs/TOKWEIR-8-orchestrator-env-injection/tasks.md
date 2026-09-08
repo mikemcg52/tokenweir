@@ -84,6 +84,10 @@ sequential — the hook and the docs both depend on the new module existing.
   taxonomy actually reads; make the source-reading tests skip rather than raise where
   there is no source tree.
 
+- [x] **T022** (review 5) Teach the import-isolation test about relative imports, so
+  SC-006 is enforced for both import styles; note the separator-only fold at the hook
+  instead of dropping it silently, and document `_`/`#`-as-blank in the README.
+
 ## Explicit non-goals
 
 Not tasks, listed so their absence is a decision rather than an oversight:

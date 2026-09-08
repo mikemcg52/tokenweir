@@ -713,7 +713,20 @@ def attribution_from_env() -> dict[str, Any]:
 
     written = _env(ATTRIBUTION_ENV["phase"])
     phase = normalize_phase(written)
-    if phase is not None and not is_canonical_phase(phase):
+    if written is not None and phase is None:
+        # The value had content and folded to nothing — it was made only of the
+        # separators the taxonomy folds (`_`, `#`). That is "no phase" by the same rule
+        # the producer refuses to export it under, so the field is left unset; but it
+        # is *said*, because the likeliest way to get here is a template that expanded
+        # to nothing (`${KIND}_${N}` with neither set), and an orchestrator quietly
+        # recording no phase for every turn is exactly the failure nobody notices
+        # (review 5, Med-2). `_env` has already ruled out unset and whitespace-only,
+        # so this cannot fire on an ordinary unattributed run.
+        _note(
+            f"{ATTRIBUTION_ENV['phase']}={written!r} is made only of separators and "
+            "folds to nothing; recording no phase"
+        )
+    elif phase is not None and not is_canonical_phase(phase):
         # The value as read, not as normalized: an operator debugging this goes
         # looking for the string in their orchestrator's configuration, and
         # `'deploy step'` appears nowhere in a config that says `deploy_step`

@@ -1278,6 +1278,54 @@ def test_attribution_keeps_a_phase_outside_the_taxonomy(transcript, monkeypatch,
     )
 
 
+@pytest.mark.parametrize("value", ["_", "#", "__ ##"])
+def test_attribution_reads_a_separator_only_phase_as_no_phase(
+    transcript, monkeypatch, caplog, value
+):
+    """TOKWEIR-8 FR-006. `_` folds to nothing, so it says "no phase" in the same way
+    `""` does — and the producer refuses to export it for that reason, so the hook is
+    reading a value only a hand-stamped or mis-expanded environment produces.
+
+    It is recorded as no phase — but **said**, not swallowed (review 5, Med-2). Before
+    this story the value reached the record as `'_'`; turning visible junk into an
+    invisible absence is a regression unless something announces it, and the likeliest
+    way to produce `_` is a template that expanded to nothing (`${KIND}_${N}` with
+    neither set), which is precisely the fault an operator needs to hear about rather
+    than read off an empty column."""
+    monkeypatch.setenv("MADO_PHASE", value)
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.claude_code"):
+        record = run(hook_stdin(transcript), into(sink))
+
+    assert record is not None
+    assert record.queue is None
+    assert [message for message in caplog.messages if "folds to nothing" in message]
+    assert not [message for message in caplog.messages if "taxonomy" in message]
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_attribution_says_nothing_when_no_phase_was_exported(
+    transcript, monkeypatch, caplog, value
+):
+    """The bound on the note above. An unattributed run — a laptop, a stream with no
+    orchestrator — is the common case, and a warning on every turn of it is a warning
+    an operator learns to filter out, taking the separator-only signal with it."""
+    if value is None:
+        monkeypatch.delenv("MADO_PHASE", raising=False)
+    else:
+        monkeypatch.setenv("MADO_PHASE", value)
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.claude_code"):
+        record = run(hook_stdin(transcript), into(sink))
+
+    assert record is not None and record.queue is None
+    assert not caplog.messages
+
+
 def test_attribution_does_not_warn_about_a_phase_it_recognizes(
     transcript, monkeypatch, caplog
 ):
