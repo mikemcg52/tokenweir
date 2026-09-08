@@ -280,14 +280,23 @@ capability is what is being built; the documentation makes it reachable.
 - **FR-016**: The hook MUST write the state file atomically, so that an interrupted write cannot
   leave a partial file in its place.
 - **FR-017**: A state directory that cannot be created or written MUST NOT prevent the record from
-  being emitted.
+  being emitted, and each failure MUST be logged. The **cost** is that the turn is re-reported
+  until the baseline can be stored: a single failure over-counts one turn, and a persistent one
+  re-reports the whole session every turn. That cost MUST be documented accurately wherever it is
+  described — an understated one ("it costs one turn") reads as a bounded loss and is not.
 
 **The record**
 
 - **FR-018**: Every emitted record MUST carry `pricing_mode=subscription` by default, overridable
   only to another mode the contract recognizes; an unrecognized `MADO_PRICING_MODE` MUST fall back
   to `subscription` rather than dropping the record.
-- **FR-019**: Every emitted record MUST carry a `request_id` that is unique to the turn.
+- **FR-019**: Every emitted record MUST carry a non-blank `request_id` that identifies the turn:
+  two **distinct** turns MUST NOT share one. It MUST be **stable** rather than fresh per
+  emission — if the same turn is re-reported (because its baseline could not be stored), the
+  re-report MUST carry the same id, so that a duplicate is recognizable as a duplicate rather
+  than appearing as a new turn. The store deliberately puts no unique constraint on the column
+  (`001_gateway_usage.sql`) because it is an append-only log expecting at-least-once delivery;
+  this requirement is what makes that tolerance usable.
 - **FR-020**: The record MUST carry `model` taken from the most recent counted assistant message,
   and MUST fall back to a non-blank placeholder when the transcript names none — a record the
   contract would refuse is worse than one whose model is unknown.
@@ -393,6 +402,14 @@ Recorded because the story did not specify them and a reasonable default was cho
   an optional field.
 - **State lives under a cache directory keyed by transcript path**, honouring an explicit override
   environment variable. It is disposable: losing it costs one over-counted turn, never a lost one.
+- **A bounded flush can produce a duplicate, and the run errs that way on purpose.** The baseline
+  advances only if the emitter reports the record delivered within `close_timeout`. A sink that is
+  still publishing when that expires, and then *succeeds*, gets the record while the baseline stays
+  put — so the next turn re-reports it. The window is the close timeout (3 seconds by default) and
+  it is narrow, but it is not zero. Erring the other way — assuming success on a timeout — would
+  turn the same window into a silent **loss**, and this design's whole premise is that a duplicate
+  is recoverable where a loss is not: duplicates share a `request_id` (FR-019) and a report can
+  collapse them, while a turn that vanished leaves nothing behind to notice.
 - **The `Unverified` parity check stands.** ADR-0001 records that subscription-vs-API-key token
   parity is unconfirmed. This story captures what the transcript reports; it does not verify that
   the transcript's numbers match an API-key session's, which the ADR keeps as its own item.

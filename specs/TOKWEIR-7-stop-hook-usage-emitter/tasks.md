@@ -133,9 +133,11 @@ so the entry point has nothing left to invent.
       does not verify the transcript against an API-key session.
 - [x] **T032 [P]** Test: importing `tokenweir.claude_code` loads neither `pika` nor `psycopg`
       (FR-031), matching the existing dependency-light guard's approach.
-- [x] **T033 [P]** Test: the console-script entry point declared in `pyproject.toml` resolves to a
-      callable (FR-032), and the README documents every `TOKENWEIR_`/`MADO_` variable the module
-      reads — a guard that fails when the code grows a knob the docs do not mention (FR-033).
+- [x] **T033 [P]** Test: the console-script entry point is declared **and resolves to a callable**
+      through the installed distribution's metadata (FR-032) — a declaration that is merely present
+      in `pyproject.toml` is not the same claim — and the README documents every environment
+      variable the module reads, a guard that fails when the code grows a knob the docs do not
+      mention (FR-033).
 
 ---
 

@@ -601,7 +601,8 @@ column would say the field was populated.
 |---|---|
 | `TOKENWEIR_APP_ID` | Overrides `app_id` (default `claude-code`). |
 | `TOKENWEIR_ENDPOINT` | Overrides `endpoint` (default `claude-code/stop-hook`). |
-| `TOKENWEIR_HOOK_STATE_DIR` | Where the per-transcript baseline is kept (default under `$XDG_STATE_HOME`). |
+| `TOKENWEIR_HOOK_STATE_DIR` | Where the per-transcript baseline is kept. |
+| `XDG_STATE_HOME` | Base for the default state directory when the above is unset (falls back to `~/.local/state`). |
 | `TOKENWEIR_HOOK_TIMEOUT` | The hook's own time budget in seconds (default `10`). |
 | `TOKENWEIR_HOOK_DEBUG` | Also write diagnostics to stderr. |
 
@@ -625,10 +626,27 @@ Two decisions in that sentence are load-bearing:
   tokens forever. A cumulative baseline is self-correcting: a turn that could not be
   delivered is merged into the next one. Late and coarse beats gone.
 
-The state file is disposable — losing it over-counts exactly one turn (the session's
-tokens land in one record) and costs nothing after that. A transcript that *regresses*
-below its baseline is taken as a replaced file: the baseline is re-anchored and nothing
-is emitted for that transition.
+Losing the state file **once** over-counts exactly one turn — the session's tokens land
+in one record — and everything after it is correct again. A state directory that is
+**persistently** unwritable is a different matter: the hook still emits (it must; a
+metering cache is not a reason to lose a turn), but it re-reports the whole session on
+every turn for as long as the condition lasts.
+
+Those re-reports are exact duplicates and they carry the **same `request_id`**, because
+they describe the same turn. That is deliberate: a fresh id per emission would make them
+look like distinct turns and turn a visible duplicate into invisible inflation. The store
+puts no unique constraint on `request_id` precisely because it is an append-only log that
+expects at-least-once delivery, so a report can collapse them. Each failure is logged as
+well — the condition is made visible rather than harmless.
+
+The same "duplicates beat losses" rule decides one other case. The baseline advances only if
+the record is delivered within the emitter's close timeout (3 seconds by default). A sink still
+publishing when that expires, which then succeeds, gets the record while the baseline stays put,
+so the next turn re-reports it. That window is narrow but real, and erring the other way would
+convert it into a silent loss instead.
+
+A transcript that *regresses* below its baseline is taken as a replaced file: the baseline
+is re-anchored and nothing is emitted for that transition.
 
 A turn that added no new tokens emits nothing at all. A zero-token record would inflate
 the request count while adding no tokens.

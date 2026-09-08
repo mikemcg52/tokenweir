@@ -128,7 +128,7 @@ absorbed, which is the correct price for a case that only arises when the ground
 
 | Record field | Source | Note |
 |---|---|---|
-| `request_id` | last counted `message.id`, else `<session_id>:<last-id>`, else a uuid4 | unique per turn, and traceable back into the transcript |
+| `request_id` | last counted `message.id`, else `<session_id>:<uuid4>`, else `claude-code:<uuid4>` | identifies the turn and is traceable back into the transcript; **stable** rather than fresh per emission, so a re-report of the same turn is recognizable as a duplicate (FR-019) |
 | `app_id` | `TOKENWEIR_APP_ID`, else `claude-code` | a constant, so per-app rollups do not fragment per stream |
 | `endpoint` | `TOKENWEIR_ENDPOINT`, else `claude-code/stop-hook` | a turn is an aggregate; `/v1/messages` would blend it with single calls |
 | `model` | most recent counted message's `message.model`, else `unknown` | verbatim, per Pillar 3 |

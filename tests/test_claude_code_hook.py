@@ -129,7 +129,6 @@ def scrubbed_environment(tmp_path, monkeypatch):
     """
     for name in ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     state_dir = tmp_path / "hook-state"
     monkeypatch.setenv("TOKENWEIR_HOOK_STATE_DIR", str(state_dir))
     return state_dir
@@ -767,9 +766,12 @@ def test_never_disturbs_the_session_when_delivery_hangs(transcript):
     assert elapsed < 5, f"a hanging sink held the hook for {elapsed:.1f}s"
 
 
-@pytest.mark.skipif(
+requires_alarm = pytest.mark.skipif(
     not hasattr(__import__("signal"), "SIGALRM"), reason="POSIX alarm required"
 )
+
+
+@requires_alarm
 def test_never_disturbs_the_session_when_the_main_thread_wedges(
     transcript, monkeypatch, capsys
 ):
@@ -778,15 +780,27 @@ def test_never_disturbs_the_session_when_the_main_thread_wedges(
     Nothing raises and nothing returns: a connect into a black hole, on the hook's
     own thread. Claude Code's `timeout` would eventually kill the process, but
     being killed skips the state write and is louder in the session, so the hook
-    gives up on its own first."""
+    gives up on its own first.
+
+    The wedge is placed **inside a real guarded path** — `select_sink` calling a
+    transport's `from_url`, exactly where a dead broker wedges a real hook — and
+    not by replacing `select_sink` itself. That distinction is the whole test: an
+    unguarded `time.sleep` standing in for the code path passes whether or not the
+    budget can survive contact with the module's own `except Exception` guards,
+    which is the thing that actually needs proving.
+    """
     transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
     monkeypatch.setenv("TOKENWEIR_HOOK_TIMEOUT", "1")
+    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://nowhere.invalid:5672/")
     monkeypatch.setattr(sys, "stdin", hook_stdin(transcript))
 
-    def wedge():
-        time.sleep(60)
+    import tokenweir.amqp
 
-    monkeypatch.setattr("tokenweir.claude_code.select_sink", wedge)
+    monkeypatch.setattr(
+        tokenweir.amqp.AMQPSink,
+        "from_url",
+        classmethod(lambda cls, *a, **k: time.sleep(60)),
+    )
 
     started = time.monotonic()
     status = main()
@@ -795,6 +809,77 @@ def test_never_disturbs_the_session_when_the_main_thread_wedges(
     assert status == 0
     assert elapsed < 20, f"the time budget did not fire; took {elapsed:.1f}s"
     assert capsys.readouterr().out == ""
+
+
+@requires_alarm
+def test_never_disturbs_the_session_when_a_second_operation_also_wedges(
+    transcript, monkeypatch, capsys
+):
+    """FR-027, and the reason the budget's exception is a `BaseException`.
+
+    The budget is a one-shot alarm and every blocking call in the module sits
+    inside a broad `except Exception`. An ordinary exception is therefore absorbed
+    by whichever guard it lands in and the budget is *spent* — after which the
+    next blocking call runs unbounded and the process waits to be killed, which is
+    precisely the outcome the budget exists to prevent. One wedge cannot show
+    that: the first alarm fires, the guard swallows it, the rest of the hook is
+    fast, and the run looks bounded.
+
+    So: wedge twice, both inside real guarded paths — `select_sink` calling a
+    transport factory, then `scan_transcript` opening the transcript.
+
+    Both wedges are **bounded sleeps**, not unbounded blocks, so a regression
+    fails this test at the assertion rather than hanging the suite behind it.
+    """
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    monkeypatch.setenv("TOKENWEIR_HOOK_TIMEOUT", "1")
+    monkeypatch.setenv("TOKENWEIR_AMQP_URL", "amqp://nowhere.invalid:5672/")
+    monkeypatch.setattr(sys, "stdin", hook_stdin(transcript))
+
+    import tokenweir.amqp
+
+    monkeypatch.setattr(
+        tokenweir.amqp.AMQPSink,
+        "from_url",
+        classmethod(lambda cls, *a, **k: time.sleep(25)),
+    )
+
+    real_open = open
+    wedged_path = str(transcript)
+
+    def slow_open(file, *args, **kwargs):
+        if str(file) == wedged_path:
+            time.sleep(25)
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", slow_open)
+
+    started = time.monotonic()
+    status = main()
+    elapsed = time.monotonic() - started
+
+    assert status == 0
+    assert elapsed < 20, (
+        f"the budget was spent on the first wedge and did not bound the second; "
+        f"took {elapsed:.1f}s"
+    )
+    assert capsys.readouterr().out == ""
+
+
+@requires_alarm
+def test_the_budget_is_not_absorbable_by_the_modules_own_guards():
+    """The property above, asserted directly rather than only through its symptom.
+
+    Every guard in this module catches `Exception`, deliberately, so that a
+    failure degrades to "no metering for this turn". The budget must be outside
+    that category or those guards swallow it.
+    """
+    from tokenweir.claude_code import _BudgetExpiredError
+
+    assert issubclass(_BudgetExpiredError, BaseException)
+    assert not issubclass(_BudgetExpiredError, Exception), (
+        "an Exception here is absorbed by the module's own except-Exception guards"
+    )
 
 
 def test_never_disturbs_the_session_with_a_corrupt_baseline(transcript, monkeypatch):
@@ -812,15 +897,58 @@ def test_never_disturbs_the_session_with_a_corrupt_baseline(transcript, monkeypa
 
 
 def test_never_disturbs_the_session_and_writes_the_baseline_atomically(
-    tmp_path, transcript
+    tmp_path, transcript, monkeypatch
 ):
-    """FR-016. An interrupted in-place write leaves a truncated file that every
-    later invocation reads as corrupt — one interruption costing every subsequent
-    turn its baseline."""
+    """FR-016, asserted as a *mechanism* rather than as an outcome.
+
+    An interrupted in-place write leaves a truncated file that every later
+    invocation reads as corrupt — one interruption costing every subsequent turn
+    its baseline. Round-tripping a value proves nothing about that: a plain
+    `write_text` round-trips just as well. So this asserts what a non-atomic
+    implementation cannot do — the target is only ever reached by `os.replace`,
+    from a temporary file in the target's own directory, since `os.replace` is
+    atomic only within a filesystem.
+    """
     state = state_path_for(transcript)
+    replacements = []
+    real_replace = os.replace
+
+    def spy(src, dst, *args, **kwargs):
+        replacements.append((Path(src), Path(dst)))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("tokenweir.claude_code.os.replace", spy)
+
     assert write_baseline(state, TokenTotals(1, 2, 3, 4), transcript=transcript)
+
     assert read_baseline(state) == TokenTotals(1, 2, 3, 4)
+    assert len(replacements) == 1, "the target was not reached by an atomic replace"
+    source, destination = replacements[0]
+    assert destination == state
+    assert source.parent == state.parent, (
+        "os.replace is atomic only within a filesystem, so the temporary file "
+        "must live in the target's own directory"
+    )
     assert not list(state.parent.glob("*.tmp")), "no temporary file left behind"
+
+
+def test_never_disturbs_the_session_when_the_baseline_write_is_interrupted(
+    transcript, monkeypatch
+):
+    """The consequence FR-016 exists for: an interruption must leave the *previous*
+    baseline intact, not a truncated file that reads as corrupt forever."""
+    state = state_path_for(transcript)
+    assert write_baseline(state, TokenTotals(11, 22, 33, 44), transcript=transcript)
+
+    def interrupted(src, dst, *args, **kwargs):
+        raise OSError("interrupted before the rename landed")
+
+    monkeypatch.setattr("tokenweir.claude_code.os.replace", interrupted)
+    assert write_baseline(state, TokenTotals(99, 99, 99, 99), transcript=transcript) is False
+
+    monkeypatch.undo()
+    assert read_baseline(state) == TokenTotals(11, 22, 33, 44)
+    assert not list(state.parent.glob("*.tmp")), "the partial write was cleaned up"
 
 
 # ===========================================================================
@@ -940,11 +1068,23 @@ def test_attribution_never_reads_anything_the_model_wrote(transcript, monkeypatc
 # ===========================================================================
 
 
-def test_packaging_declares_the_console_script_entry_point():
+def test_packaging_resolves_the_console_script_entry_point():
     """FR-032. Claude Code's `settings.json` names a command, so the hook has to
-    *be* one."""
-    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'tokenweir-claude-code-hook = "tokenweir.claude_code:main"' in pyproject
+    *be* one — and a declaration sitting in `pyproject.toml` is a different claim
+    from an entry point the installed distribution can actually hand back. This
+    asserts the second one, through the metadata a console script is built from."""
+    from importlib.metadata import entry_points
+
+    scripts = {
+        ep.name: ep
+        for ep in entry_points(group="console_scripts")
+        if ep.name == "tokenweir-claude-code-hook"
+    }
+    assert scripts, "the hook's console script is not installed"
+
+    resolved = scripts["tokenweir-claude-code-hook"].load()
+    assert callable(resolved)
+    assert resolved is main
 
 
 def test_packaging_keeps_the_module_free_of_transport_imports():
@@ -1008,6 +1148,133 @@ def test_packaging_documents_a_non_blocking_settings_fragment():
     assert "tokenweir-claude-code-hook" in readme
     assert '"Stop"' in readme
     assert '"timeout"' in readme
+
+
+def test_packaging_reads_the_transcript_incrementally(transcript, monkeypatch):
+    """FR-009, asserted as a mechanism. A session's transcript grows all day, and
+    a hook whose memory is a function of how long the developer has been working
+    is a hook that gets killed on the longest sessions — the ones worth metering
+    most.
+
+    Round-tripping counts cannot catch a regression here: `handle.read().split()`
+    produces identical numbers. So the file handle itself refuses to be read
+    whole."""
+    transcript.append(
+        *[transcript_entry(message_id=f"m{n}", usage=usage(1)) for n in range(200)]
+    )
+
+    class IterationOnly:
+        """A handle that yields lines but refuses to be materialized."""
+
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __iter__(self):
+            return iter(self._handle)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+            return False
+
+        def close(self):
+            self._handle.close()
+
+        def read(self, *args, **kwargs):
+            raise AssertionError("scan_transcript materialized the whole transcript")
+
+        def readlines(self, *args, **kwargs):
+            raise AssertionError("scan_transcript materialized the whole transcript")
+
+    real_open = open
+    target = str(transcript)
+
+    def guarded_open(file, *args, **kwargs):
+        handle = real_open(file, *args, **kwargs)
+        return IterationOnly(handle) if str(file) == target else handle
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+
+    result = scan_transcript(transcript)
+
+    assert result.counted == 200
+    assert result.totals.input_tokens == 200
+
+
+def test_counts_give_distinct_turns_distinct_request_ids(transcript):
+    """FR-019's actual protection: two different turns must never share an id."""
+    sink = RecordingSink()
+    for n in range(4):
+        transcript.append(
+            transcript_entry(message_id=f"msg_{n}", usage=usage(10 * (n + 1)))
+        )
+        run(hook_stdin(transcript), sink)
+
+    ids = [r.request_id for r in sink.records]
+    assert len(ids) == 4
+    assert len(set(ids)) == 4, f"distinct turns shared an id: {ids}"
+
+
+def test_counts_re_report_a_turn_under_the_same_id_when_the_baseline_is_lost(
+    transcript, tmp_path, monkeypatch
+):
+    """The other half of FR-019, and the honest reading of an unwritable state
+    directory (FR-017).
+
+    The hook must still emit — a metering cache is not a reason to lose a turn —
+    so the same turn is re-reported until the baseline can be stored. Those
+    re-reports are exact duplicates and they carry the **same** `request_id`,
+    deliberately: a fresh id per emission would make them look like distinct turns
+    and turn a visible duplicate into invisible inflation. The store puts no unique
+    constraint on the column precisely so a consumer can collapse them.
+    """
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    monkeypatch.setenv("TOKENWEIR_HOOK_STATE_DIR", str(blocked / "state"))
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(100, 10)))
+    sink = RecordingSink()
+
+    try:
+        for _ in range(3):
+            run(hook_stdin(transcript), sink)
+    finally:
+        blocked.chmod(0o700)
+
+    assert len(sink.records) == 3, "an unwritable cache must not cost a turn its record"
+    assert {r.request_id for r in sink.records} == {"msg_a"}, (
+        "re-reports of one turn must be recognizable as duplicates, not new turns"
+    )
+    assert {counts_of(r) for r in sink.records} == {(100, 10, 0, 0)}
+
+
+def test_select_sink_uses_the_direct_path_when_a_dsn_is_configured(monkeypatch):
+    """FR-030's second branch. Asserted without a driver or a server: the question
+    is which sink the environment selects, and `PostgresSource.from_dsn` is the
+    seam where the driver would be needed."""
+    import tokenweir.postgres
+    from tokenweir.sink import DirectSink
+
+    class FakeSource:
+        def write(self, records):
+            return len(records)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        tokenweir.postgres.PostgresSource,
+        "from_dsn",
+        classmethod(lambda cls, dsn, **kwargs: FakeSource()),
+    )
+    monkeypatch.setenv("TOKENWEIR_DSN", "postgresql://example/db")
+
+    sink = select_sink()
+
+    assert isinstance(sink, DirectSink)
+    assert isinstance(sink.source, FakeSource)
 
 
 # ===========================================================================

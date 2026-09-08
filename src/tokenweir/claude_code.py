@@ -171,6 +171,7 @@ ENVIRONMENT_VARIABLES: dict[str, str] = {
     "TOKENWEIR_APP_ID": f"Overrides app_id (default {DEFAULT_APP_ID!r}).",
     "TOKENWEIR_ENDPOINT": f"Overrides endpoint (default {DEFAULT_ENDPOINT!r}).",
     "TOKENWEIR_HOOK_STATE_DIR": "Where the per-transcript baseline is kept.",
+    "XDG_STATE_HOME": "Base for the default state directory when the above is unset.",
     "TOKENWEIR_HOOK_TIMEOUT": f"Total time budget in seconds (default {DEFAULT_HOOK_TIMEOUT}).",
     "TOKENWEIR_HOOK_DEBUG": "When set, also write diagnostics to stderr.",
     "MADO_ISSUE_KEY": "Issue being worked; recorded as workload.",
@@ -338,11 +339,18 @@ class ScanResult:
 
 
 def _text(value: Any) -> Optional[str]:
-    """A non-blank string, or ``None``. Anything else in the transcript is noise."""
+    """A non-blank, stripped string, or ``None``. Anything else is noise.
+
+    The stripped value is what is returned, not the original. Testing one and
+    returning the other is the kind of asymmetry that reads as an oversight and
+    eventually becomes one — a path or a model id with surrounding whitespace
+    would propagate into a record, while :func:`_env` strips the equivalent
+    value from the environment. One rule for both.
+    """
     if isinstance(value, str):
         stripped = value.strip()
         if stripped:
-            return value
+            return stripped
     return None
 
 
@@ -498,8 +506,22 @@ def write_baseline(path: Any, totals: TokenTotals, *, transcript: Any = None) ->
     atomic within a filesystem.
 
     Returns ``False`` rather than raising when the directory cannot be created or
-    written (FR-017): an unwritable cache costs accuracy on the *next* turn, and
-    must not cost this turn its record.
+    written (FR-017): losing the baseline costs accuracy, and must not cost this
+    turn its record.
+
+    Be precise about that cost, because the reassuring version of the sentence is
+    wrong. A baseline lost **once** over-counts exactly one turn — the session's
+    tokens land in one record — and everything after it is correct again. A state
+    directory that is **persistently** unwritable never recovers: every turn
+    re-reports the whole session from zero, so the over-count compounds for as
+    long as the condition lasts.
+
+    What keeps that from being silent is the identity. Each of those re-reports
+    carries the *same* ``request_id`` as the last, because the turn it describes
+    is the same turn — so they are exact duplicates, and a consumer can see that
+    they are (see :func:`build_fields`). Every failure is also noted. The failure
+    is not made harmless; it is made **visible**, which is the most a producer
+    that must not fail can do about it.
     """
     payload = {
         "schema": 1,
@@ -526,7 +548,10 @@ def write_baseline(path: Any, totals: TokenTotals, *, transcript: Any = None) ->
         os.replace(tmp_name, target)
         return True
     except Exception:
-        _note(f"baseline not written; next turn may over-count: {target!r}")
+        _note(
+            "baseline not written; this turn will be re-reported until it can be "
+            f"stored: {target!r}"
+        )
         if tmp_name is not None:
             try:
                 os.unlink(tmp_name)
@@ -678,11 +703,28 @@ def build_fields(
 
     Identity (FR-019) is the last counted response's ``message.id``, which is
     unique per API response and therefore per turn, and which is *traceable* — a
-    row in the store can be found again in the transcript that produced it. The
-    fallbacks exist so that a transcript with no usable ids still produces a
+    row in the store can be found again in the transcript that produced it.
+
+    It is deliberately **stable, not fresh per emission**, and the difference
+    matters in one case. If the baseline cannot be stored, the same turn is
+    re-reported next time; a random discriminator would make those re-reports look
+    like distinct turns and turn a visible duplicate into invisible inflation. A
+    stable id makes them what they are — the same record, twice — which is
+    something a report can collapse. That is also why the store deliberately puts
+    no unique constraint on ``request_id`` (``001_gateway_usage.sql``): it is an
+    append-only log that expects at-least-once delivery, so an identical row
+    arriving twice is an ordinary event with an ordinary remedy, and the id is the
+    key that remedy needs.
+
+    Distinct turns never collide, which is the property FR-019 actually protects:
+    a turn's id is its last response's id, and no two responses share one.
+
+    The fallbacks exist so that a transcript with no usable ids still produces a
     record rather than none: the contract requires ``request_id`` to be non-blank,
     and a uuid4 is a worse identifier than a message id but an infinitely better
-    one than a dropped turn.
+    one than a dropped turn. Uniqueness is preserved in that case too — a fresh
+    uuid4 cannot collide — at the cost of the stability above, which is
+    unavailable when the transcript names nothing to be stable about.
 
     ``model`` is stored verbatim (ADR-0001 Pillar 3 — nothing is inferred from it)
     and falls back to :data:`DEFAULT_MODEL`, because the alternative to an unknown
@@ -791,6 +833,15 @@ def run(
     That flush is bounded, not unbounded, so this stays inside the hook's own
     budget (FR-027, FR-028) — the wait is the same one ``close`` already promises.
 
+    The bound has a cost worth naming rather than discovering. A sink still
+    publishing when ``close_timeout`` expires, which then *succeeds*, has the
+    record while the baseline stays put — so the next turn re-reports it. The
+    window is ``close_timeout`` (3 seconds by default) and it is narrow, but it is
+    not zero. The run errs this way deliberately: assuming success on a timeout
+    would turn the same window into a silent **loss**, and a duplicate is
+    recoverable where a loss is not — duplicates share a ``request_id`` and a
+    report can collapse them, while a turn that vanished leaves nothing to notice.
+
     Emission goes through the buffered client and the guarded seam rather than a
     bare ``sink.emit`` (FR-029). Both guarantees already exist in the library; the
     fourth reimplementation of a guarantee is where it stops being one.
@@ -847,8 +898,26 @@ def run(
 # --- the time budget -------------------------------------------------------
 
 
-class _BudgetExpiredError(Exception):
-    """Raised on the main thread when the hook's own time budget runs out."""
+class _BudgetExpiredError(BaseException):
+    """Raised on the main thread when the hook's own time budget runs out.
+
+    **A ``BaseException``, deliberately, and this is load-bearing.** Every
+    blocking operation in this module sits inside a broad ``except Exception``
+    — :func:`select_sink`, :func:`scan_transcript`, :func:`read_baseline`,
+    :func:`write_baseline` — because each of them must degrade to "no metering
+    for this turn" rather than propagate. An ordinary ``Exception`` raised by
+    the alarm is absorbed by whichever of those guards it lands in, and since
+    the alarm is one-shot and nothing re-arms it, the budget is then *spent*:
+    the next blocking call runs unbounded, and the process waits to be killed by
+    Claude Code's own timeout. That is the exact outcome the budget exists to
+    prevent — being killed skips the state write and is louder in the session.
+
+    Inheriting from ``BaseException`` puts it in the same category as
+    ``KeyboardInterrupt``, which is the honest classification: like an interrupt,
+    it is a decision to stop that no local ``try`` may overrule. :func:`main`
+    catches it by name, ahead of its own ``except Exception``, and turns it into
+    the ordinary exit 0.
+    """
 
 
 def _budget_seconds() -> float:
@@ -936,6 +1005,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception:
                 pass
     except _BudgetExpiredError:
+        # Named explicitly because it is a `BaseException`: the clause below
+        # cannot catch it, and it must not escape — an unhandled one would exit
+        # non-zero, which is the one thing this hook may never do.
         _note("hook exceeded its time budget; exiting without disturbing the session")
     except Exception:
         _note("hook failed; exiting 0 so the session is untouched", exc_info=True)
