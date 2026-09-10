@@ -54,7 +54,8 @@ metering — so an unrecognized phase is carried through as written rather than 
 
 **Nothing here imports the hook**, and nothing here imports outside the standard library
 except :mod:`tokenweir.contract` — itself stdlib-only — for the one enum both ends must
-agree on. That is a property of *this module*: ``import tokenweir.orchestrator`` still
+agree on, and for the one definition of "blank" a required string is judged by (TOKWEIR-57).
+That is a property of *this module*: ``import tokenweir.orchestrator`` still
 initializes the package, which re-exports these names alongside the emitter and the
 sinks, so the guarantee an adopter gets is "no transport driver and no hook", not "these
 two modules alone" (review 2, Low-5). The
@@ -72,7 +73,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Optional, Union
 
-from tokenweir.contract import PricingMode
+from tokenweir.contract import _NON_BLANK_RE, PricingMode
 
 __all__ = [
     "ATTRIBUTION_ENV",
@@ -407,6 +408,16 @@ def _required_text(name: str, value: Optional[str]) -> str:
     ``'TOKWEIR-8'`` are the same issue to everyone who reads the record and two
     different strings to anything that groups by it — the duplicate-lane problem the
     phase taxonomy exists to solve, one column over.
+
+    Blankness is judged by :data:`tokenweir.contract._NON_BLANK_RE`, not by
+    ``str.strip()`` (TOKWEIR-57). The two disagree: Python's whitespace set and the
+    published schema's ECMA-262 one differ by a handful of code points — U+0085
+    (NEXT LINE) is whitespace to Python and not to ECMA-262; U+FEFF (the BOM) the
+    reverse — so a value made only of one of those was blank to one check and not
+    the other. Judging it here with anything but the contract's own definition
+    would let such a value pass this check and fail later, when the hook actually
+    builds the record: refused far from where the producer could fix it, rather
+    than at the point of mistake.
     """
     if value is None:
         return ""
@@ -414,7 +425,7 @@ def _required_text(name: str, value: Optional[str]) -> str:
         raise ValueError(
             f"{name} must be a string or None; got {type(value).__name__} {value!r}"
         )
-    if not value.strip():
+    if not _NON_BLANK_RE.search(value):
         raise ValueError(f"{name} was given as blank; pass None to leave it unknown")
     return value.strip()
 
