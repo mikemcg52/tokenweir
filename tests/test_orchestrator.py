@@ -541,13 +541,16 @@ def test_the_hook_resolves_the_variable_names_from_the_contract():
 # --- isolation -------------------------------------------------------------
 
 
-def test_the_contract_module_imports_nothing_but_the_stdlib_and_the_contract():
-    """SC-006, FR-014. The orchestrator runs in another codebase and another namespace;
-    depending on this contract must not mean inheriting a capture path or a transport
-    driver. Read from the source rather than from `sys.modules`, so the check sees what
-    the module *asks for* — a session that already imported everything cannot hide a
-    new import from it."""
-    tree = ast.parse(_source("src", "tokenweir", "orchestrator.py"))
+def _tokenweir_imports(source: str) -> set[str]:
+    """Every module a source file imports, `tokenweir.*` ones qualified as such.
+
+    Module-level and named separately from the test that uses it against real
+    source, so a synthetic snippet can drive the same logic directly (TOKWEIR-59)
+    rather than a test re-implementing the rule and asserting against its own
+    copy — the mistake `TestMainCredentialedPath` in `test_parity.py` was written
+    to stop repeating.
+    """
+    tree = ast.parse(source)
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -559,10 +562,33 @@ def test_the_contract_module_imports_nothing_but_the_stdlib_and_the_contract():
                 # first version of this check skipped every one of them — `node.level
                 # == 0` — so the criterion it names was enforced for one import style
                 # out of two, and review 5 got `from .postgres import *` past a green
-                # suite. `node.module` is empty for `from . import x`, hence the or.
-                imported.add("tokenweir." + (node.module or ""))
+                # suite.
+                if node.module:
+                    imported.add("tokenweir." + node.module)
+                else:
+                    # `from . import contract` names the submodule in `node.names`,
+                    # not in `node.module` — unlike `from .contract import X`, where
+                    # the submodule *is* `node.module` and the name is one of its
+                    # attributes. Building the module name from `node.module or ""`
+                    # collapsed this shape to `"tokenweir."` (a trailing dot, no
+                    # name), so a perfectly legal `from . import contract` failed
+                    # this check as though it imported something else (TOKWEIR-59).
+                    # Reading `node.names` here also means `from . import contract,
+                    # postgres` is no longer half-checked: both submodules are
+                    # seen, not just whichever one `node.module` happened to name.
+                    imported.update("tokenweir." + alias.name for alias in node.names)
             elif node.module:
                 imported.add(node.module)
+    return imported
+
+
+def test_the_contract_module_imports_nothing_but_the_stdlib_and_the_contract():
+    """SC-006, FR-014. The orchestrator runs in another codebase and another namespace;
+    depending on this contract must not mean inheriting a capture path or a transport
+    driver. Read from the source rather than from `sys.modules`, so the check sees what
+    the module *asks for* — a session that already imported everything cannot hide a
+    new import from it."""
+    imported = _tokenweir_imports(_source("src", "tokenweir", "orchestrator.py"))
 
     for module in imported:
         root = module.split(".")[0]
@@ -573,6 +599,27 @@ def test_the_contract_module_imports_nothing_but_the_stdlib_and_the_contract():
             )
         else:
             assert root in sys.stdlib_module_names, f"{module} is not in the standard library"
+
+
+@pytest.mark.parametrize(
+    ("snippet", "expected"),
+    [
+        ("from .contract import PricingMode", {"tokenweir.contract"}),
+        ("from . import contract", {"tokenweir.contract"}),
+        ("from . import contract as c", {"tokenweir.contract"}),
+        ("from . import contract, postgres", {"tokenweir.contract", "tokenweir.postgres"}),
+    ],
+)
+def test_relative_imports_resolve_to_the_right_tokenweir_module(snippet, expected):
+    """TOKWEIR-59. `from . import contract` and `from .contract import X` name the
+    same module through different AST shapes -- `node.module` for the second,
+    `node.names` for the first -- and the checker has to read both correctly to
+    tell a permitted import from a forbidden one. Direct regression test for the
+    shape that produced `"tokenweir."` (a trailing dot, no module at all) and
+    would have failed `test_the_contract_module_imports_nothing_but_the_stdlib_
+    and_the_contract` against code that does nothing wrong.
+    """
+    assert _tokenweir_imports(snippet) == expected
 
 
 def test_importing_the_contract_module_does_not_import_the_hook():
