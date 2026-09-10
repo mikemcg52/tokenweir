@@ -51,10 +51,14 @@ overhead ride along — a *constant*, which shows up across turns of differing
 length as an offset that does not scale, distinguishable from a ratio. And a turn
 whose output includes a ``tool_use`` block has ``output_tokens`` covering a JSON
 payload this harness cannot re-tokenize faithfully, so such turns are excluded from
-the headline rather than averaged in. ``thinking`` blocks *are* recoverable and are
-kept separately, which is what lets ``output_tokens_details.thinking_tokens`` be
-checked rather than trusted. That is why the probe runs over a *population* of
-turns and reports a distribution.
+the headline rather than averaged in — as is any turn that accounts for thinking
+tokens, whose content Claude Code strips from the transcript. That is why the probe
+runs over a *population* of turns and reports a distribution.
+
+The transcript's own ``thinking_tokens`` is therefore **not** checked by this
+harness — only the API side's is, in Probe A′, where the generated response is in
+hand. The finding records that as a limit, and it is the correct position rather
+than a gap to close: there is nothing on the transcript side to re-tokenize.
 
 What this can and cannot establish
 ----------------------------------
@@ -155,11 +159,14 @@ class Turn:
     that carries it**, not one line's worth — see :func:`iter_turns` for why the
     difference is the whole ballgame.
 
-    ``thinking_text`` is kept **separately** rather than folded into
-    ``output_text``, because the two are counted separately by the provider:
-    ``output_tokens_details.thinking_tokens`` reports the thinking half on its own.
-    Keeping them apart is what lets the harness check that field independently
-    instead of taking it on trust.
+    ``thinking_text`` is kept **separately** rather than folded into ``output_text``,
+    because the provider counts the two separately and folding them would corrupt the
+    comparison. Its role here is as a **disqualifier**: a turn carrying it is excluded
+    from the headline, since its ``output_tokens`` covers content measured under a
+    different heading. It is not a transcript-side thinking check — Claude Code strips
+    thinking content from the transcript (0 of 450 responses in the measured pod carry
+    any), so there is nothing to re-tokenize; only Probe A′ checks a thinking count,
+    on the API side where the response is in hand.
 
     ``has_unaccounted_blocks`` is what keeps the headline honest. ``output_tokens``
     covers every block the model emitted, and a ``tool_use`` block's tokens cannot
@@ -308,8 +315,7 @@ def iter_turns(path: Any) -> Iterator[Turn]:
     the hook's scan to the **same response count** over a transcript carrying every
     hazard — sibling lines, malformed lines, usage-less entries — so the two cannot
     drift apart unnoticed. The duplication is a deliberate trade with a guard on it,
-    not an accident; review 2 of TOKWEIR-9 asked for it to be said here rather than
-    only in ``plan.md``.
+    not an accident.
     """
     try:
         handle = open(path, "r", encoding="utf-8", errors="replace")
@@ -943,10 +949,8 @@ def is_headline_eligible(turn: Turn) -> bool:
 
     This is a **module-level named predicate rather than a comprehension inside
     :func:`main`** because it is the load-bearing correctness rule of the whole
-    measurement, and it has to be assertable on its own. Review 1 of TOKWEIR-9
-    demonstrated the cost of the alternative: with the rule inlined, deleting either
-    of the last two conditions left all 54 tests passing, because the only test that
-    claimed to cover it re-implemented it inline and asserted on its own copy.
+    measurement and has to be assertable on its own — inlined, a test can only
+    re-implement it and assert against its own copy, which is no test at all.
     """
     return (
         bool(turn.output_text.strip())
@@ -1004,6 +1008,11 @@ def main(
     ``opener`` is injected by the tests so the rendering path — the headline filter,
     the report text, and the guarantee that the credential never reaches it — can be
     exercised without a network call or a metered request.
+
+    **This reporting surface is deliberately closed.** The verdict strings and the exit
+    codes are as much machinery as a spike's harness should carry: they exist to make
+    one document re-establishable, not to grow into a reporting tool. Additions belong
+    in a follow-up story with its own justification, not here.
     """
     parser = argparse.ArgumentParser(
         prog="python -m tokenweir.parity",
@@ -1078,18 +1087,16 @@ def main(
     failures = 0
 
     text_only = [t for t in turns if is_headline_eligible(t)]
-    # The **complement** of the predicate, not a restatement of parts of it. Review 2
-    # of TOKWEIR-9 caught the earlier version enumerating only two of the four
-    # disqualifying conditions, so a turn with no text at all — or with thinking text
-    # but a zero thinking count — fell into neither bucket and vanished from a report
-    # whose own comment below promises the arithmetic closes. Derived this way,
+    # The **complement** of the predicate, not a restatement of parts of it. Enumerate
+    # the disqualifying conditions separately and a turn that trips one you forgot
+    # falls into neither bucket and vanishes from a report that promises its
+    # arithmetic closes. Derived this way,
     # `len(text_only) + len(excluded) == len(turns)` holds by construction.
     excluded = [t for t in turns if not is_headline_eligible(t)]
 
     # The envelope first: without it every row below reads as a discrepancy of
-    # exactly -E, which is what review 1 of TOKWEIR-9 found this command doing —
-    # printing "delta -4" twelve times and leaving the operator no way to tell
-    # parity from drift.
+    # exactly -E — twelve identical "delta -4" lines, leaving the operator no way to
+    # tell parity from drift.
     envelope: Optional[int] = None
     if text_only:
         longest = max(text_only, key=lambda t: len(t.output_text))
@@ -1197,12 +1204,11 @@ def main(
     #
     # **Opt-in, and off by default.** It is this harness's only *expensive* probe —
     # four generations of up to 300 max_tokens, against count_tokens everywhere else.
-    # (Probe B still generates once, 16 tokens, on any credentialed run; review 3 of
-    # TOKWEIR-9 caught this comment claiming otherwise directly above the code that
-    # does it.) The routine reason to re-run the command is to check that nothing has
-    # drifted, which Probe A and Probe C answer on their own. Review 2 made the case:
-    # every re-run paying for four generations to re-derive a constant that is already
-    # recorded is a standing cost for an occasional need. The verdict below degrades
+    # (Probe B still generates once, 16 tokens, on any credentialed run: a default run
+    # is cheap, not free.) The routine reason to re-run the command is to check that
+    # nothing has drifted, which Probe A and Probe C answer on their own, so paying for
+    # four generations every time to re-derive a constant already recorded in the
+    # finding is a standing cost for an occasional need. The verdict below degrades
     # honestly rather than silently when it is off.
     out.append("Probe A' — the same arithmetic on the API's own generations")
     api_offsets: list[int] = []

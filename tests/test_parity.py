@@ -239,12 +239,16 @@ class TestIterTurns:
         a JSON payload this harness cannot re-tokenize faithfully — so a turn
         carrying one is excluded rather than averaged in.
 
-        A `thinking` block is different: its content *is* recoverable, and the
-        provider reports its tokens separately as
-        `output_tokens_details.thinking_tokens`. Keeping it accounted is what lets
-        that field be checked rather than trusted, and treating it as unaccounted
-        would have thrown away the 164 thinking turns this session's transcripts
-        actually contain.
+        A `thinking` block with real content is different: it is recoverable, so it
+        does not make the response unmeasurable — it is kept separately, because the
+        provider counts it separately and folding it into the output text would
+        corrupt the comparison. A turn carrying it is still excluded from the
+        headline, by the `thinking_text` conjunct of `is_headline_eligible`.
+
+        No transcript-side thinking count is ever checked against the tokenizer:
+        Claude Code strips thinking content, so across the measured pod 0 of 450
+        responses carry any. Only Probe A′ checks a thinking count, on the API side
+        where the generated response is in hand.
         """
         path = write_transcript(
             tmp_path / "t.jsonl",
@@ -893,9 +897,15 @@ class ScriptedOpener:
     The rule is 1 token per 10 characters plus an envelope of `ENVELOPE`, so a
     doubled text costs exactly twice the bare count and `envelope()`'s derivation
     (`2*c1 - c2`) recovers `ENVELOPE` exactly.
+
+    `ENVELOPE` is deliberately **not** the real-world value of 6. With the fixture and
+    reality agreeing, replacing the derivation `2*c1 - c2` with a hard-coded `return 6`
+    passes the whole suite — the formula would be asserted only against a number that
+    happens to match it. 11 is not a plausible hard-code, so the derivation has to
+    actually derive.
     """
 
-    ENVELOPE = 6
+    ENVELOPE = 11
 
     def __init__(self, *, generated="control response text here", thinking_tokens=0):
         self.count_bodies = []
@@ -1351,3 +1361,63 @@ class TestTurnAccountingCloses:
         )
         assert "1 of 1 eligible" in out
         assert "3 excluded" in out
+
+
+class TestProbeAPrimeSubtractsThinkingTokens:
+    """The term that silently flips the verdict if it is dropped.
+
+    Probe A′ computes `offset = reported - bare_text - thinking`. That subtraction is
+    the correction the measurement had to discover: without it, a control response
+    that thought for 25 tokens looks like a 25-token discrepancy, which is exactly how
+    the first exploratory run appeared to disagree by +27 and +21 before the thinking
+    term was accounted for.
+
+    Drop `- thinking` and the harness prints DIFFERENCE — recommending a correction
+    factor that does not exist — and still exits 0. Nothing caught that: the fixture
+    had a `thinking_tokens` knob that no test ever set to a non-zero value.
+    """
+
+    def _transcript(self, tmp_path):
+        return write_transcript(
+            tmp_path / "t.jsonl",
+            [_turn_with_bare_tokens(f"msg_{i}", 600 + i * 200) for i in range(3)],
+        )
+
+    def test_a_thinking_control_still_reaches_parity(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        opener = ScriptedOpener(thinking_tokens=7)
+        main(
+            [
+                "--transcript", str(self._transcript(tmp_path)),
+                "--model", "claude-opus-5",
+                "--control",
+            ],
+            opener=opener,
+        )
+        out = capsys.readouterr().out
+
+        assert "thinking 7" in out, "the control's thinking count was not reported"
+        assert "==> PARITY" in out, (
+            "the API-side constant did not match the transcript's; the thinking term "
+            "is not being subtracted"
+        )
+        assert "DIFFERENCE" not in out
+
+    def test_the_thinking_count_is_read_from_output_tokens_details(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Two different non-zero counts must both land on the same constant — so the
+        subtraction is using the reported number, not a fixed one."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        for thinking in (3, 41):
+            main(
+                [
+                    "--transcript", str(self._transcript(tmp_path)),
+                    "--model", "claude-opus-5",
+                    "--control",
+                ],
+                opener=ScriptedOpener(thinking_tokens=thinking),
+            )
+            out = capsys.readouterr().out
+            assert f"thinking {thinking}" in out
+            assert "==> PARITY" in out, f"thinking={thinking} did not reach parity"

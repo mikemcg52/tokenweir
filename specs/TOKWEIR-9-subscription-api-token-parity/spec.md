@@ -182,6 +182,14 @@ must say so rather than reading as permanent.
 - **FR-002**: Extraction MUST reuse `tokenweir.claude_code`'s existing de-duplication semantics
   rather than re-deriving them: usage belongs to one API response, and a transcript repeats the
   same `message.usage` across lines.
+
+  **Deviation, recorded rather than glossed.** This MUST was met only in part.
+  `scan_transcript` folds the rule into a cumulative total and exposes no per-response detail, so
+  `iter_turns` re-derives the filter-and-group loop; what *is* reused is `_text`,
+  `TokenTotals.from_mapping` and `_COUNT_FIELDS`. The substitute for literal reuse is a test —
+  `TestAgreementWithTheHooksOwnScan` pins both readers to the same response count over a transcript
+  carrying every hazard — so the two cannot drift apart unnoticed. That is a deviation from a MUST
+  resolved in the implementer's favour, and a reader should weigh it as one.
 - **FR-003**: The harness MUST provide a pure comparison that, given two usage mappings, reports
   per field: both values, their absolute difference, and their ratio where the reference is
   non-zero.

@@ -121,7 +121,9 @@ transcript.output_tokens = tokens(text) + 2        (n = 12, zero variance)
 ```
 
 **Why this rules out a scale factor.** The *difference* is constant at exactly 2 while
-the *ratio* drifts 0.978 → 0.997 across the range. A scaled count behaves the opposite
+the *ratio* drifts across the range — 0.978 → 0.997 measured as
+`transcript ÷ count_tokens`, or 1.0112 → 1.0017 as `transcript ÷ bare text`, which is
+the one the harness prints. Either way it moves; the difference does not. A scaled count behaves the opposite
 way: the ratio would be constant and the difference would grow with size. A constant
 difference with slope 1 is a framing constant, not a correction factor — and it does not
 scale with anything, so there is no factor to apply.
@@ -199,7 +201,7 @@ Two observations worth recording:
 ## Probe C — internal consistency (offline, no credential)
 
 Arithmetic identities that a passed-through count satisfies and a synthesized or bucketed
-one generally does not. Across 3 independent sessions:
+one generally does not. Across the 2 completed sessions:
 
 | Session | Responses | `cache_creation` sums | `iterations[]` sums | cache reads non-decreasing |
 |---|---:|---|---|---|
@@ -288,6 +290,10 @@ python -m tokenweir.parity \
   --credential-file /path/to/api-key \
   --control        # add this to re-establish the verdict itself
 ```
+
+`--sample` caps how many eligible turns go to the tokenizer, defaulting to 20 — above
+the 12 that were eligible here, so it did not bind. A run it *does* cap says so, in the
+same line that reports the turn accounting.
 
 `--control` is off by default and is the harness's only *expensive* probe: four
 generations of up to 300 `max_tokens`. A credentialed run without it is **not**
