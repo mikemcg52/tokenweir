@@ -21,8 +21,9 @@ permanent.
 | Claude Code | 2.1.263 |
 | Auth measured | Claude Max subscription (OAuth) vs. API key (`x-api-key`) |
 | API version | `2023-06-01` |
-| Transcripts | 3 sessions in one stream pod, 373 de-duplicated assistant responses |
-| Headline sample | 12 responses, 181–1206 output tokens (a 6.7× span) |
+| Transcripts | the 2 **completed** sessions in one stream pod, 283 de-duplicated assistant responses (144 + 139) |
+| Headline sample | 12 responses (7 + 5), 181–1206 output tokens (a 6.7× span) |
+| Also checked | the in-flight session that produced this finding — reported separately below, since its counts grow while it runs and are not reproducible |
 | Harness | `python -m tokenweir.parity` (`src/tokenweir/parity.py`) |
 
 The API-key measurement was explicitly authorized by the developer, in session, as the
@@ -72,7 +73,21 @@ len=1744  c1=668  c2=1330  =>  E = 6
 len=1899  c1=679  c2=1352  =>  E = 6
 ```
 
-**E = 6**, invariant. With that subtracted, all 12 headline responses:
+**E = 6**, invariant across all four.
+
+One assumption is buried in that derivation and is worth naming rather than leaving
+implicit: it takes `count_tokens(T+T) = 2·tokens(T) + E`, i.e. that tokenization is
+**additive across the join**. That holds when `T` ends on a clean token boundary and can
+be off by a token or two otherwise, which is why it is derived from long texts and why
+two derivations disagreeing would itself be the signal.
+
+**The verdict does not rest on it.** `count_tokens − transcript = 4` exactly on all 12
+rows across a 6.7× span, and a constant difference over that range rules out a scale
+factor without reference to `E` at all. `E` only converts that 4 into the more
+interpretable "+2 against the bare text count"; if the additivity assumption were off by
+a token, the `+2` would shift and the parity conclusion would not.
+
+With `E` subtracted, all 12 headline responses:
 
 | chars | transcript `output_tokens` | `count_tokens` | bare text (= ct − 6) | transcript − bare |
 |---:|---:|---:|---:|---:|
@@ -110,16 +125,27 @@ The first attempt appeared to disagree by +27 and +21 — because the responses 
 `thinking` blocks whose tokens count toward `output_tokens`. Accounting for
 `output_tokens_details.thinking_tokens`:
 
+As printed by the committed harness (`python -m tokenweir.parity`), so these numbers are
+reproducible rather than transcribed from a scratch script:
+
 ```
-out=138  bare_text=111  thinking=25  predicted=111+25+2=138   MATCH
-out= 39  bare_text= 18  thinking=19  predicted= 18+19+2= 39   MATCH
-out=  4  bare_text=  2  thinking= 0  predicted=  2+ 0+2=  4   MATCH
-out= 28  bare_text=  7  thinking=19  predicted=  7+19+2= 28   MATCH
+api 128, bare text 101, thinking 25, api-(text+thinking) +2
+api  39, bare text  18, thinking 19, api-(text+thinking) +2
+api  27, bare text   7, thinking 18, api-(text+thinking) +2
+api   4, bare text   2, thinking  0, api-(text+thinking) +2
+
+Probe A' result: api = bare_text + thinking +2, CONSTANT across 4 call(s).
+==> PARITY. One rule, one constant (+2), both auth modes. No correction factor.
 ```
 
 ```
 api.output_tokens = tokens(text) + thinking_tokens + 2        (4 of 4 exact)
 ```
+
+A generation is not deterministic, and that is useful here rather than a nuisance: an
+earlier run of the same control produced entirely different responses (138 / 39 / 28 / 4
+output tokens) and yielded **the same `+2`**. The constant is a property of the reporting,
+not of the sample.
 
 The headline transcript sample all report `thinking_tokens: 0`, so `tokens(text) + 2` is
 that same rule with its thinking term zero. **One rule, one constant, both auth modes.**
@@ -164,7 +190,19 @@ one generally does not. Across 3 independent sessions:
 |---|---:|---|---|---|
 | c301b927 | 144 | 144/144 PASS | 144/144 PASS | 143/143 PASS |
 | f603b29b | 139 | 139/139 PASS | 139/139 PASS | 138/138 PASS |
-| f30a6c83 | 69+ | PASS | PASS | PASS |
+| **283** | | **PASS** | **PASS** | **PASS** |
+
+The in-flight session that produced this finding was checked too, and is reported
+separately because it is not a reproducible input — it grows while it runs. Its two
+arithmetic identities pass (126/126 each); its monotonicity check **fails**, at
+124/126 transitions, with `cache_read_input_tokens` dropping 233,233 → 230,941.
+
+That is the documented legitimate case, not a defect: `_cache_read_monotonic` says in
+as many words that compaction, a context reset or a new cache prefix all shrink what is
+read, which is exactly what happens to a long session. It is recorded here because a
+reader who re-runs the harness on a long session **will** see that failure, and a
+finding that showed three tidy PASSes would leave them thinking something had broken.
+It is also why this check is corroboration and never a verdict on its own.
 
 The `iterations[]` result is the most informative: Claude Code makes several API calls per
 turn and records each one's usage, and those per-call figures sum **exactly** to the
@@ -197,7 +235,7 @@ caught because the deltas were implausibly large and structured, not noisy.
 **Established.** A Max transcript's `output_tokens` is a true token count on the
 provider's scale, related to the underlying text by the same slope-1 rule with the same
 `+2` constant as the API's own reporting; the four billing fields exist under identical
-names on both sides; and a transcript's internal aggregation is exactly consistent on 373
+names on both sides; and a transcript's internal aggregation is exactly consistent on 283
 responses.
 
 **Not established, and not to be inferred:**
@@ -211,10 +249,14 @@ responses.
   C (identical names; exactly consistent aggregation) but not by a same-artifact tokenizer
   comparison, because the Claude Code request's exact bytes are not reconstructable. The
   input side rests on corroboration, the output side on direct measurement.
-- **Turns containing `tool_use` are not covered by the headline.** A tool call's tokens
-  cannot be re-tokenized faithfully from the transcript. 12 of 373 responses were
-  headline-eligible; the rest were excluded for that reason. The excluded turns are not
-  suspected — they are unmeasurable by this method.
+- **Most turns are not covered by the headline**, and for two distinct reasons rather
+  than one. 12 of 283 responses were eligible. A turn is excluded if it carries a
+  `tool_use` block (a JSON payload this harness cannot re-tokenize faithfully) **or** if
+  it accounts for thinking tokens it cannot reproduce — either a `thinking` block whose
+  content Claude Code stripped, or a non-zero `output_tokens_details.thinking_tokens` with
+  no block at all. Both causes are common and they overlap; the harness reports them
+  together as "unmeasurable". The excluded turns are **not** suspected — they are
+  unmeasurable by this method, which is a different thing.
 - **`thinking_tokens` was verified on the API side only.** Max transcripts strip thinking
   content, so the transcript's own `thinking_tokens` could not be checked against the
   tokenizer.
@@ -231,5 +273,22 @@ python -m tokenweir.parity \
   --credential-file /path/to/api-key
 ```
 
-Probe C runs with no credential at all and is the cheap early warning: if its identities
-ever start failing, the parity claim above should be treated as lapsed until re-measured.
+The harness computes and prints the verdict itself, so a re-run does not require this
+document to interpret. It derives `E` on the spot, prints each turn's
+`transcript − bare_text`, states whether that difference is **CONSTANT** or **VARIES**,
+runs the same arithmetic against the API's own generations (Probe A′), and then prints one
+of:
+
+- `==> PARITY. One rule, one constant (+2), both auth modes. No correction factor.`
+- `==> DIFFERENCE. Transcript constant X vs api constant Y: the gap is the correction to
+  carry with the emitter.`
+- `==> NO VERDICT: a constant was not established on both sides.`
+
+Exit status carries the same information for a script: `0` measured, `1` nothing to
+measure, `2` partial (no credential), `3` a probe was attempted and failed. A failed probe
+never exits 0.
+
+Probe C runs with no credential at all and is the cheap early warning: if its two
+arithmetic identities ever start failing, the parity claim above should be treated as
+lapsed until re-measured. (Its monotonicity check is the exception — a long session
+legitimately fails it, as above.)

@@ -802,39 +802,23 @@ which is a different claim. That verification was done separately, in TOKWEIR-9,
 
 ADR-0001 kept one item open as `Unverified`: nothing had established that a Claude Max
 transcript's counts are denominated in the same token units the API reports and bills on.
-The Stop hook above reports the transcript faithfully; that is not the same claim.
+The Stop hook above reports the transcript faithfully, which is a different claim.
 
 **Measured on 2026-09-10 against `claude-opus-5` on Claude Code 2.1.263: parity holds,
-and no correction factor is needed.**
-
-The story's literal method — diff a Max session against an API-key session on the same
-model and context — is not executable, and it is worth knowing why. A Claude Code turn
-carries a large system prompt, a full tool-schema set and cached history whose exact bytes
-are not a published artifact. Two requests with different inputs produce different counts
-*correctly*, so the difference measures the prompt rather than the reporting. Real
-transcripts show it starkly: every Max turn reports `input_tokens: 2`, with the context in
-`cache_read_input_tokens`.
-
-So the comparison is against an authority both sides share — the provider's own tokenizer.
-A transcript records both a response's output text and the `output_tokens` it attributes
-to producing it, and those describe the same artifact:
-
-```
-transcript.output_tokens = tokens(text) + 2          n = 12, zero variance, 181–1206 tokens
-api.output_tokens        = tokens(text) + thinking_tokens + 2      4 of 4 exact
-```
-
-One rule, one constant, both auth modes. The *difference* is constant while the ratio
-drifts 0.978 → 0.997, which is the signature of request framing rather than a scale
-factor — a scaled count would behave the other way round.
+and no correction factor is needed.** The measurement is not a literal Max-vs-API session
+diff — two such requests differ by their prompts, so their counts differ *correctly* — but
+a comparison against the provider's own tokenizer on the same text, corroborated by the
+same arithmetic run against the API's own generations.
 
 Two consequences for anyone reading records: all four billing fields exist on both sides
 under identical names, and `service_tier` reads `standard` on a Max subscription, so
 nothing in `usage` marks subscription traffic — `pricing_mode` has to come from the
 emitter, as it does.
 
-Re-run it after a Claude Code upgrade, a model change or a tier change; the result is
-point-in-time, because ADR-0001 records that the Max landscape is volatile:
+The result is **point-in-time**, because ADR-0001 records that the Max landscape is
+volatile. Re-run the harness after a Claude Code upgrade, a model change or a tier change;
+it derives its own constants and prints its own verdict, so it needs no reference to the
+write-up to interpret:
 
 ```bash
 python -m tokenweir.parity \
@@ -845,8 +829,11 @@ python -m tokenweir.parity \
 
 Without a credential it still runs its offline consistency checks and reports the run as
 partial — that half needs no key and is the cheap early warning that something has moved.
-The full method, the numbers, and the four things the measurement deliberately does *not*
-establish are in [`docs/parity-subscription-vs-api.md`](docs/parity-subscription-vs-api.md).
+
+**[`docs/parity-subscription-vs-api.md`](docs/parity-subscription-vs-api.md) is canonical**
+for the method, the numbers, and the four things the measurement deliberately does *not*
+establish. It is deliberately the only place they live: a result that lapses on a Claude
+Code upgrade should not have to be corrected in four files.
 
 ## The store — schema, migrations and the writer
 

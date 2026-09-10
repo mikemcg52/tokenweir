@@ -442,17 +442,57 @@ def test_key_detector_recognizes_a_credential(text):
     assert _looks_like_an_api_key(text)
 
 
-def test_the_key_sweep_would_catch_a_planted_credential(tmp_path):
+def _files_containing_a_key(paths, root):
+    """The sweep itself, extracted so it can be tested on a planted file.
+
+    Review 1 of TOKWEIR-9 caught the earlier arrangement: the "would this catch a
+    planted key?" test re-implemented the read-and-match inline, so replacing the
+    real sweep's `_tracked_files()` with `[]` left the whole file green. The guard
+    was hollow. One function, called by both the planted-file test and the
+    repository sweep, is what makes it load-bearing.
+    """
+    offenders = []
+    for path in paths:
+        if Path(path).suffix.lower() in _UNSCANNED_SUFFIXES:
+            continue
+        try:
+            content = (root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _looks_like_an_api_key(content):
+            offenders.append(path)
+    return offenders
+
+
+def test_the_key_sweep_catches_a_planted_credential(tmp_path):
     """The sweep's own wiring, not just its predicate.
 
     `test_no_api_credential_is_tracked` passes on a clean repository whether or not
-    it actually reads anything, so this plants a key-shaped file, runs the same
-    read-and-match step over it, and asserts it is caught. Without this, deleting
-    the body of the loop would leave the suite green.
+    it actually reads anything. This drives the **same function** over a planted
+    file, so gutting the sweep fails here.
     """
-    planted = tmp_path / "leaked.env"
-    planted.write_text(f"ANTHROPIC_API_KEY={_KEY_SHAPED}\n", encoding="utf-8")
-    assert _looks_like_an_api_key(planted.read_text(encoding="utf-8", errors="replace"))
+    (tmp_path / "leaked.env").write_text(
+        f"ANTHROPIC_API_KEY={_KEY_SHAPED}\n", encoding="utf-8"
+    )
+    (tmp_path / "innocent.py").write_text(
+        "KEY = os.environ['ANTHROPIC_API_KEY']\n", encoding="utf-8"
+    )
+
+    found = _files_containing_a_key(["leaked.env", "innocent.py"], tmp_path)
+    assert found == ["leaked.env"]
+
+
+def test_the_key_sweep_skips_binary_suffixes(tmp_path):
+    """The suffix skip is a real branch, and it must not swallow a text file."""
+    (tmp_path / "image.png").write_text(_KEY_SHAPED, encoding="utf-8")
+    assert _files_containing_a_key(["image.png"], tmp_path) == []
+
+
+def test_the_key_sweep_tolerates_an_unreadable_path(tmp_path):
+    """A directory or vanished path is skipped, not raised — the sweep must not be
+    the thing that breaks an otherwise fine checkout."""
+    (tmp_path / "adir").mkdir()
+    assert _files_containing_a_key(["adir", "gone.txt"], tmp_path) == []
 
 
 @pytest.mark.parametrize(
@@ -481,17 +521,9 @@ def test_no_api_credential_is_tracked():
     """
     _require_git_repo()
 
-    offenders = []
-    for path in _tracked_files():
-        if Path(path).suffix.lower() in _UNSCANNED_SUFFIXES:
-            continue
-        full = REPO_ROOT / path
-        try:
-            content = full.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if _looks_like_an_api_key(content):
-            offenders.append(path)
+    tracked = _tracked_files()
+    assert tracked, "the sweep read no tracked files; it would pass vacuously"
+    offenders = _files_containing_a_key(tracked, REPO_ROOT)
 
     assert not offenders, (
         "An API-key-shaped string is committed in: "

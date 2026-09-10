@@ -891,3 +891,333 @@ class TestThinkingIsNotSilentlyAccounted:
         turn = next(iter(iter_turns(path)))
         assert turn.has_unaccounted_blocks is False, "no block is malformed here"
         assert turn.thinking_tokens == 71, "but tokens were spent out of sight"
+
+
+# --- main's credentialed path, through an injected opener --------------------
+
+
+class ScriptedOpener:
+    """Answers `count_tokens` and `messages` from a token-per-character rule.
+
+    Records every request body, so a test can assert on **which texts were sent to
+    the tokenizer** — which is the only way to check the headline filter through
+    `main` rather than by re-implementing it in the test, the mistake review 1
+    caught in this file's first version.
+
+    The rule is 1 token per 10 characters plus an envelope of `ENVELOPE`, so a
+    doubled text costs exactly twice the bare count and `envelope()`'s derivation
+    (`2*c1 - c2`) recovers `ENVELOPE` exactly.
+    """
+
+    ENVELOPE = 6
+
+    def __init__(self, *, generated="control response text here", thinking_tokens=0):
+        self.count_bodies = []
+        self.message_bodies = []
+        self.generated = generated
+        self.thinking_tokens = thinking_tokens
+
+    @staticmethod
+    def _bare(text):
+        return len(text) // 10
+
+    def __call__(self, request, timeout):
+        body = json.loads(request.data.decode("utf-8"))
+        if request.full_url.endswith("/count_tokens"):
+            self.count_bodies.append(body)
+            text = body["messages"][0]["content"]
+            return FakeResponse({"input_tokens": self._bare(text) + self.ENVELOPE})
+        self.message_bodies.append(body)
+        return FakeResponse(
+            {
+                "content": [{"type": "text", "text": self.generated}],
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": self._bare(self.generated) + self.thinking_tokens + 2,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens_details": {"thinking_tokens": self.thinking_tokens},
+                },
+            }
+        )
+
+    def texts_sent_to_tokenizer(self):
+        return [b["messages"][0]["content"] for b in self.count_bodies]
+
+
+def _turn_with_bare_tokens(message_id, chars, *, extra_usage=None, content=None, fill="x"):
+    """A turn whose text is `chars` long and whose output_tokens is the +2 rule.
+
+    `ScriptedOpener` charges `chars // 10` for the text, so `output_tokens` of
+    `chars // 10 + 2` makes this turn report exact parity under that rule.
+
+    `fill` gives every turn a **distinct** text. That is not cosmetic: with a shared
+    fill character, an ineligible turn's text is a substring-equal twin of the
+    eligible one, and an assertion that "the ineligible text was not sent" passes
+    even when it was. Mutation-testing the filter is what exposed it.
+    """
+    text = fill * chars
+    usage_obj = usage(output_tokens=chars // 10 + 2, cache_read=chars)
+    if extra_usage:
+        usage_obj.update(extra_usage)
+    return assistant(
+        message_id,
+        usage=usage_obj,
+        content=content if content is not None else [{"type": "text", "text": text}],
+    )
+
+
+class TestMainCredentialedPath:
+    """Review 1's H2. The headline filter is the load-bearing correctness rule of
+    the whole measurement, and it had zero executing coverage: each of its four
+    conjuncts could be deleted with all tests still passing, because the only test
+    that claimed to cover it re-implemented the rule and asserted on its own copy.
+
+    These drive `main` with an injected opener and assert on the texts that actually
+    reached the tokenizer, so deleting any conjunct fails a test here.
+    """
+
+    def _transcript(self, tmp_path):
+        return write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                # Eligible: plain text, no thinking of any kind.
+                _turn_with_bare_tokens("msg_clean", 1200),
+                # Ineligible: a tool_use sibling makes output_tokens unrecoverable.
+                _turn_with_bare_tokens(
+                    "msg_tool",
+                    800,
+                    content=[
+                        {"type": "text", "text": "y" * 800},
+                        {"type": "tool_use", "id": "tu", "name": "Bash", "input": {}},
+                    ],
+                ),
+                # Ineligible: thinking text is counted separately by the provider.
+                _turn_with_bare_tokens(
+                    "msg_thinking_text",
+                    900,
+                    content=[
+                        {"type": "thinking", "thinking": "z" * 400},
+                        {"type": "text", "text": "w" * 900},
+                    ],
+                ),
+                # Ineligible: stripped thinking — tokens claimed, content gone. Its
+                # own fill character, so it cannot hide behind msg_clean's text.
+                _turn_with_bare_tokens(
+                    "msg_stripped",
+                    1000,
+                    fill="s",
+                    extra_usage={"output_tokens_details": {"thinking_tokens": 366}},
+                ),
+                # Ineligible: no text at all to compare.
+                assistant(
+                    "msg_empty",
+                    usage=usage(output_tokens=2, cache_read=2000),
+                    content=[{"type": "text", "text": ""}],
+                ),
+            ],
+        )
+
+    def test_only_eligible_turns_reach_the_tokenizer(self, tmp_path, capsys, monkeypatch):
+        """The mutation test. Removing any conjunct of `is_headline_eligible` sends
+        an extra text here and fails this assertion."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        opener = ScriptedOpener()
+        code = main(
+            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            opener=opener,
+        )
+        capsys.readouterr()
+
+        sent = opener.texts_sent_to_tokenizer()
+        # The eligible turn's text, and the envelope derivation's doubled copy of it.
+        assert "x" * 1200 in sent
+        # None of the ineligible turns' texts, on any code path. Each has its own
+        # fill character so that "not sent" cannot be satisfied by a twin.
+        for label, excluded in [
+            ("tool_use sibling", "y" * 800),
+            ("thinking text", "w" * 900),
+            ("the thinking block itself", "z" * 400),
+            ("stripped thinking", "s" * 1000),
+            ("empty text", ""),
+        ]:
+            assert excluded not in sent, f"an ineligible turn ({label}) reached the tokenizer"
+        assert code == 0
+
+    def test_the_report_states_the_constant_and_the_verdict(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """H1: a re-run must be interpretable on its own.
+
+        Printing a raw `delta -4` twelve times is what review 1 objected to — it
+        leaves the operator unable to tell parity from drift. The report has to name
+        the envelope, the constant, and the verdict.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        opener = ScriptedOpener()
+        main(
+            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            opener=opener,
+        )
+        out = capsys.readouterr().out
+
+        assert f"envelope E = {ScriptedOpener.ENVELOPE}" in out
+        assert "CONSTANT" in out
+        assert "PARITY" in out, "the verdict itself must be in the report"
+        assert "no scale factor" in out.lower()
+
+    def test_a_differing_constant_reports_difference_not_parity(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The other branch, which must not quietly read as parity.
+
+        `thinking_tokens=9` on the control while the opener adds it to
+        `output_tokens` too means the API side's constant lands elsewhere than the
+        transcript's, which is exactly the correction-factor case FR-034 covers.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        transcript = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                # transcript constant is +5 here, not the +2 the control will show
+                assistant(
+                    "msg_a",
+                    usage=usage(output_tokens=1200 // 10 + 5, cache_read=1),
+                    content=[{"type": "text", "text": "x" * 1200}],
+                ),
+            ],
+        )
+        main(["--transcript", str(transcript), "--model", "claude-opus-5"], opener=ScriptedOpener())
+        out = capsys.readouterr().out
+        assert "DIFFERENCE" in out
+        assert "correction" in out.lower()
+        assert "==> PARITY" not in out
+
+    def test_the_credential_never_appears_in_the_rendered_report(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """FR-021's other half, which tasks.md T11 named and no test covered."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        main(
+            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            opener=ScriptedOpener(),
+        )
+        captured = capsys.readouterr()
+        assert SECRET not in captured.out
+        assert SECRET not in captured.err
+
+    def test_a_probe_failure_does_not_exit_success(self, tmp_path, capsys, monkeypatch):
+        """L3: this command is meant to be re-run from a script after an upgrade.
+        Exiting 0 on a run that measured nothing reports success for the one outcome
+        the re-runner needs to hear about."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        code = main(
+            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            opener=RecordingOpener(raises=OSError("network unreachable")),
+        )
+        assert code == 3
+        assert "FAILED" in capsys.readouterr().out
+
+    def test_sample_cap_is_reported_so_a_capped_run_is_not_read_as_complete(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        transcript = write_transcript(
+            tmp_path / "t.jsonl",
+            [_turn_with_bare_tokens(f"msg_{i}", 500 + i * 100) for i in range(5)],
+        )
+        main(
+            ["--transcript", str(transcript), "--model", "claude-opus-5", "--sample", "2"],
+            opener=ScriptedOpener(),
+        )
+        out = capsys.readouterr().out
+        assert "2 of 5 eligible" in out
+        assert "were not measured" in out
+
+
+class TestEnvelopeDerivation:
+    def test_envelope_is_recovered_without_knowing_the_token_count(self):
+        """`E = 2*c1 - c2`, with no assumption about how many tokens the text is."""
+        opener = ScriptedOpener()
+        probe = ApiProbe(SECRET, opener=opener)
+        assert probe.envelope("claude-opus-5", "x" * 1000) == ScriptedOpener.ENVELOPE
+        assert len(opener.count_bodies) == 2, "one call for T, one for T+T"
+
+    def test_envelope_requires_an_explicit_model(self):
+        probe = ApiProbe(SECRET, opener=ScriptedOpener())
+        with pytest.raises(ValueError):
+            probe.envelope("", "text")
+
+
+class TestMessagesReturnsProducedText:
+    def test_text_blocks_are_returned_for_the_control(self):
+        opener = ScriptedOpener(generated="hello there")
+        result = ApiProbe(SECRET, opener=opener).messages("claude-opus-5", "prompt")
+        assert result.text == "hello there"
+
+    def test_thinking_blocks_are_not_folded_into_the_text(self):
+        """Probe A′ adds `thinking_tokens` explicitly; folding thinking text into the
+        returned text would double-count it and break the control."""
+
+        class ThinkingOpener:
+            def __call__(self, request, timeout):
+                return FakeResponse(
+                    {
+                        "content": [
+                            {"type": "thinking", "thinking": "private reasoning"},
+                            {"type": "text", "text": "visible"},
+                        ],
+                        "usage": {"output_tokens": 9},
+                    }
+                )
+
+        result = ApiProbe(SECRET, opener=ThinkingOpener()).messages("claude-opus-5", "p")
+        assert result.text == "visible"
+
+
+class TestAgreementWithTheHooksOwnScan:
+    """FR-002. `iter_turns` and `scan_transcript` read the same file for different
+    purposes, and both must agree on **how many responses are in it**.
+
+    The plan (plan.md) argues the duplication is unavoidable: the hook needs
+    cumulative totals and deliberately discards per-turn detail, while Probe A needs
+    each response's usage paired with its own text. Accepted — but review 1 noted
+    that nothing failed if the two drifted. This is that guard: it is the one
+    property both implementations must share, and it is the one that would silently
+    corrupt the measurement if it broke.
+    """
+
+    def _both(self, path):
+        from tokenweir.claude_code import scan_transcript
+
+        return len(list(iter_turns(path))), scan_transcript(path).counted
+
+    def test_response_counts_agree_on_a_transcript_with_every_hazard(self, tmp_path):
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant("msg_1"),
+                assistant("msg_1"),  # sibling line, same response
+                assistant(
+                    "msg_2",
+                    content=[{"type": "tool_use", "id": "t", "name": "B", "input": {}}],
+                ),
+                "{not json",
+                {"message": {"id": "msg_3"}},  # no usage
+                {"message": {"id": "msg_4", "usage": "not a mapping"}},
+                json.dumps([1, 2, 3]),
+                assistant("msg_5"),
+            ],
+        )
+        mine, hooks = self._both(path)
+        assert mine == hooks == 3, f"iter_turns saw {mine}, scan_transcript {hooks}"
+
+    def test_counts_agree_when_every_line_is_a_sibling(self, tmp_path):
+        path = write_transcript(tmp_path / "t.jsonl", [assistant("msg_1")] * 7)
+        mine, hooks = self._both(path)
+        assert mine == hooks == 1
+
+    def test_counts_agree_on_an_empty_and_a_missing_transcript(self, tmp_path):
+        empty = write_transcript(tmp_path / "empty.jsonl", [])
+        assert self._both(empty) == (0, 0)
+        assert self._both(tmp_path / "missing.jsonl") == (0, 0)

@@ -108,6 +108,7 @@ __all__ = [
     "compare_usage",
     "consistency_checks",
     "credential",
+    "is_headline_eligible",
     "iter_turns",
     "main",
 ]
@@ -385,16 +386,17 @@ class FieldComparison:
     difference: Optional[int] = None
     ratio: Optional[float] = None
 
-    @property
-    def present_both(self) -> bool:
-        return self.status in (PARITY, OFFSET)
-
 
 _MISSING = object()
 
 
 def _numeric(value: Any) -> Optional[int]:
-    """The value as a whole non-negative count, or ``None`` if it is not one.
+    """The value as a whole number, or ``None`` if it is not one.
+
+    Negative values pass through unchanged rather than being clamped: this is a
+    *comparison* helper, and a negative count is a discrepancy worth reporting
+    rather than one worth hiding. (The hook's own ``_coerce_count`` clamps, because
+    it is building a record that must satisfy the contract.)
 
     ``bool`` is excluded on purpose: it is an ``int`` subclass in Python, and a
     ``True`` silently comparing equal to ``1`` is the kind of agreement a parity
@@ -725,6 +727,13 @@ class ProbeResult:
     kind: str
     model: str
     usage: Mapping[str, Any]
+    text: str = ""
+    """The text the response actually produced, for a ``messages`` result.
+
+    Probe A′ needs it: the control is "what the API says it spent, versus what the
+    tokenizer makes of what it returned", and that is unanswerable without the
+    returned text. Empty for a ``count_tokens`` result, which produces none.
+    """
 
 
 class ApiProbe:
@@ -811,11 +820,16 @@ class ApiProbe:
         return ProbeResult(kind="count_tokens", model=model, usage=parsed)
 
     def messages(self, model: str, text: str, *, max_tokens: int = 16) -> ProbeResult:
-        """Probe B: one small controlled call, for the API's own ``usage`` shape.
+        """One controlled generation — Probe B's field inventory and Probe A′'s control.
 
-        ``max_tokens`` is deliberately tiny. This call exists to inventory field
-        names, not to generate anything, and it spends the only output tokens the
-        whole harness spends.
+        Returns the produced text alongside the usage, because Probe A′ compares the
+        two: what the API says it spent, against what the tokenizer makes of what it
+        returned. Only ``text`` blocks are collected; ``thinking`` is reported
+        separately by ``output_tokens_details.thinking_tokens`` and must not be
+        folded in, which is the whole point of the control.
+
+        ``max_tokens`` defaults small — Probe B only needs field names, and these are
+        the only output tokens the harness ever spends.
         """
         if not model or not model.strip():
             raise ValueError("model is required and is never defaulted")
@@ -830,10 +844,98 @@ class ApiProbe:
         usage = parsed.get("usage")
         if not isinstance(usage, Mapping):
             raise ProbeError("POST /v1/messages returned no usage object")
-        return ProbeResult(kind="messages", model=model, usage=usage)
+        produced = ""
+        content = parsed.get("content")
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+            produced = "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, Mapping)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+        return ProbeResult(kind="messages", model=model, usage=usage, text=produced)
+
+    def envelope(self, model: str, text: str) -> int:
+        """The constant ``count_tokens`` adds for the request it wraps the text in.
+
+        ``count_tokens`` prices a whole message request, so it returns
+        ``tokens(text) + E`` for some fixed framing cost ``E``. Probe A needs ``E``
+        to recover the bare text count — and guessing it, or reading it off a short
+        string whose token count is itself unknown, is how a measurement acquires a
+        fudge factor.
+
+        So it is derived instead. Doubling the text gives two equations::
+
+            count_tokens(T)   = tokens(T)     + E
+            count_tokens(T+T) = 2 * tokens(T) + E
+
+        and subtracting twice the first from the second leaves ``E = 2*c1 - c2``,
+        with **no assumption about how many tokens T is**.
+
+        It does assume one thing, which the finding states rather than buries:
+        that tokenization is **additive across the join** — that ``T+T`` costs
+        exactly twice ``T``. That holds for a text ending on a clean token boundary
+        and can be off by a token or two otherwise, so the caller should derive it
+        from a long text and treat a disagreement between two derivations as the
+        signal it is. It is also why the *verdict* does not rest on ``E``: a
+        difference that stays constant across a wide range of sizes already rules
+        out a scale factor, whatever the framing costs.
+        """
+        if not model or not model.strip():
+            raise ValueError("model is required and is never defaulted")
+        single = _numeric(self.count_tokens(model, text).usage.get("input_tokens"))
+        double = _numeric(self.count_tokens(model, text + text).usage.get("input_tokens"))
+        if single is None or double is None:
+            raise ProbeError("count_tokens did not return an input_tokens count")
+        return 2 * single - double
 
 
 # --- the reproducible command ----------------------------------------------
+
+
+#: Probe A′'s control prompts, fixed so a re-run measures the same thing. Short and
+#: varied in length on purpose: the control needs a few responses of differing size
+#: to show its constant is a constant, and every token here is metered spend.
+_CONTROL_PROMPTS: Tuple[Tuple[str, int], ...] = (
+    ("Write exactly two sentences about tokenizers. No preamble.", 300),
+    ("List five colours, one per line, nothing else.", 150),
+    ("Name three prime numbers, comma separated.", 100),
+    ("Say the word 'ok' and nothing else.", 20),
+)
+
+
+def is_headline_eligible(turn: Turn) -> bool:
+    """Is this response comparable against the tokenizer on equal terms?
+
+    Probe A's headline is only meaningful for a response whose ``output_tokens``
+    covers content this harness can re-tokenize in full. Four conditions, and none
+    of them is redundant:
+
+    - there is text to compare at all;
+    - no **unaccounted** block — a ``tool_use`` payload's tokenization cannot be
+      reproduced faithfully from the transcript;
+    - no thinking *text*, which is counted separately by the provider;
+    - and ``thinking_tokens == 0``, which is the belt-and-braces guard rather than a
+      restatement of the third. A response can claim thinking tokens with **no**
+      recoverable thinking block at all — Claude Code writes
+      ``{"type": "thinking", "thinking": ""}`` and still reports a non-zero count.
+      Asking the provider's own number, instead of inferring from block shape, is
+      what makes this robust to a transcript layout nobody has seen yet.
+
+    This is a **module-level named predicate rather than a comprehension inside
+    :func:`main`** because it is the load-bearing correctness rule of the whole
+    measurement, and it has to be assertable on its own. Review 1 of TOKWEIR-9
+    demonstrated the cost of the alternative: with the rule inlined, deleting either
+    of the last two conditions left all 54 tests passing, because the only test that
+    claimed to cover it re-implemented it inline and asserted on its own copy.
+    """
+    return (
+        bool(turn.output_text.strip())
+        and not turn.has_unaccounted_blocks
+        and not turn.thinking_text
+        and turn.thinking_tokens == 0
+    )
 
 
 def _render_checks(results: Sequence[CheckResult]) -> list[str]:
@@ -847,11 +949,33 @@ def _render_checks(results: Sequence[CheckResult]) -> list[str]:
     return lines
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    opener: Optional[Callable[[urllib.request.Request, float], Any]] = None,
+) -> int:
     """Run the probes that can be run and report which were not (FR-040, FR-041).
 
     A partial run must never read as a complete one, so a skipped probe is stated
     as skipped, with the reason, rather than simply being absent from the output.
+
+    Exit status is part of that honesty, not decoration:
+
+    ==== ====================================================================
+    0    every probe that was asked for ran and produced a measurement
+    1    the transcript yielded nothing to measure
+    2    partial — no credential, so the probes needing the tokenizer skipped
+    3    a probe was attempted and did not produce a measurement
+    ==== ====================================================================
+
+    ``3`` exists because this command is meant to be re-run after a Claude Code or
+    model change, quite possibly from a script. Returning 0 for a run that measured
+    nothing would report success for the exact outcome someone re-running it needs
+    to hear about.
+
+    ``opener`` is injected by the tests so the rendering path — the headline filter,
+    the report text, and the guarantee that the credential never reaches it — can be
+    exercised without a network call or a metered request.
     """
     parser = argparse.ArgumentParser(
         prog="python -m tokenweir.parity",
@@ -911,47 +1035,176 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("\n".join(out))
         return 2
 
-    probe = ApiProbe(key)
+    probe = ApiProbe(key, opener=opener)
+    failures = 0
 
-    # Three conditions, and the third is a belt-and-braces guard rather than a
-    # restatement of the second: `thinking_tokens > 0` means the response spent
-    # tokens this harness cannot re-tokenize, whatever the blocks happen to look
-    # like. Asking the provider's own number — instead of inferring from block
-    # presence — is what makes the filter robust to a transcript shape nobody has
-    # seen yet.
-    text_only = [
-        t
-        for t in turns
-        if t.output_text.strip()
-        and not t.has_unaccounted_blocks
-        and not t.thinking_text
-        and t.thinking_tokens == 0
-    ]
+    text_only = [t for t in turns if is_headline_eligible(t)]
     excluded = [t for t in turns if t.has_unaccounted_blocks or t.thinking_tokens]
 
-    out.append("Probe A — output-side parity (text-only turns are the headline)")
+    # The envelope first: without it every row below reads as a discrepancy of
+    # exactly -E, which is what review 1 of TOKWEIR-9 found this command doing —
+    # printing "delta -4" twelve times and leaving the operator no way to tell
+    # parity from drift.
+    envelope: Optional[int] = None
+    if text_only:
+        longest = max(text_only, key=lambda t: len(t.output_text))
+        try:
+            envelope = probe.envelope(args.model, longest.output_text)
+        except ProbeError as exc:
+            out.append(f"count_tokens envelope: FAILED — {exc}")
+            failures += 1
+    if envelope is not None:
+        out.append(
+            f"count_tokens envelope E = {envelope} tokens "
+            f"(derived as 2*c1-c2 by doubling a {len(longest.output_text)}-char turn; "
+            f"bare text count = count_tokens - E)"
+        )
+    out.append("")
+
+    out.append("Probe A — output-side parity (transcript vs the tokenizer, same text)")
     if not text_only:
-        out.append("  no text-only turn was available; headline NOT MEASURED")
+        out.append("  no eligible turn was available; headline NOT MEASURED")
+        failures += 1
+    measured = 0
+    offsets: list[int] = []
+    ratios: list[float] = []
     for turn in text_only[: args.sample]:
         reported = _numeric(turn.usage.get("output_tokens"))
         try:
             counted = probe.count_tokens(args.model, turn.output_text)
         except ProbeError as exc:
             out.append(f"  {turn.message_id}: FAILED — {exc}")
+            failures += 1
             break
         tokenizer = _numeric(counted.usage.get("input_tokens"))
         if reported is None or tokenizer is None:
             out.append(f"  {turn.message_id}: incomparable (a count was absent)")
             continue
-        delta = reported - tokenizer
+        measured += 1
+        if envelope is None:
+            out.append(
+                f"  {turn.message_id}: transcript {reported}, count_tokens {tokenizer} "
+                f"(no envelope: bare count unavailable)"
+            )
+            continue
+        bare = tokenizer - envelope
+        offset = reported - bare
+        offsets.append(offset)
+        if bare:
+            ratios.append(reported / bare)
         out.append(
-            f"  {turn.message_id}: transcript {reported}, tokenizer {tokenizer}, "
-            f"delta {delta:+d}"
+            f"  {turn.message_id}: transcript {reported}, count_tokens {tokenizer}, "
+            f"bare text {bare}, transcript-bare {offset:+d}"
         )
+
+    # The verdict, computed rather than left to the reader. A *constant* difference
+    # with slope 1 is framing; a constant *ratio* with a growing difference is a
+    # scale factor. Saying which was observed is the whole point of re-running this.
+    if offsets:
+        distinct = sorted(set(offsets))
+        out.append("")
+        if len(distinct) == 1:
+            out.append(
+                f"  Probe A result: transcript = bare_text {distinct[0]:+d}, "
+                f"CONSTANT across {len(offsets)} turn(s) — no scale factor."
+            )
+        else:
+            out.append(
+                f"  Probe A result: difference VARIES across {len(offsets)} turn(s): "
+                f"{distinct} — investigate before trusting subscription numbers."
+            )
+        if len(ratios) > 1:
+            out.append(
+                f"  (ratio transcript/bare spans {min(ratios):.4f}-{max(ratios):.4f}; a "
+                f"scale factor would hold this constant and grow the difference instead)"
+            )
+    # The arithmetic has to close, or a capped run reads as a complete one: with
+    # `--sample 3` on a 144-turn transcript, "3 measured" and "137 excluded" leave
+    # four eligible turns unaccounted for and invisible (FR-041).
     out.append(
-        f"  ({len(excluded)} turn(s) carrying unrecoverable blocks such as "
-        "tool_use excluded from the headline)"
+        f"  {measured} of {len(text_only)} eligible turn(s) measured"
+        f"; {len(excluded)} turn(s) excluded as unmeasurable (tool_use or "
+        f"unrecoverable thinking)"
     )
+    if text_only and measured < len(text_only):
+        out.append(
+            f"  NOTE: {len(text_only) - measured} eligible turn(s) were not measured "
+            f"(--sample {args.sample})"
+        )
+    out.append("")
+
+    # Probe A' — the control that turns "the transcript reports real tokens" into
+    # "the transcript reports the same number the API would". Probe A alone cannot
+    # do that: it shows the transcript is on the tokenizer's scale, not that the API
+    # agrees on the constant. So the identical arithmetic is run against responses
+    # the API generates itself, and the two constants are compared.
+    out.append("Probe A' — the same arithmetic on the API's own generations")
+    api_offsets: list[int] = []
+    if envelope is None:
+        out.append("  SKIPPED (no envelope, so a bare count cannot be recovered)")
+    else:
+        for prompt, budget in _CONTROL_PROMPTS:
+            try:
+                control = probe.messages(args.model, prompt, max_tokens=budget)
+            except ProbeError as exc:
+                out.append(f"  FAILED — {exc}")
+                failures += 1
+                break
+            reported = _numeric(control.usage.get("output_tokens"))
+            if reported is None or not control.text.strip():
+                out.append("  incomparable (no output_tokens, or no text produced)")
+                continue
+            try:
+                counted = probe.count_tokens(args.model, control.text)
+            except ProbeError as exc:
+                out.append(f"  FAILED — {exc}")
+                failures += 1
+                break
+            tokenizer = _numeric(counted.usage.get("input_tokens"))
+            if tokenizer is None:
+                out.append("  incomparable (no count returned)")
+                continue
+            thinking = 0
+            details = control.usage.get("output_tokens_details")
+            if isinstance(details, Mapping):
+                thinking = _numeric(details.get("thinking_tokens")) or 0
+            bare = tokenizer - envelope
+            offset = reported - bare - thinking
+            api_offsets.append(offset)
+            out.append(
+                f"  api {reported}, bare text {bare}, thinking {thinking}, "
+                f"api-(text+thinking) {offset:+d}"
+            )
+
+    if api_offsets:
+        api_distinct = sorted(set(api_offsets))
+        out.append("")
+        if len(api_distinct) == 1:
+            out.append(
+                f"  Probe A' result: api = bare_text + thinking {api_distinct[0]:+d}, "
+                f"CONSTANT across {len(api_offsets)} call(s)."
+            )
+        else:
+            out.append(f"  Probe A' result: VARIES: {api_distinct}")
+
+        # The verdict the whole command exists to produce.
+        transcript_distinct = sorted(set(offsets))
+        if len(api_distinct) == 1 and len(transcript_distinct) == 1:
+            if api_distinct == transcript_distinct:
+                out.append(
+                    f"  ==> PARITY. One rule, one constant ({api_distinct[0]:+d}), both "
+                    f"auth modes. No correction factor."
+                )
+            else:
+                out.append(
+                    f"  ==> DIFFERENCE. Transcript constant {transcript_distinct[0]:+d} vs "
+                    f"api constant {api_distinct[0]:+d}: the gap is the correction to "
+                    f"carry with the emitter."
+                )
+        else:
+            out.append(
+                "  ==> NO VERDICT: a constant was not established on both sides."
+            )
     out.append("")
 
     out.append("Probe B — the API's own usage field shape")
@@ -959,8 +1212,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         control = probe.messages(args.model, "Reply with the single word: ok")
     except ProbeError as exc:
         out.append(f"  FAILED — {exc}")
+        failures += 1
     else:
-        transcript_usage = turns[-1].usage
+        # The last counted response, named in the output rather than left implicit.
+        # Any turn would do — this probe compares the *set of field names*, which is
+        # a property of the transcript format and not of one response — but a report
+        # that does not say which row it read cannot be checked by its reader.
+        reference_turn = turns[-1]
+        transcript_usage = reference_turn.usage
+        out.append(f"  transcript row compared: {reference_turn.message_id}")
         out.append(f"  API usage keys:        {sorted(control.usage)}")
         out.append(f"  transcript usage keys: {sorted(transcript_usage)}")
         for comparison in compare_usage(control.usage, transcript_usage):
@@ -971,7 +1231,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
 
     print("\n".join(out))
-    return 0
+    return 3 if failures else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - module entry point
