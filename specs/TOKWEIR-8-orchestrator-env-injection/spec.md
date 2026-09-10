@@ -189,8 +189,13 @@ canonical label grammar and the per-iteration timing are stated.
   "Preserved" is bounded, and the bound is part of the requirement rather than an accident of the
   implementation: separators are folded in the preserved value too, so `deploy_step` is kept as
   `deploy step`. Folding in one direction is what stops an *unknown* phase splitting into as many
-  lanes as it has spellings — the same reason the taxonomy exists at all. The diagnostic still
-  names the value as exported, so an operator can find it in their own configuration.
+  lanes as it has spellings — the same reason the taxonomy exists at all. The diagnostic names the
+  value **as read**, not as exported — `_env` has already trimmed surrounding whitespace before the
+  hook ever sees it, so a phase exported with leading or trailing spaces is reported without them.
+  (Corrected here: TOKWEIR-58, filed by the terminal review, found this bullet still claiming "as
+  exported" — see `claude_code.py`'s `attribution_from_env`, whose diagnostic comment already said
+  "as read" and explained why.) An operator can still find the value in their own configuration;
+  only the ends, which folding does not touch anyway, are not reproduced verbatim.
 - **An occurrence of zero.** Not a real occurrence; the label is rejected at the producer
   (`review-0`, `review 0`, `fix-0`, `0th fix`) and left as written at the consumer.
 - **A negative number where an occurrence would go** (`review -1`). Not an occurrence and not a
