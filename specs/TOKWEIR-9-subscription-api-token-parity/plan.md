@@ -90,8 +90,9 @@ not as one number from one turn.
 ### Probe B and C
 
 Probe B issues one small controlled `messages` call and inventories the `usage` keys, diffing them
-against the key set observed in the transcript. It is cheap (a handful of tokens) and it is the only
-part of the run that spends output tokens on the API key.
+against the key set observed in the transcript. It is cheap (a handful of tokens). On the default
+path it is the only part of the run that spends output tokens; `--control` adds Probe A′'s four
+generations, which is why that flag is opt-in (see Spend, below).
 
 Probe C is pure and needs no credential: `cache_creation` sub-fields summing to
 `cache_creation_input_tokens`; `iterations[]` summing to the turn's top-level billing fields; cache
@@ -152,4 +153,4 @@ writable without it.
 | Envelope overhead read as a discrepancy | Population across turn lengths distinguishes a constant offset from a ratio. |
 | A "verified parity" note outliving its validity | FR-031 forces conditions and a point-in-time statement into the finding. |
 | Credential leaking into a commit | FR-021 code path plus FR-024 hygiene test. |
-| Spend | Probe B is one small call; Probe A is `count_tokens`, which is not a generation. Bounded and small. |
+| Spend | Probe A and the envelope derivation are `count_tokens` calls, which are not generations; Probe B is one small call. **Probe A′ (added during the review loop) costs four generations and is therefore opt-in behind `--control`, off by default** — so a routine re-run stays `count_tokens`-only, and only re-establishing the parity verdict itself pays for generations. |

@@ -88,12 +88,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
-# Intra-package reuse, deliberately. FR-002 requires this module not re-derive the
-# transcript semantics that already exist: `_text` for field hygiene and
-# `TokenTotals.from_mapping` for count coercion. The one that would be a real bug
-# to re-invent is de-duplication on `message.id` — a transcript repeats one API
-# response's usage across several lines — so that rule is restated by reference
-# below rather than guessed at a second time.
+# Intra-package reuse, deliberately, and two underscore-prefixed names among them.
+# That is a deliberate exception rather than an oversight: FR-002 requires this module
+# not re-derive the transcript semantics that already exist — `_text` for field
+# hygiene, `TokenTotals.from_mapping` for count coercion, `_COUNT_FIELDS` so the
+# harness measures exactly the fields the capture path reads — and importing them is
+# the only way to hold that requirement without copying three definitions that would
+# then be free to drift. Both modules are inside this package; nothing here is
+# re-exported to a consumer.
+#
+# What FR-002 cannot be discharged by import is the de-duplication rule itself, since
+# `scan_transcript` folds it into a cumulative sum this module cannot use — see
+# `iter_turns` for why, and for the test that keeps the two from drifting.
 from tokenweir.claude_code import _COUNT_FIELDS, TokenTotals, _text
 
 __all__ = [
@@ -292,6 +298,18 @@ def iter_turns(path: Any) -> Iterator[Turn]:
     An unreadable file yields nothing rather than raising. The harness reports
     "no turns" and the operator can see that for themselves; a traceback out of an
     iterator would be a worse way to say the same thing.
+
+    **On FR-002, which says not to re-derive these semantics.** This function does
+    re-derive the filter-and-group loop, because
+    :func:`~tokenweir.claude_code.scan_transcript` folds it into a cumulative total
+    and offers no way to get per-response detail out. What discharges the requirement
+    instead is a test:
+    ``tests/test_parity.py::TestAgreementWithTheHooksOwnScan`` pins this function and
+    the hook's scan to the **same response count** over a transcript carrying every
+    hazard — sibling lines, malformed lines, usage-less entries — so the two cannot
+    drift apart unnoticed. The duplication is a deliberate trade with a guard on it,
+    not an accident; review 2 of TOKWEIR-9 asked for it to be said here rather than
+    only in ``plan.md``.
     """
     try:
         handle = open(path, "r", encoding="utf-8", errors="replace")
@@ -973,6 +991,13 @@ def main(
     nothing would report success for the exact outcome someone re-running it needs
     to hear about.
 
+    ``--control`` gates Probe A′, the API-side control, **off by default**. Everything
+    else the command does costs ``count_tokens`` calls; A′ costs four generations. The
+    routine reason to re-run this is to check nothing has drifted, which Probe A and
+    Probe C answer on their own, so the expensive probe is the one you ask for rather
+    than the one you pay for by default. Without it the report says what was
+    established on the transcript side and declines to claim the parity verdict.
+
     ``opener`` is injected by the tests so the rendering path — the headline filter,
     the report text, and the guarantee that the credential never reaches it — can be
     exercised without a network call or a metered request.
@@ -996,6 +1021,16 @@ def main(
         "--credential-file",
         default=None,
         help="file holding the API key (never pass the key itself as an argument)",
+    )
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help=(
+            "also run Probe A' — the same arithmetic against the API's own generations. "
+            "Off by default: it is the only part of the harness that spends generation "
+            "tokens (4 calls, up to 300 max_tokens each), where everything else is "
+            "count_tokens. Turn it on when re-establishing the parity verdict itself."
+        ),
     )
     parser.add_argument(
         "--sample",
@@ -1039,7 +1074,13 @@ def main(
     failures = 0
 
     text_only = [t for t in turns if is_headline_eligible(t)]
-    excluded = [t for t in turns if t.has_unaccounted_blocks or t.thinking_tokens]
+    # The **complement** of the predicate, not a restatement of parts of it. Review 2
+    # of TOKWEIR-9 caught the earlier version enumerating only two of the four
+    # disqualifying conditions, so a turn with no text at all — or with thinking text
+    # but a zero thinking count — fell into neither bucket and vanished from a report
+    # whose own comment below promises the arithmetic closes. Derived this way,
+    # `len(text_only) + len(excluded) == len(turns)` holds by construction.
+    excluded = [t for t in turns if not is_headline_eligible(t)]
 
     # The envelope first: without it every row below reads as a discrepancy of
     # exactly -E, which is what review 1 of TOKWEIR-9 found this command doing —
@@ -1121,10 +1162,13 @@ def main(
     # The arithmetic has to close, or a capped run reads as a complete one: with
     # `--sample 3` on a 144-turn transcript, "3 measured" and "137 excluded" leave
     # four eligible turns unaccounted for and invisible (FR-041).
+    unrecoverable = sum(1 for t in excluded if t.has_unaccounted_blocks or t.thinking_tokens)
+    no_text = len(excluded) - unrecoverable
     out.append(
-        f"  {measured} of {len(text_only)} eligible turn(s) measured"
-        f"; {len(excluded)} turn(s) excluded as unmeasurable (tool_use or "
-        f"unrecoverable thinking)"
+        f"  {measured} of {len(text_only)} eligible turn(s) measured; "
+        f"{len(excluded)} excluded ({unrecoverable} unmeasurable — tool_use or "
+        f"unrecoverable thinking; {no_text} with no comparable text); "
+        f"{len(text_only) + len(excluded)} accounted for of {len(turns)} total"
     )
     if text_only and measured < len(text_only):
         out.append(
@@ -1138,9 +1182,22 @@ def main(
     # do that: it shows the transcript is on the tokenizer's scale, not that the API
     # agrees on the constant. So the identical arithmetic is run against responses
     # the API generates itself, and the two constants are compared.
+    #
+    # **Opt-in, and off by default.** It is the only part of this harness that spends
+    # generation tokens, and the routine reason to re-run the command is to check
+    # that nothing has drifted — which Probe A and Probe C answer on their own, for
+    # the price of a few count_tokens calls. Review 2 of TOKWEIR-9 made the case:
+    # every re-run paying for four generations to re-derive a constant that is
+    # already recorded is a standing cost for an occasional need. The verdict below
+    # degrades honestly rather than silently when it is off.
     out.append("Probe A' — the same arithmetic on the API's own generations")
     api_offsets: list[int] = []
-    if envelope is None:
+    if not args.control:
+        out.append(
+            "  SKIPPED (pass --control to run it; it is the only probe that spends "
+            "generation tokens)"
+        )
+    elif envelope is None:
         out.append("  SKIPPED (no envelope, so a bare count cannot be recovered)")
     else:
         for prompt, budget in _CONTROL_PROMPTS:
@@ -1204,6 +1261,24 @@ def main(
         else:
             out.append(
                 "  ==> NO VERDICT: a constant was not established on both sides."
+            )
+    elif offsets:
+        # A' did not run. Say what *was* established and what was not, rather than
+        # letting a constant transcript offset read as the full parity verdict.
+        transcript_distinct = sorted(set(offsets))
+        if len(transcript_distinct) == 1:
+            out.append(
+                f"  ==> Transcript side only: a constant offset of "
+                f"{transcript_distinct[0]:+d} against the tokenizer, so the counts are "
+                f"real tokens and unscaled. Whether the API reports the *same* constant "
+                f"is the API-side control question — re-run with --control to confirm it, or see "
+                f"docs/parity-subscription-vs-api.md for the recorded result."
+            )
+        else:
+            out.append(
+                f"  ==> DRIFT on the transcript side: the offset varies "
+                f"({transcript_distinct}). Re-run with --control before trusting "
+                f"subscription numbers."
             )
     out.append("")
 

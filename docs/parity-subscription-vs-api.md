@@ -3,10 +3,14 @@
 **Verdict: parity. No correction factor is needed.**
 
 A Claude Max transcript's `message.usage` counts are true token counts on the same
-scale the Anthropic API reports. The relationship between a transcript's
-`output_tokens` and the provider's own tokenizer is **exact, affine, and slope-1**,
-and the *same* relationship holds for the API's own `output_tokens` on a response it
-generates itself.
+scale the Anthropic API reports — its `output_tokens` **by direct measurement**, its
+input-side fields **by corroboration only**. That distinction is load-bearing and is
+spelled out under "What this does and does not establish"; it is stated here so the
+verdict cannot be quoted without it.
+
+For `output_tokens`, the relationship between a transcript's count and the provider's
+own tokenizer is **exact, affine, and slope-1**, and the *same* relationship holds for
+the API's own `output_tokens` on a response it generates itself.
 
 This closes ADR-0001 item 6 and the `Unverified:` note in Pillar 4, within the limits
 stated at the bottom — which are real and should be read before this is treated as
@@ -72,6 +76,14 @@ len=1359  c1=512  c2=1018  =>  E = 6
 len=1744  c1=668  c2=1330  =>  E = 6
 len=1899  c1=679  c2=1352  =>  E = 6
 ```
+
+**Provenance**, since it differs from what a re-run prints: these four came from an
+exploratory script written while establishing the method, which derived `E` from four
+separate turns to check the constant held. The committed harness derives it **once**,
+from the longest eligible turn, because one derivation is what the measurement needs
+and each costs two `count_tokens` calls. A re-run therefore prints a single
+`count_tokens envelope E = 6` line, not four. Running the committed command against
+c301b927 reproduces `E = 6` from its 3248-char turn.
 
 **E = 6**, invariant across all four.
 
@@ -142,10 +154,12 @@ Probe A' result: api = bare_text + thinking +2, CONSTANT across 4 call(s).
 api.output_tokens = tokens(text) + thinking_tokens + 2        (4 of 4 exact)
 ```
 
-A generation is not deterministic, and that is useful here rather than a nuisance: an
-earlier run of the same control produced entirely different responses (138 / 39 / 28 / 4
-output tokens) and yielded **the same `+2`**. The constant is a property of the reporting,
-not of the sample.
+A generation is not deterministic, and that is useful here rather than a nuisance. The
+control was run three times over the course of this story, producing three different sets
+of responses — `135 / 43 / 27 / 4`, `128 / 39 / 27 / 4` and `138 / 39 / 28 / 4` output
+tokens — and every one yielded **the same `+2`**, including across differing thinking
+counts (25, 23, 19, 18, 0). The constant is a property of the reporting, not of the
+sample.
 
 The headline transcript sample all report `thinking_tokens: 0`, so `tokens(text) + 2` is
 that same rule with its thinking term zero. **One rule, one constant, both auth modes.**
@@ -270,8 +284,15 @@ on it again:
 python -m tokenweir.parity \
   --transcript ~/.claude/projects/<project>/<session>.jsonl \
   --model claude-opus-5 \
-  --credential-file /path/to/api-key
+  --credential-file /path/to/api-key \
+  --control        # add this to re-establish the verdict itself
 ```
+
+`--control` is off by default and is the only part of the harness that spends
+*generation* tokens (four calls); everything else is `count_tokens`. Without it the
+command still measures the transcript side and reports whether its offset is constant —
+which is the cheap drift check — but it declines to print the parity verdict, because
+that verdict rests on the API-side comparison it did not make.
 
 The harness computes and prints the verdict itself, so a re-run does not require this
 document to interpret. It derives `E` on the spot, prints each turn's

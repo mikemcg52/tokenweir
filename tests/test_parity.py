@@ -33,6 +33,7 @@ from tokenweir.parity import (
     compare_usage,
     consistency_checks,
     credential,
+    is_headline_eligible,
     iter_turns,
     main,
 )
@@ -827,28 +828,25 @@ class TestThinkingIsNotSilentlyAccounted:
         assert turn.has_unaccounted_blocks is True
         assert turn.thinking_tokens == 503
 
-    def test_a_stripped_thinking_turn_never_reaches_the_headline(
-        self, tmp_path, capsys, monkeypatch
-    ):
-        """End to end: the command must not treat such a turn as text-only.
+    def test_a_stripped_thinking_turn_is_not_headline_eligible(self, tmp_path):
+        """The predicate, asserted directly.
 
-        Asserted through `main` rather than the predicate alone, because the
-        headline filter is where the exclusion actually has to happen — a correct
-        flag that the filter ignores would still produce a wrong measurement.
+        This test previously drove `main` on its *no-credential* path — where the
+        headline never runs — re-implemented the eligibility rule in its own body, and
+        finished with `assert "excluded from the headline" not in ...err`, a string
+        that exists nowhere in `src/`. Three ways of asserting nothing. Review 2
+        caught it. The real coverage lives in `TestMainCredentialedPath`, which drives
+        `main` with an injected opener and checks which texts reached the tokenizer;
+        this is now just the unit assertion on the module predicate.
         """
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         path = write_transcript(
             tmp_path / "t.jsonl",
             [
                 assistant(
-                    "msg_clean",
-                    usage=usage(cache_read=1),
-                    content=[{"type": "text", "text": "plain"}],
-                ),
-                assistant(
                     "msg_stripped",
                     usage=usage(
-                        cache_read=2, extra={"output_tokens_details": {"thinking_tokens": 366}}
+                        cache_read=2,
+                        extra={"output_tokens_details": {"thinking_tokens": 366}},
                     ),
                     content=[
                         {"type": "thinking", "thinking": ""},
@@ -857,19 +855,7 @@ class TestThinkingIsNotSilentlyAccounted:
                 ),
             ],
         )
-        turns = list(iter_turns(path))
-        eligible = [
-            t
-            for t in turns
-            if t.output_text.strip()
-            and not t.has_unaccounted_blocks
-            and not t.thinking_text
-            and t.thinking_tokens == 0
-        ]
-        assert [t.message_id for t in eligible] == ["msg_clean"]
-
-        assert main(["--transcript", str(path), "--model", "claude-opus-5"]) == 2
-        assert "excluded from the headline" not in capsys.readouterr().err
+        assert is_headline_eligible(next(iter(iter_turns(path)))) is False
 
     def test_thinking_tokens_alone_disqualifies_a_turn(self, tmp_path):
         """Even with no thinking block at all, a non-zero claim is disqualifying.
@@ -1056,7 +1042,11 @@ class TestMainCredentialedPath:
         monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
         opener = ScriptedOpener()
         main(
-            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            [
+                "--transcript", str(self._transcript(tmp_path)),
+                "--model", "claude-opus-5",
+                "--control",
+            ],
             opener=opener,
         )
         out = capsys.readouterr().out
@@ -1071,9 +1061,10 @@ class TestMainCredentialedPath:
     ):
         """The other branch, which must not quietly read as parity.
 
-        `thinking_tokens=9` on the control while the opener adds it to
-        `output_tokens` too means the API side's constant lands elsewhere than the
-        transcript's, which is exactly the correction-factor case FR-034 covers.
+        The transcript here reports `output_tokens = bare_text + 5`, while the
+        scripted API side reports `bare_text + thinking + 2`. Two different
+        constants, which is exactly the correction-factor case FR-034 covers, and
+        the harness must name it rather than rounding it up to parity.
         """
         monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
         transcript = write_transcript(
@@ -1087,7 +1078,10 @@ class TestMainCredentialedPath:
                 ),
             ],
         )
-        main(["--transcript", str(transcript), "--model", "claude-opus-5"], opener=ScriptedOpener())
+        main(
+            ["--transcript", str(transcript), "--model", "claude-opus-5", "--control"],
+            opener=ScriptedOpener(),
+        )
         out = capsys.readouterr().out
         assert "DIFFERENCE" in out
         assert "correction" in out.lower()
@@ -1221,3 +1215,133 @@ class TestAgreementWithTheHooksOwnScan:
         empty = write_transcript(tmp_path / "empty.jsonl", [])
         assert self._both(empty) == (0, 0)
         assert self._both(tmp_path / "missing.jsonl") == (0, 0)
+
+
+class TestProbeAPrimeIsOptIn:
+    """Review 2's M1. Probe A′ is the only probe that spends generation tokens, and
+    the routine reason to re-run this command is to check nothing has drifted — which
+    Probe A and Probe C answer for the price of a few `count_tokens` calls.
+
+    So it is off by default, and the verdict has to degrade honestly rather than let
+    a constant transcript offset read as the full parity result.
+    """
+
+    def _transcript(self, tmp_path):
+        return write_transcript(
+            tmp_path / "t.jsonl",
+            [_turn_with_bare_tokens(f"msg_{i}", 600 + i * 200) for i in range(3)],
+        )
+
+    def test_default_run_spends_no_generation_tokens(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        opener = ScriptedOpener()
+        main(
+            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            opener=opener,
+        )
+        out = capsys.readouterr().out
+
+        # Probe B's single call is the only /v1/messages request on the default path.
+        assert len(opener.message_bodies) == 1, "a default re-run generated more than Probe B"
+        assert "Probe A' " in out and "SKIPPED" in out
+        assert "--control" in out, "the report must say how to run the control"
+
+    def test_default_run_does_not_claim_the_parity_verdict(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        main(
+            ["--transcript", str(self._transcript(tmp_path)), "--model", "claude-opus-5"],
+            opener=ScriptedOpener(),
+        )
+        out = capsys.readouterr().out
+        assert "==> PARITY" not in out, "parity was claimed without the API-side control"
+        assert "Transcript side only" in out
+        assert "real tokens and unscaled" in out
+
+    def test_control_run_does_spend_generations_and_reaches_a_verdict(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        opener = ScriptedOpener()
+        main(
+            [
+                "--transcript", str(self._transcript(tmp_path)),
+                "--model", "claude-opus-5",
+                "--control",
+            ],
+            opener=opener,
+        )
+        out = capsys.readouterr().out
+        assert len(opener.message_bodies) > 1
+        assert "==> PARITY" in out
+
+    def test_varying_transcript_offset_reports_drift_without_the_control(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The other default-path branch: an offset that is not constant is drift,
+        and must be said so even though A′ never ran."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        transcript = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                _turn_with_bare_tokens("msg_a", 600),
+                # +9 instead of +2: the offset now varies across the population.
+                assistant(
+                    "msg_b",
+                    usage=usage(output_tokens=800 // 10 + 9, cache_read=800),
+                    content=[{"type": "text", "text": "b" * 800}],
+                ),
+            ],
+        )
+        main(["--transcript", str(transcript), "--model", "claude-opus-5"], opener=ScriptedOpener())
+        out = capsys.readouterr().out
+        assert "DRIFT" in out
+        assert "==> PARITY" not in out
+
+
+class TestTurnAccountingCloses:
+    """Review 2's M2. The report promised its arithmetic closed and it did not:
+    `excluded` enumerated two of the four disqualifying conditions, so a turn with no
+    text — or with thinking text but a zero thinking count — appeared in neither
+    bucket and vanished from the totals.
+    """
+
+    def test_eligible_plus_excluded_equals_every_turn(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        transcript = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                _turn_with_bare_tokens("msg_clean", 700),
+                # tool_use — unmeasurable
+                _turn_with_bare_tokens(
+                    "msg_tool",
+                    500,
+                    fill="t",
+                    content=[
+                        {"type": "text", "text": "t" * 500},
+                        {"type": "tool_use", "id": "u", "name": "B", "input": {}},
+                    ],
+                ),
+                # no text at all — one of the two the old accounting dropped
+                assistant("msg_empty", usage=usage(output_tokens=2), content=[]),
+                # thinking text with a zero thinking count — the other one
+                _turn_with_bare_tokens(
+                    "msg_thinking",
+                    400,
+                    fill="k",
+                    content=[
+                        {"type": "thinking", "thinking": "reasoning"},
+                        {"type": "text", "text": "k" * 400},
+                    ],
+                ),
+            ],
+        )
+        main(["--transcript", str(transcript), "--model", "claude-opus-5"], opener=ScriptedOpener())
+        out = capsys.readouterr().out
+
+        assert "turns with usage: 4" in out
+        assert "4 accounted for of 4 total" in out, (
+            "the buckets do not sum to the transcript's turns; a turn vanished from "
+            "the report, which is the defect review 2 found"
+        )
+        assert "1 of 1 eligible" in out
+        assert "3 excluded" in out

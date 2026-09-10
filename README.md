@@ -824,10 +824,15 @@ write-up to interpret:
 python -m tokenweir.parity \
   --transcript ~/.claude/projects/<project>/<session>.jsonl \
   --model claude-opus-5 \
-  --credential-file /path/to/api-key      # never pass the key as an argument
+  --credential-file /path/to/api-key \
+  --control                               # only needed to re-establish the verdict
 ```
 
-Without a credential it still runs its offline consistency checks and reports the run as
+Never pass the key as an argument — it is visible in `ps` and lands in shell history.
+
+`--control` is off by default: it is the only part of the harness that spends *generation*
+tokens, and the routine reason to re-run is drift, which the cheaper probes answer. Without
+a credential at all it still runs its offline consistency checks and reports the run as
 partial — that half needs no key and is the cheap early warning that something has moved.
 
 **[`docs/parity-subscription-vs-api.md`](docs/parity-subscription-vs-api.md) is canonical**
