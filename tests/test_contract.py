@@ -371,6 +371,11 @@ def test_core_module_sweep_actually_covers_the_package():
         "emitter.py",
         "amqp.py",
         "_ratelimit.py",
+        # The parity harness, added by TOKWEIR-9. It is the one module here that makes
+        # network calls of its own, and it makes them with `urllib` precisely so the
+        # core stays dependency-light — which is the property this sweep protects, and
+        # exactly the property a future edit reaching for an HTTP client would break.
+        "parity.py",
     } <= names
 
 

@@ -794,8 +794,55 @@ volatile, and cost is derived at report time from the rate card, as everywhere e
 this project.
 
 It also does not verify that a Max transcript's numbers agree with an API-key session's
-on the same model and context. ADR-0001 records that parity as `Unverified` and keeps it
-as its own item; this hook faithfully reports what the transcript says.
+on the same model and context — this hook faithfully reports what the transcript says,
+which is a different claim. That verification was done separately, in TOKWEIR-9, and
+**parity holds with no correction factor**; see below.
+
+## Is a Max transcript's token count real? (TOKWEIR-9)
+
+ADR-0001 kept one item open as `Unverified`: nothing had established that a Claude Max
+transcript's counts are denominated in the same token units the API reports and bills on.
+The Stop hook above reports the transcript faithfully, which is a different claim.
+
+**Measured on 2026-09-10 against `claude-opus-5` on Claude Code 2.1.263: parity holds,
+and no correction factor is needed** — `output_tokens` by direct measurement, the
+input-side fields by corroboration only. That split travels with the verdict wherever it
+is quoted. The measurement is not a literal Max-vs-API session
+diff — two such requests differ by their prompts, so their counts differ *correctly* — but
+a comparison against the provider's own tokenizer on the same text, corroborated by the
+same arithmetic run against the API's own generations.
+
+Two consequences for anyone reading records: all four billing fields exist on both sides
+under identical names, and `service_tier` reads `standard` on a Max subscription, so
+nothing in `usage` marks subscription traffic — `pricing_mode` has to come from the
+emitter, as it does.
+
+The result is **point-in-time**, because ADR-0001 records that the Max landscape is
+volatile. Re-run the harness after a Claude Code upgrade, a model change or a tier change;
+it derives its own constants and prints its own verdict, so it needs no reference to the
+write-up to interpret:
+
+```bash
+python -m tokenweir.parity \
+  --transcript ~/.claude/projects/<project>/<session>.jsonl \
+  --model claude-opus-5 \
+  --credential-file /path/to/api-key \
+  --control                               # only needed to re-establish the verdict
+```
+
+Never pass the key as an argument — it is visible in `ps` and lands in shell history.
+
+`--control` is off by default: it is the harness's only *expensive* probe (four generations
+of up to 300 `max_tokens`), and the routine reason to re-run is drift, which the cheaper
+probes answer. A credentialed run without it is not generation-free — Probe B spends one
+16-token generation on its field inventory — but everything else is `count_tokens`. Without
+a credential at all it still runs its offline consistency checks and reports the run as
+partial — that half needs no key and is the cheap early warning that something has moved.
+
+**[`docs/parity-subscription-vs-api.md`](docs/parity-subscription-vs-api.md) is canonical**
+for the method, the numbers, and the four things the measurement deliberately does *not*
+establish. It is deliberately the only place they live: a result that lapses on a Claude
+Code upgrade should not have to be corrected in four files.
 
 ## The store — schema, migrations and the writer
 

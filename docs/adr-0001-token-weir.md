@@ -92,7 +92,9 @@ Capture mechanism differs by how Claude Code is authenticated; both feed the *sa
   - **Phase/issue context:** hooks inherit Claude Code's process environment, so MADO's orchestrator injects `MADO_ISSUE_KEY`, `MADO_PHASE`, `MADO_STREAM_ID`, `MADO_PRICING_MODE` per iteration; the hook reads them onto the record. Attribution comes from the orchestrator, not the model.
   - **Fallback source:** Claude Code's OTel `claude_code.token.usage` metric (works under both auth modes) is a viable secondary adapter where an OTLP collector exists, accepting coarser (~60s, per-API-request) granularity.
 
-  `Unverified:` docs don't explicitly confirm token-count parity between subscription and API-key transcripts — the single check is to diff a Max-session transcript against an API-key session on the same model/context. Do this before relying on subscription numbers.
+  ~~`Unverified:` docs don't explicitly confirm token-count parity between subscription and API-key transcripts — the single check is to diff a Max-session transcript against an API-key session on the same model/context. Do this before relying on subscription numbers.~~
+
+  **Verified (TOKWEIR-9, 2026-09-10).** Parity holds; no correction factor is needed. A Max transcript's `output_tokens` is a true token count on the provider's scale — measured directly against the provider's own tokenizer, and satisfying the same arithmetic rule the API's own reporting satisfies. The input-side fields rest on corroboration rather than direct measurement, because a Claude Code request's exact bytes are not reconstructable; that split travels with the verdict. All four billing fields are present on both sides under identical names. Note the transcript's `service_tier` reads `standard` on a Max subscription, so nothing in the usage object marks subscription traffic — `pricing_mode` must come from the emitter, as it does. **Point-in-time**, per the volatility note below: re-run `python -m tokenweir.parity` after a Claude Code or model change. The measured numbers, the method and the limits live in one place, [`docs/parity-subscription-vs-api.md`](parity-subscription-vs-api.md), so a result that lapses is corrected there and not in four files.
 
   **Scope now:** store raw tokens/requests per iteration under `pricing_mode=subscription`; **defer** %-of-limit / capacity modeling (Max tiers and weekly caps are volatile). Cost/capacity views are computed at report time, consistent with "raw stored, dollars derived, provider invoice authoritative."
 
@@ -105,7 +107,7 @@ Ownership of `gateway_usage` and its forward-only migrations (001–006) moves i
 
 **Harder / new work:** a real extraction refactor; defining and versioning the public record contract and Sink/Source interfaces; moving schema/migration ownership; building the subscription `Stop`-hook adapter and the orchestrator env injection; standing up a broker-less cloud writer path.
 
-**To revisit:** the `Unverified` subscription-transcript parity check; whether the cloud-edge writer co-deploys with or separates from the store; %-of-limit capacity modeling once the Max limit landscape settles; OSS license choice (permissive vs. AGPL) — deferred to release time, not blocking this ADR.
+**To revisit:** ~~the `Unverified` subscription-transcript parity check~~ (settled by TOKWEIR-9 — but as a point-in-time result that lapses on a Claude Code, model or tier change, so it is re-checkable rather than closed forever); whether the cloud-edge writer co-deploys with or separates from the store; %-of-limit capacity modeling once the Max limit landscape settles; OSS license choice (permissive vs. AGPL) — deferred to release time, not blocking this ADR.
 
 ## Action Items
 
@@ -114,7 +116,7 @@ Ownership of `gateway_usage` and its forward-only migrations (001–006) moves i
 3. [ ] Rewrite MADO-216 story 1: target the cloud-edge / `tokenweir` consumer instead of assuming the homelab gateway; add the reconciliation note and the AIGWAY-003 dependency.
 4. [ ] Refactor AI Gateway to consume `tokenweir` (move schema/migrations out; pin a version).
 5. [x] Build the subscription capture adapter: `Stop` hook → transcript delta → `tokenweir` emitter; orchestrator injects `MADO_*` env per iteration — landed as `tokenweir.claude_code` (TOKWEIR-7). The orchestrator half is MADO's to inject; the hook reads whatever of it is present.
-6. [ ] Verify subscription vs API-key transcript token parity (the `Unverified` check) before trusting Max numbers.
+6. [x] Verify subscription vs API-key transcript token parity (the `Unverified` check) before trusting Max numbers — done in TOKWEIR-9: **parity, no correction factor**, measured against the provider's tokenizer rather than by the un-runnable literal session diff. See [`docs/parity-subscription-vs-api.md`](parity-subscription-vs-api.md) for the method, the numbers, and the four things it deliberately does not establish.
 7. [ ] Defer: %-of-limit capacity model; OSS license selection.
 
 ### Landed in the library so far
@@ -138,8 +140,16 @@ checked, and these are the commits that make it true rather than stated:
   Pillar 2's dependency-light core still holds with it in the package.
 
 Still outstanding on the consumer side: item 4 (the gateway consumes `tokenweir`).
-Item 6 — the `Unverified` parity check — is **unaffected by TOKWEIR-7 and still
-open**: the hook faithfully reports what a Max transcript says, which is a different
-claim from those numbers agreeing with an API-key session's on the same model and
-context. Pillar 4 says to do that diff before trusting subscription figures, and
-shipping the capture path does not do it.
+
+Item 6 — the `Unverified` parity check — was **settled separately by TOKWEIR-9**, and
+the distinction that kept it open is worth preserving now that it is closed. TOKWEIR-7
+established only that the hook faithfully reports what a Max transcript says; TOKWEIR-9
+established that what the transcript says is denominated in the provider's own token
+units. Two different claims, and shipping the capture path only ever discharged the
+first.
+
+- **TOKWEIR-9** — `tokenweir.parity`, the harness that measured it, and
+  [`docs/parity-subscription-vs-api.md`](parity-subscription-vs-api.md), the finding.
+  It is a spike harness rather than part of the capture path: the hook never imports it
+  and it never runs on a metered request. Like everything else in the core it carries no
+  third-party import — the two API calls it makes go through `urllib`.

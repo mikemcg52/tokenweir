@@ -103,6 +103,49 @@ stderr knob. The consequence is that a *persistently* misconfigured hook is quie
 and the operator-facing answer to that is the store: a stream that reports no
 usage is the signal, not a log line nobody collected.
 
+Are the numbers it reads real? Yes — measured, not assumed
+---------------------------------------------------------
+
+This module only ever claimed to report a transcript *faithfully*. Whether a Max
+transcript's counts are denominated in the same token units the API reports and
+bills on is a **separate** claim, and ADR-0001 kept it open as an ``Unverified``
+item for exactly that reason.
+
+TOKWEIR-9 measured it, on **2026-09-10**, against **``claude-opus-5`` on Claude Code
+2.1.263**. **Parity holds and no correction factor is needed**, so nothing here
+adjusts, scales or annotates the counts it reads — which is why this note is
+documentation rather than code. The date and version are repeated here, against the
+single-source rule the rest of this note follows, because staleness is the one thing
+a reader of *this* file must be able to judge without opening another.
+
+A transcript's ``output_tokens`` was measured
+directly against the provider's own tokenizer and satisfies the same arithmetic rule
+the API's own reporting satisfies; the input-side fields rest on corroboration rather
+than direct measurement. The numbers, the method and the limits are deliberately not
+repeated here — see the finding, so that a result which lapses is corrected in one
+place.
+
+Three things about that result bear on this module directly:
+
+- **The four fields this module reads** (:data:`_COUNT_FIELDS`) exist on both sides
+  under identical names. Nothing it depends on is renamed or absent under
+  subscription auth.
+- **Nothing in ``usage`` marks subscription traffic.** ``service_tier`` reads
+  ``standard`` on a Max subscription, the same as on an API key. So
+  ``pricing_mode`` must come from the environment the orchestrator injected — as it
+  does — and could never have been inferred from the transcript.
+- **The result is point-in-time.** ADR-0001 notes the Max landscape is volatile, and
+  the measurement was made against the one model and Claude Code version named above.
+  It is not a permanent property of the format, and re-running
+  ``python -m tokenweir.parity`` after a Claude Code, model or tier change is the
+  intended way to renew it. :mod:`tokenweir.parity`'s offline checks need no
+  credential and are the cheap early warning.
+
+Method, numbers and the four things the measurement deliberately does **not**
+establish — chiefly that it says nothing about what a subscription is *billed*, and
+that the input side rests on corroboration rather than direct measurement — are in
+``docs/parity-subscription-vs-api.md``.
+
 Installing it
 -------------
 
