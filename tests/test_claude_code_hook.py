@@ -25,6 +25,7 @@ a laptop and fail in the pod that this code is written for, or worse, the revers
 
 import io
 import json
+import logging
 import os
 import sys
 import threading
@@ -1239,6 +1240,106 @@ def test_attribution_falls_back_to_subscription_for_an_unrecognized_mode(
 
     assert record is not None
     assert record.pricing_mode is PricingMode.SUBSCRIPTION
+
+
+def test_attribution_writes_the_phase_as_a_canonical_label(transcript, monkeypatch):
+    """TOKWEIR-8 FR-015, US3 AC2. The orchestrator that exports `MADO_PHASE` may
+    predate the taxonomy, or a phase may have been stamped by hand — either way the
+    record carries the one label, so a report grouping by phase does not split a lane
+    in two over a spelling."""
+    monkeypatch.setenv("MADO_PHASE", "1st review")
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    run(hook_stdin(transcript), into(sink))
+
+    assert sink.records[0].queue == "review-1"
+
+
+def test_attribution_keeps_a_phase_outside_the_taxonomy(transcript, monkeypatch, caplog):
+    """TOKWEIR-8 FR-016, SC-004, US3 AC3. The lifecycle may grow a phase before this
+    library hears about it. Losing the attribution would be a worse answer than
+    carrying an unrecognized one, so the value survives — and is noted, because a
+    taxonomy nobody is told has been missed is a taxonomy that quietly rots."""
+    monkeypatch.setenv("MADO_PHASE", "deploy_step")
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.claude_code"):
+        run(hook_stdin(transcript), into(sink))
+
+    assert sink.records[0].queue == "deploy step"
+    notes = [message for message in caplog.messages if "taxonomy" in message]
+    assert notes
+    assert "'deploy_step'" in notes[0], (
+        "the diagnostic must name the value as exported: an operator goes looking "
+        "for it in their orchestrator's configuration, where the normalized "
+        "spelling appears nowhere (review 1, Low-3)"
+    )
+
+
+@pytest.mark.parametrize("value", ["_", "#", "__ ##"])
+def test_attribution_reads_a_separator_only_phase_as_no_phase(
+    transcript, monkeypatch, caplog, value
+):
+    """TOKWEIR-8 FR-006. `_` folds to nothing, so it says "no phase" in the same way
+    `""` does — and the producer refuses to export it for that reason, so the hook is
+    reading a value only a hand-stamped or mis-expanded environment produces.
+
+    It is recorded as no phase — but **said**, not swallowed (review 5, Med-2). Before
+    this story the value reached the record as `'_'`; turning visible junk into an
+    invisible absence is a regression unless something announces it, and the likeliest
+    way to produce `_` is a template that expanded to nothing (`${KIND}_${N}` with
+    neither set), which is precisely the fault an operator needs to hear about rather
+    than read off an empty column."""
+    monkeypatch.setenv("MADO_PHASE", value)
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.claude_code"):
+        record = run(hook_stdin(transcript), into(sink))
+
+    assert record is not None
+    assert record.queue is None
+    assert [message for message in caplog.messages if "folds to nothing" in message]
+    assert not [message for message in caplog.messages if "taxonomy" in message]
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_attribution_says_nothing_when_no_phase_was_exported(
+    transcript, monkeypatch, caplog, value
+):
+    """The bound on the note above. An unattributed run — a laptop, a stream with no
+    orchestrator — is the common case, and a warning on every turn of it is a warning
+    an operator learns to filter out, taking the separator-only signal with it."""
+    if value is None:
+        monkeypatch.delenv("MADO_PHASE", raising=False)
+    else:
+        monkeypatch.setenv("MADO_PHASE", value)
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.claude_code"):
+        record = run(hook_stdin(transcript), into(sink))
+
+    assert record is not None and record.queue is None
+    assert not caplog.messages
+
+
+def test_attribution_does_not_warn_about_a_phase_it_recognizes(
+    transcript, monkeypatch, caplog
+):
+    """The other half of FR-016. A diagnostic that fires for a correct value is one an
+    operator learns to ignore, which costs the diagnostic its only purpose."""
+    monkeypatch.setenv("MADO_PHASE", "2nd fix")
+    transcript.append(transcript_entry(message_id="msg_a", usage=usage(10, 1)))
+    sink = RecordingSink()
+
+    with caplog.at_level(logging.WARNING, logger="tokenweir.claude_code"):
+        run(hook_stdin(transcript), into(sink))
+
+    assert sink.records[0].queue == "fix-2"
+    assert not [message for message in caplog.messages if "taxonomy" in message]
 
 
 def test_attribution_honours_a_recognized_pricing_mode_override(

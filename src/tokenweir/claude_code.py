@@ -127,6 +127,7 @@ from typing import IO, Any, Callable, Mapping, Optional, Tuple
 
 from tokenweir.contract import PricingMode, UsageRecord
 from tokenweir.emitter import BufferedEmitter
+from tokenweir.orchestrator import ATTRIBUTION_ENV, is_canonical_phase, normalize_phase
 from tokenweir.sink import NullSink, Sink, emit_usage
 
 #: What this module offers a caller. The baseline machinery — ``read_baseline``,
@@ -682,28 +683,65 @@ def attribution_from_env() -> dict[str, Any]:
       Assumptions and in the README so that a future v2 can move it deliberately
       rather than discover it.
 
+    The phase is read through :func:`tokenweir.orchestrator.normalize_phase`
+    (TOKWEIR-8 FR-015), so ``1st review`` and ``review_1`` reach the record as the
+    one label ``review-1`` whether the orchestrator was written before this
+    taxonomy existed or a phase was stamped by hand. That module defines the
+    vocabulary; this one does not restate it. A phase outside the taxonomy is
+    **kept** and noted (FR-016) — the hook may not lose a turn's attribution over a
+    label it does not know, any more than it may over a pricing mode it does not
+    know.
+
     ``pricing_mode`` defaults to ``subscription`` — that is the whole point of this
     capture path — and an unrecognized ``MADO_PRICING_MODE`` falls **back** to it
     rather than dropping the record (FR-018). A misconfigured environment variable
     losing a turn's metering would be the tail wagging the dog.
     """
     mode: PricingMode = PricingMode.SUBSCRIPTION
-    declared = _env("MADO_PRICING_MODE")
+    declared = _env(ATTRIBUTION_ENV["pricing_mode"])
     if declared is not None:
         try:
             coerced = PricingMode.coerce(declared)
         except ValueError:
             _note(
-                f"MADO_PRICING_MODE={declared!r} is not a recognized mode; "
-                "recording as subscription"
+                f"{ATTRIBUTION_ENV['pricing_mode']}={declared!r} is not a recognized "
+                "mode; recording as subscription"
             )
         else:
             if coerced is not None:
                 mode = coerced
+
+    written = _env(ATTRIBUTION_ENV["phase"])
+    phase = normalize_phase(written)
+    if written is not None and phase is None:
+        # The value had content and folded to nothing — it was made only of the
+        # separators the taxonomy folds (`_`, `#`). That is "no phase" by the same rule
+        # the producer refuses to export it under, so the field is left unset; but it
+        # is *said*, because the likeliest way to get here is a template that expanded
+        # to nothing (`${KIND}_${N}` with neither set), and an orchestrator quietly
+        # recording no phase for every turn is exactly the failure nobody notices
+        # (review 5, Med-2). `_env` has already ruled out unset and whitespace-only,
+        # so this cannot fire on an ordinary unattributed run.
+        _note(
+            f"{ATTRIBUTION_ENV['phase']}={written!r} is made only of separators and "
+            "folds to nothing; recording no phase"
+        )
+    elif phase is not None and not is_canonical_phase(phase):
+        # The value as read, not as normalized: an operator debugging this goes
+        # looking for the string in their orchestrator's configuration, and
+        # `'deploy step'` appears nowhere in a config that says `deploy_step`
+        # (review 1, Low-3). "As read" rather than "as exported" because `_env` has
+        # already trimmed the ends — a phase exported with surrounding spaces is
+        # reported without them (review 4, Low-4). The middle, which is the part that
+        # differs after folding, is untouched.
+        _note(
+            f"{ATTRIBUTION_ENV['phase']}={written!r} is not a phase in the "
+            "orchestrator taxonomy; recording it as given"
+        )
     return {
-        "workload": _env("MADO_ISSUE_KEY"),
-        "queue": _env("MADO_PHASE"),
-        "parent_request_id": _env("MADO_STREAM_ID"),
+        "workload": _env(ATTRIBUTION_ENV["issue_key"]),
+        "queue": phase,
+        "parent_request_id": _env(ATTRIBUTION_ENV["stream_id"]),
         "pricing_mode": mode,
     }
 

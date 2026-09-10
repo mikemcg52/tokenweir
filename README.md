@@ -603,6 +603,93 @@ column would say the field was populated.
 > down here, in the module, and in the story's spec so a future v2 can move it
 > deliberately rather than find it.
 
+### The phase taxonomy, and what the orchestrator must export (TOKWEIR-8)
+
+`MADO_PHASE` lands in a free-text column, so without a defined vocabulary `review`,
+`Review`, `1st review`, `review 1` and `review-1` are five different strings for one
+phase of one run — and a report grouping by phase shows five lanes where the work had
+one. `tokenweir.orchestrator` defines the vocabulary both ends use.
+
+**The kinds** are the orchestrator's own, taken from `mado-phase begin --phase` (*"one of:
+implementation, review, fix"*) rather than invented here. The loop — implement → review
+→ fix → review → … — is what makes a kind recur, so a label is a kind and, optionally,
+which occurrence of it:
+
+```text
+implementation        a kind on its own
+review-1  fix-1       a kind and a positive occurrence, hyphen-joined
+review-12             any occurrence — the fix-round cap is configurable
+```
+
+The set of kinds is closed; the occurrence is not. A bare kind means *the orchestrator
+did not say which occurrence*, which is not the same claim as "the first" — so nothing
+here ever invents a `-1`.
+
+**Reading is forgiving.** `normalize_phase` maps what a human or an older orchestrator
+would write onto the canonical label: case, `_` and `#` separators, surrounding
+whitespace, a leading English ordinal (`1st review`, `22nd fix`), a trailing number
+(`review 2`), and the aliases `bug fix`/`bug-fix`/`bugfix` → `fix` and
+`implement` → `implementation`. A minus sign where an occurrence would go (`review -1`)
+is not an occurrence and not a shape this reads: it is an unrecognized phase, kept and
+logged like any other. Ordinal suffixes are validated rather than stripped, so `11th` is 11
+and `11st` is not an ordinal at all. A phase the taxonomy does not recognize is **kept**
+and logged — the lifecycle may grow a phase before this library hears about it, and a
+record carrying `deploy` is worth more than a record carrying nothing. Separators are
+folded in the preserved value too (`deploy_step` is kept as `deploy step`), so an
+unknown phase does not split into as many lanes as it has spellings; the log names the
+value as read — as you exported it, minus surrounding whitespace — so you can still find
+it in your own configuration. Case is left alone in a preserved value (`Deploy` stays
+`Deploy`): folding separators repairs a spelling of the same word, while folding case
+would be editing what an unknown phase is called.
+
+Unset and blank still mean "no phase" and still leave the field `None` — and so does a
+value made only of the separators that get folded (`_`, `#`, `__ ##`), at both ends: the
+builder refuses it, and the hook records no phase and **logs that it did**, since a
+template that expanded to nothing is the likeliest way to produce one and an empty column
+is the hardest place to notice it.
+
+**Writing is strict.** The producer builds the block from the contract rather than
+spelling the variable names by hand, and hears about a value it cannot use:
+
+```python
+from tokenweir import attribution_env, phase_label
+
+env.update(attribution_env(
+    issue_key="TOKWEIR-8",
+    phase=phase_label("fix", 2),      # 'fix-2'
+    stream_id=stream_id,
+))
+```
+
+`attribution_env` returns **all four variables on every call**, using `''` for a value
+the caller does not have. That is the load-bearing part: a block that omitted what it
+had nothing to say about would leave the previous iteration's phase standing during the
+next one, and the resulting record would be well-formed, plausible and wrong. A blank
+issue key, a blank stream id, a blank phase, a non-positive occurrence on a known kind
+(`review-0`, `review 0`, `0th fix`) or an unrecognized pricing mode raises
+instead of being exported. Surrounding whitespace on the issue key and stream id is
+stripped rather than exported, since `' TOKWEIR-8 '` and `'TOKWEIR-8'` are one issue to
+a reader and two rows to anything grouping by the column. A phase the taxonomy does not
+*recognize* is not in that list — `deploy` passes through, because the lifecycle is
+MADO's to extend — the hook tolerates such values because it may not
+fail a session, while a producer is a program with a bug worth surfacing.
+
+So the orchestrator's obligation is: **export the whole block, on every iteration,
+before the turn**, into the environment Claude Code inherits.
+
+**Version skew.** The orchestrator depends on this package and the two ends deploy
+separately, so they can disagree about the taxonomy — harmlessly, and in one direction:
+a producer that knows a kind the reader's `tokenweir` does not exports a canonical
+label, and the older reader keeps it verbatim and logs it as unrecognized. Adding a kind
+is additive at both ends, and neither has to be upgraded first.
+
+> **The orchestrator-side change is not in this repository.** MADO's orchestrator is
+> `services/orchestrator/` in the `mado` repo. TOKWEIR-8 delivers the contract here —
+> the taxonomy, the builder, and the hook's conformance to it — and the export itself is
+> a separate change over there, tracked as **MADO-419** and written against this
+> contract. Until it lands, records from a Max-authenticated stream carry no issue key
+> and no phase, however green this repo's suite is.
+
 ### Everything else it reads
 
 | Variable | Effect |
