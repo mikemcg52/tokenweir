@@ -191,8 +191,13 @@ must say so rather than reading as permanent.
   carrying every hazard — so the two cannot drift apart unnoticed. That is a deviation from a MUST
   resolved in the implementer's favour, and a reader should weigh it as one.
 - **FR-003**: The harness MUST provide a pure comparison that, given two usage mappings, reports
-  per field: both values, their absolute difference, and their ratio where the reference is
-  non-zero.
+  per field: both values, their **signed** difference, and their ratio where the reference is
+  non-zero. Signed rather than absolute, and deliberately: `compare_usage` computes
+  `observed - reference` and passes a negative value through unchanged rather than folding it into
+  a magnitude. A negative count is a discrepancy worth reporting, not one worth hiding — the same
+  reasoning `_numeric` states for why it does not clamp. (Corrected here: the terminal review
+  [TOKWEIR-60] found this bullet still said "absolute difference" against a signed
+  implementation.)
 - **FR-004**: The comparison MUST classify each field's result as `parity` (exact agreement),
   `offset` (a difference), or `absent` (the field is missing on one side), and MUST NOT report
   `parity` for a field absent on either side.
