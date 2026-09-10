@@ -120,6 +120,86 @@ class TestIterTurns:
         assert len(turns) == 1
         assert turns[0].message_id == "msg_1"
 
+    def test_usage_is_counted_once_across_sibling_lines(self, tmp_path):
+        """Usage is taken once per response, not summed over its lines."""
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant("msg_1", usage=usage(output_tokens=500)),
+                assistant("msg_1", usage=usage(output_tokens=500)),
+            ],
+        )
+        turns = list(iter_turns(path))
+        assert len(turns) == 1
+        assert turns[0].usage["output_tokens"] == 500
+
+    def test_content_is_merged_across_sibling_lines(self, tmp_path):
+        """The regression test for the bug the real measurement exposed.
+
+        Sibling lines sharing a `message.id` do not *repeat* the content — they
+        *divide* it. A real response is written as one line carrying its `text`
+        block and another carrying its `tool_use` block, while both carry the whole
+        response's aggregate `output_tokens`.
+
+        The first version of this harness kept the first line and dropped the rest,
+        so it paired 20 characters of text with the token count for a 37 KB tool
+        call, reported a transcript claiming 14,142 output tokens against a
+        tokenizer count of 12, and read its own bug as a parity failure.
+
+        Two things must hold, and the second is what actually broke: the text is
+        concatenated across every line, and `has_unaccounted_blocks` is true if *any*
+        line carried one. Per-line inspection could never set that flag, because
+        each individual line holds exactly one kind of block.
+        """
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant(
+                    "msg_1",
+                    usage=usage(output_tokens=14142),
+                    content=[{"type": "text", "text": "Now the test module:"}],
+                ),
+                assistant(
+                    "msg_1",
+                    usage=usage(output_tokens=14142),
+                    content=[
+                        {"type": "tool_use", "id": "tu_1", "name": "Write", "input": {"x": "y"}}
+                    ],
+                ),
+            ],
+        )
+        turns = list(iter_turns(path))
+        assert len(turns) == 1
+        assert turns[0].output_text == "Now the test module:"
+        assert turns[0].has_unaccounted_blocks is True, (
+            "the tool_use sibling was dropped; this turn would be treated as "
+            "text-only and wreck Probe A's headline"
+        )
+
+    def test_text_from_several_lines_is_concatenated_in_order(self, tmp_path):
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant("msg_1", content=[{"type": "text", "text": "first "}]),
+                assistant("msg_1", content=[{"type": "text", "text": "second"}]),
+            ],
+        )
+        turns = list(iter_turns(path))
+        assert [t.output_text for t in turns] == ["first second"]
+
+    def test_entries_without_an_id_are_not_merged_together(self, tmp_path):
+        """Two unrelated responses that both lack an id must stay two responses."""
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                {"message": {"usage": usage(), "content": [{"type": "text", "text": "a"}]}},
+                {"message": {"usage": usage(), "content": [{"type": "text", "text": "b"}]}},
+            ],
+        )
+        turns = list(iter_turns(path))
+        assert [t.output_text for t in turns] == ["a", "b"]
+        assert [t.message_id for t in turns] == [None, None]
+
     def test_skips_malformed_and_usageless_entries(self, tmp_path):
         path = write_transcript(
             tmp_path / "t.jsonl",
@@ -149,14 +229,21 @@ class TestIterTurns:
         )
         turn = next(iter(iter_turns(path)))
         assert turn.output_text == "one two"
-        assert turn.has_non_text_blocks is False
+        assert turn.has_unaccounted_blocks is False
 
-    def test_flags_tool_use_and_thinking_blocks(self, tmp_path):
-        """These turns must be excluded from Probe A's headline.
+    def test_tool_use_is_unaccounted_but_thinking_is_not(self, tmp_path):
+        """The distinction the whole headline rests on.
 
-        `output_tokens` covers thinking and tool_use; the reconstructable text
-        does not, so such a turn under-counts on the tokenizer side for a reason
-        that has nothing to do with parity.
+        A `tool_use` block's tokens count toward `output_tokens` and its content is
+        a JSON payload this harness cannot re-tokenize faithfully — so a turn
+        carrying one is excluded rather than averaged in.
+
+        A `thinking` block is different: its content *is* recoverable, and the
+        provider reports its tokens separately as
+        `output_tokens_details.thinking_tokens`. Keeping it accounted is what lets
+        that field be checked rather than trusted, and treating it as unaccounted
+        would have thrown away the 164 thinking turns this session's transcripts
+        actually contain.
         """
         path = write_transcript(
             tmp_path / "t.jsonl",
@@ -178,14 +265,66 @@ class TestIterTurns:
             ],
         )
         turns = list(iter_turns(path))
-        assert [t.has_non_text_blocks for t in turns] == [True, True]
+        assert [t.has_unaccounted_blocks for t in turns] == [True, False]
         assert [t.output_text for t in turns] == ["calling", "answer"]
+        assert [t.thinking_text for t in turns] == ["", "hmm"]
+
+    def test_redacted_thinking_is_unaccounted(self, tmp_path):
+        """It has tokens and no recoverable content — exactly what the flag is for."""
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [assistant(content=[{"type": "redacted_thinking", "data": "opaque"}])],
+        )
+        turn = next(iter(iter_turns(path)))
+        assert turn.has_unaccounted_blocks is True
+        assert turn.thinking_text == ""
+
+    def test_thinking_text_merges_across_lines(self, tmp_path):
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant("msg_1", content=[{"type": "thinking", "thinking": "step one "}]),
+                assistant("msg_1", content=[{"type": "thinking", "thinking": "step two"}]),
+                assistant("msg_1", content=[{"type": "text", "text": "done"}]),
+            ],
+        )
+        turns = list(iter_turns(path))
+        assert len(turns) == 1
+        assert turns[0].thinking_text == "step one step two"
+        assert turns[0].output_text == "done"
+        assert turns[0].has_unaccounted_blocks is False
+
+    def test_a_block_whose_content_is_not_a_string_is_unaccounted(self, tmp_path):
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant("msg_a", content=[{"type": "text", "text": {"not": "a string"}}]),
+                assistant("msg_b", content=[{"type": "thinking", "thinking": 42}]),
+                assistant("msg_c", content=["not a mapping"]),
+            ],
+        )
+        assert [t.has_unaccounted_blocks for t in iter_turns(path)] == [True, True, True]
+
+    def test_thinking_tokens_reads_the_claim_or_zero(self, tmp_path):
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant(
+                    "msg_a",
+                    usage=usage(extra={"output_tokens_details": {"thinking_tokens": 25}}),
+                ),
+                assistant("msg_b", usage=usage(extra={"output_tokens_details": {}})),
+                assistant("msg_c", usage=usage()),
+                assistant("msg_d", usage=usage(extra={"output_tokens_details": "not a mapping"})),
+            ],
+        )
+        assert [t.thinking_tokens for t in iter_turns(path)] == [25, 0, 0, 0]
 
     def test_string_content_is_taken_at_face_value(self, tmp_path):
         path = write_transcript(tmp_path / "t.jsonl", [assistant(content="plain string")])
         turn = next(iter(iter_turns(path)))
         assert turn.output_text == "plain string"
-        assert turn.has_non_text_blocks is False
+        assert turn.has_unaccounted_blocks is False
 
     def test_unreadable_file_yields_nothing_rather_than_raising(self, tmp_path):
         assert list(iter_turns(tmp_path / "does-not-exist.jsonl")) == []
@@ -653,3 +792,102 @@ class TestMain:
         """FR-020: an argument is visible in `ps` and lands in shell history."""
         with pytest.raises(SystemExit):
             main(["--transcript", str(tmp_path / "t.jsonl"), "--model", "m", SECRET])
+
+
+class TestThinkingIsNotSilentlyAccounted:
+    """The second instance of the harness's central hazard, and its guard.
+
+    Claude Code writes `{"type": "thinking", "thinking": ""}` into a transcript
+    while still reporting a non-zero `output_tokens_details.thinking_tokens`: the
+    content is stripped, the tokens are real. A block like that must count as
+    *unaccounted*, because a turn whose output_tokens covers tokens the harness
+    cannot re-tokenize is exactly what the headline has to exclude.
+
+    Four real turns in this session's transcripts claimed 71, 176, 366 and 503
+    thinking tokens behind an empty thinking block. Had they reached the headline
+    they would each have looked like a several-hundred-token parity failure that was
+    nothing of the kind.
+    """
+
+    def test_empty_thinking_block_is_unaccounted(self, tmp_path):
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant(
+                    "msg_stripped",
+                    usage=usage(extra={"output_tokens_details": {"thinking_tokens": 503}}),
+                    content=[
+                        {"type": "thinking", "thinking": ""},
+                        {"type": "text", "text": "the visible answer"},
+                    ],
+                )
+            ],
+        )
+        turn = next(iter(iter_turns(path)))
+        assert turn.has_unaccounted_blocks is True
+        assert turn.thinking_tokens == 503
+
+    def test_a_stripped_thinking_turn_never_reaches_the_headline(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """End to end: the command must not treat such a turn as text-only.
+
+        Asserted through `main` rather than the predicate alone, because the
+        headline filter is where the exclusion actually has to happen — a correct
+        flag that the filter ignores would still produce a wrong measurement.
+        """
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant(
+                    "msg_clean",
+                    usage=usage(cache_read=1),
+                    content=[{"type": "text", "text": "plain"}],
+                ),
+                assistant(
+                    "msg_stripped",
+                    usage=usage(
+                        cache_read=2, extra={"output_tokens_details": {"thinking_tokens": 366}}
+                    ),
+                    content=[
+                        {"type": "thinking", "thinking": ""},
+                        {"type": "text", "text": "answer"},
+                    ],
+                ),
+            ],
+        )
+        turns = list(iter_turns(path))
+        eligible = [
+            t
+            for t in turns
+            if t.output_text.strip()
+            and not t.has_unaccounted_blocks
+            and not t.thinking_text
+            and t.thinking_tokens == 0
+        ]
+        assert [t.message_id for t in eligible] == ["msg_clean"]
+
+        assert main(["--transcript", str(path), "--model", "claude-opus-5"]) == 2
+        assert "excluded from the headline" not in capsys.readouterr().err
+
+    def test_thinking_tokens_alone_disqualifies_a_turn(self, tmp_path):
+        """Even with no thinking block at all, a non-zero claim is disqualifying.
+
+        This is the belt-and-braces half: the filter asks the provider's own number
+        rather than inferring from block shape, so a transcript layout nobody has
+        seen yet cannot smuggle unrecoverable tokens into the headline.
+        """
+        path = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant(
+                    "msg_no_block",
+                    usage=usage(extra={"output_tokens_details": {"thinking_tokens": 71}}),
+                    content=[{"type": "text", "text": "visible only"}],
+                )
+            ],
+        )
+        turn = next(iter(iter_turns(path)))
+        assert turn.has_unaccounted_blocks is False, "no block is malformed here"
+        assert turn.thinking_tokens == 71, "but tokens were spent out of sight"

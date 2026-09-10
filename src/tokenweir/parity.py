@@ -49,10 +49,12 @@ Probe A's two confounders are characterized rather than assumed away.
 ``count_tokens`` counts a whole message request, so a few tokens of envelope
 overhead ride along — a *constant*, which shows up across turns of differing
 length as an offset that does not scale, distinguishable from a ratio. And a turn
-whose output includes ``thinking`` or ``tool_use`` blocks has ``output_tokens``
-covering more than the text we can reconstruct, so those turns are reported
-separately from the text-only headline rather than averaged in. That is why the
-probe runs over a *population* of turns and reports a distribution.
+whose output includes a ``tool_use`` block has ``output_tokens`` covering a JSON
+payload this harness cannot re-tokenize faithfully, so such turns are excluded from
+the headline rather than averaged in. ``thinking`` blocks *are* recoverable and are
+kept separately, which is what lets ``output_tokens_details.thinking_tokens`` be
+checked rather than trusted. That is why the probe runs over a *population* of
+turns and reports a distribution.
 
 What this can and cannot establish
 ----------------------------------
@@ -142,12 +144,24 @@ class Turn:
     usage *beside the text of that same turn*, which is the only way to ask the
     tokenizer about the identical artifact.
 
-    ``has_non_text_blocks`` is what keeps the headline honest. ``output_tokens``
-    covers every block the model emitted — ``thinking`` and ``tool_use`` included —
-    while ``output_text`` can only carry the text ones. A turn with either is
-    therefore expected to under-count on the tokenizer side for a reason that has
-    nothing to do with parity, so it is flagged here and reported separately
-    rather than averaged into the result.
+    ``output_text`` is the response's text **gathered across every transcript line
+    that carries it**, not one line's worth — see :func:`iter_turns` for why the
+    difference is the whole ballgame.
+
+    ``thinking_text`` is kept **separately** rather than folded into
+    ``output_text``, because the two are counted separately by the provider:
+    ``output_tokens_details.thinking_tokens`` reports the thinking half on its own.
+    Keeping them apart is what lets the harness check that field independently
+    instead of taking it on trust.
+
+    ``has_unaccounted_blocks`` is what keeps the headline honest. ``output_tokens``
+    covers every block the model emitted, and a ``tool_use`` block's tokens cannot
+    be recovered from the transcript — the block is a JSON payload whose
+    tokenization this harness has no way to reproduce faithfully. A turn carrying
+    one is therefore expected to under-count for a reason that has nothing to do
+    with parity, so it is flagged and excluded rather than averaged in. ``text``
+    and ``thinking`` are *accounted* blocks: their content is recoverable, so they
+    do not set the flag.
     """
 
     message_id: Optional[str]
@@ -155,53 +169,124 @@ class Turn:
     timestamp: Optional[str]
     usage: Mapping[str, Any]
     output_text: str
-    has_non_text_blocks: bool = False
+    thinking_text: str = ""
+    has_unaccounted_blocks: bool = False
+
+    @property
+    def thinking_tokens(self) -> int:
+        """What the response *claims* it spent thinking, or 0.
+
+        A claim, deliberately named as one: the harness's job is to check it
+        against the tokenizer, not to adopt it.
+        """
+        details = self.usage.get("output_tokens_details")
+        if isinstance(details, Mapping):
+            value = _numeric(details.get("thinking_tokens"))
+            if value is not None:
+                return value
+        return 0
 
 
-def _blocks(message: Mapping[str, Any]) -> Tuple[str, bool]:
-    """Assemble a message's text and say whether anything else was there.
+def _blocks(message: Mapping[str, Any]) -> Tuple[str, str, bool]:
+    """Split a message's content into text, thinking, and "something else".
 
     A ``content`` that is a plain string is Claude Code's older shape and is taken
-    at face value. A list is the current one: ``text`` blocks contribute, and any
-    other block type — ``thinking``, ``tool_use``, ``redacted_thinking`` — sets the
-    flag without contributing text it cannot supply.
+    at face value. A list is the current one: ``text`` and ``thinking`` blocks
+    contribute their recoverable content, and anything else — ``tool_use``,
+    ``redacted_thinking``, a block that is not a mapping, a block whose text field
+    is not a string — sets the flag instead of silently contributing nothing.
+
+    ``redacted_thinking`` counts as unaccounted on purpose: it has tokens and no
+    recoverable content, which is precisely the case the flag exists for.
     """
     content = message.get("content")
     if isinstance(content, str):
-        return content, False
+        return content, "", False
     if not isinstance(content, Sequence):
-        return "", False
+        return "", "", False
 
-    parts: list[str] = []
-    other = False
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    unaccounted = False
     for block in content:
         if not isinstance(block, Mapping):
-            other = True
+            unaccounted = True
             continue
-        if block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str):
-                parts.append(text)
+        kind = block.get("type")
+        if kind == "text":
+            value = block.get("text")
+            if isinstance(value, str):
+                text_parts.append(value)
             else:
-                other = True
+                unaccounted = True
+        elif kind == "thinking":
+            value = block.get("thinking")
+            # An **empty** thinking block is unaccounted, not accounted-and-zero.
+            # Claude Code's transcripts carry `{"type": "thinking", "thinking": ""}`
+            # while still reporting a non-zero
+            # `output_tokens_details.thinking_tokens` — the content is stripped, the
+            # tokens are real. Treating that as recoverable is what let four turns
+            # claiming 71 to 503 thinking tokens present themselves as text-only,
+            # which would have corrupted the headline in precisely the way the
+            # sibling-line bug did.
+            if isinstance(value, str) and value:
+                thinking_parts.append(value)
+            else:
+                unaccounted = True
         else:
-            other = True
-    return "".join(parts), other
+            unaccounted = True
+    return "".join(text_parts), "".join(thinking_parts), unaccounted
+
+
+@dataclass
+class _Accumulator:
+    """One response under construction, gathered across the lines that carry it."""
+
+    model: Optional[str]
+    timestamp: Optional[str]
+    usage: Mapping[str, Any]
+    parts: list[str] = field(default_factory=list)
+    thinking_parts: list[str] = field(default_factory=list)
+    has_unaccounted_blocks: bool = False
 
 
 def iter_turns(path: Any) -> Iterator[Turn]:
-    """Yield each counted assistant turn of a Claude Code transcript.
+    """Yield each counted assistant response of a Claude Code transcript.
 
-    De-duplicates on ``message.id`` for the reason
-    :mod:`tokenweir.claude_code` documents at length: one API response can appear
-    as several transcript lines, each repeating the same ``message.usage``, and
-    every one of those lines is individually well-formed. Counting a turn twice
-    would corrupt Probe A's per-turn comparison exactly as it corrupts a session
-    total.
+    One API response can appear as **several** transcript lines. The hook's scan
+    (:func:`~tokenweir.claude_code.scan_transcript`) handles that by counting the
+    first line for a given ``message.id`` and skipping the rest, which is exactly
+    right for its purpose: every line repeats the same ``message.usage``, so
+    summing them would over-count the turn.
+
+    For Probe A that rule is right about usage and **wrong about content**, and
+    getting it wrong is not subtle — it silently produces enormous fake
+    discrepancies. Those sibling lines do not repeat the content; they *divide* it.
+    A single response is written as one line carrying its ``text`` block and
+    another carrying its ``tool_use`` block, while both carry the whole response's
+    aggregate ``output_tokens``. Take the first line's content and pair it with
+    that aggregate and you are comparing 20 characters of text against the token
+    count for a 37 KB tool call — which is how the first version of this harness
+    reported a transcript claiming 14,142 output tokens against a tokenizer count
+    of 12, and read it as a parity failure rather than as its own bug.
+
+    So this function accumulates: usage is taken **once** per ``message.id``, text
+    is concatenated across **every** line of that id, and
+    :attr:`Turn.has_unaccounted_blocks` is true if *any* of them carried a block
+    whose tokens cannot be recovered. That flag is what makes the sibling structure
+    visible; without the accumulation it never fired at all, because each
+    individual line holds exactly one kind of block.
 
     Entries that are not objects, carry no message, carry no usage, or whose usage
     is not a mapping are skipped — the same tolerance the hook's scan applies,
-    because a transcript is a log and a log has noise in it.
+    because a transcript is a log and a log has noise in it. An entry with no
+    ``message.id`` cannot be grouped and stands as its own turn.
+
+    Ordering is first-appearance. Responses are yielded only after the whole file
+    has been read, since a response's later lines cannot be known before reaching
+    them; only the text is retained, never the large tool-call payloads, so the
+    cost is bounded by a session's prose rather than by its transcript. This is a
+    spike harness run by hand, not the hook, which must stay streaming and lean.
 
     An unreadable file yields nothing rather than raising. The harness reports
     "no turns" and the operator can see that for themselves; a traceback out of an
@@ -212,7 +297,10 @@ def iter_turns(path: Any) -> Iterator[Turn]:
     except Exception:
         return
 
-    seen: set[str] = set()
+    order: list[str] = []
+    responses: dict[str, _Accumulator] = {}
+    anonymous = 0
+
     try:
         with handle:
             for line in handle:
@@ -233,24 +321,54 @@ def iter_turns(path: Any) -> Iterator[Turn]:
                     continue
 
                 identity = _text(message.get("id"))
-                if identity is not None:
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
+                if identity is None:
+                    # Ungroupable: it stands alone under a key no id can collide
+                    # with, rather than being merged into a neighbour it may have
+                    # nothing to do with.
+                    anonymous += 1
+                    key = f"\x00anonymous-{anonymous}"
+                else:
+                    key = identity
 
-                text, other = _blocks(message)
-                yield Turn(
-                    message_id=identity,
-                    model=_text(message.get("model")),
-                    timestamp=_text(entry.get("timestamp")),
-                    usage=usage,
-                    output_text=text,
-                    has_non_text_blocks=other,
-                )
+                text, thinking, unaccounted = _blocks(message)
+                existing = responses.get(key)
+                if existing is None:
+                    order.append(key)
+                    responses[key] = _Accumulator(
+                        model=_text(message.get("model")),
+                        timestamp=_text(entry.get("timestamp")),
+                        # First occurrence wins. The siblings repeat it, so this is
+                        # a choice between identical values — and taking the first
+                        # keeps the usage paired with the timestamp beside it.
+                        usage=usage,
+                        parts=[text] if text else [],
+                        thinking_parts=[thinking] if thinking else [],
+                        has_unaccounted_blocks=unaccounted,
+                    )
+                else:
+                    if text:
+                        existing.parts.append(text)
+                    if thinking:
+                        existing.thinking_parts.append(thinking)
+                    existing.has_unaccounted_blocks = (
+                        existing.has_unaccounted_blocks or unaccounted
+                    )
     except Exception:
-        # A read that ended early. What was already yielded is still true; there
-        # is simply no more of it. Same judgement as the hook's scan.
-        return
+        # A read that ended early. What was gathered before it is still true, and
+        # yielding it beats discarding a session because its tail was unreadable.
+        pass
+
+    for key in order:
+        accumulated = responses[key]
+        yield Turn(
+            message_id=None if key.startswith("\x00anonymous-") else key,
+            model=accumulated.model,
+            timestamp=accumulated.timestamp,
+            usage=accumulated.usage,
+            output_text="".join(accumulated.parts),
+            thinking_text="".join(accumulated.thinking_parts),
+            has_unaccounted_blocks=accumulated.has_unaccounted_blocks,
+        )
 
 
 # --- comparing two usage objects -------------------------------------------
@@ -795,8 +913,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     probe = ApiProbe(key)
 
-    text_only = [t for t in turns if t.output_text.strip() and not t.has_non_text_blocks]
-    mixed = [t for t in turns if t.output_text.strip() and t.has_non_text_blocks]
+    # Three conditions, and the third is a belt-and-braces guard rather than a
+    # restatement of the second: `thinking_tokens > 0` means the response spent
+    # tokens this harness cannot re-tokenize, whatever the blocks happen to look
+    # like. Asking the provider's own number — instead of inferring from block
+    # presence — is what makes the filter robust to a transcript shape nobody has
+    # seen yet.
+    text_only = [
+        t
+        for t in turns
+        if t.output_text.strip()
+        and not t.has_unaccounted_blocks
+        and not t.thinking_text
+        and t.thinking_tokens == 0
+    ]
+    excluded = [t for t in turns if t.has_unaccounted_blocks or t.thinking_tokens]
 
     out.append("Probe A — output-side parity (text-only turns are the headline)")
     if not text_only:
@@ -818,8 +949,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"delta {delta:+d}"
         )
     out.append(
-        f"  ({len(mixed)} turn(s) carrying thinking/tool_use blocks "
-        "excluded from the headline)"
+        f"  ({len(excluded)} turn(s) carrying unrecoverable blocks such as "
+        "tool_use excluded from the headline)"
     )
     out.append("")
 
