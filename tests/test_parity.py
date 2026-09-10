@@ -779,8 +779,12 @@ class TestMain:
 
         assert code == 2
         assert "PARTIAL" in out
-        assert "Probe A" in out and "SKIPPED" in out
         assert "Probe C" in out
+        # FR-041: every probe that did not run is named, including the one the
+        # verdict actually rests on. A' was missing from this list until review 5.
+        for probe in ("Probe A —", "Probe A' —", "Probe B —"):
+            assert probe in out, f"{probe} was not named as skipped"
+        assert out.count("SKIPPED (no credential configured)") == 3
 
     def test_empty_transcript_is_reported_not_crashed(self, tmp_path, capsys, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

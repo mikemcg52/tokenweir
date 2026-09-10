@@ -120,6 +120,12 @@ With `E` subtracted, all 12 headline responses:
 transcript.output_tokens = tokens(text) + 2        (n = 12, zero variance)
 ```
 
+**Reproducing this table takes two invocations, not one.** Its 12 rows pool the two
+completed sessions — 7 from `c301b927`, 5 from `f603b29b` — and the command takes a
+single `--transcript`. Each run also derives its own `E` from its own longest eligible
+turn, so the two runs establish the constant independently rather than sharing one
+derivation.
+
 **Why this rules out a scale factor.** The *difference* is constant at exactly 2 while
 the *ratio* drifts across the range — 0.978 → 0.997 measured as
 `transcript ÷ count_tokens`, or 1.0112 → 1.0017 as `transcript ÷ bare text`, which is
@@ -210,9 +216,13 @@ one generally does not. Across the 2 completed sessions:
 | **283** | | **PASS** | **PASS** | **PASS** |
 
 The in-flight session that produced this finding was checked too, and is reported
-separately because it is not a reproducible input — it grows while it runs. Its two
-arithmetic identities pass (126/126 each); its monotonicity check **fails**, at
-124/126 transitions, with `cache_read_input_tokens` dropping 233,233 → 230,941.
+separately because it is **not a reproducible input**: it grows while it runs, so no
+fixed count quoted here would survive the next turn. (An earlier draft of this
+paragraph quoted one, and the numbers did not even reconcile with each other — 126
+turns cannot yield 126 transitions.) What is stable is the shape of the result. Its
+two arithmetic identities pass on every response; its monotonicity check **fails**,
+on a small number of transitions where `cache_read_input_tokens` drops — for example
+233,233 → 230,941 and 236,168 → 234,146.
 
 That is the documented legitimate case, not a defect: `_cache_read_monotonic` says in
 as many words that compaction, a context reset or a new cache prefix all shrink what is

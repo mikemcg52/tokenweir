@@ -164,9 +164,10 @@ class Turn:
     comparison. Its role here is as a **disqualifier**: a turn carrying it is excluded
     from the headline, since its ``output_tokens`` covers content measured under a
     different heading. It is not a transcript-side thinking check — Claude Code strips
-    thinking content from the transcript (0 of 450 responses in the measured pod carry
-    any), so there is nothing to re-tokenize; only Probe A′ checks a thinking count,
-    on the API side where the response is in hand.
+    thinking content from the transcript (**every** response examined in the measured
+    pod carried an empty ``thinking`` string beside a non-zero ``thinking_tokens``), so
+    there is nothing to re-tokenize; only Probe A′ checks a thinking count, on the API
+    side where the response is in hand.
 
     ``has_unaccounted_blocks`` is what keeps the headline honest. ``output_tokens``
     covers every block the model emitted, and a ``tool_use`` block's tokens cannot
@@ -1074,6 +1075,7 @@ def main(
         out.extend(
             [
                 "Probe A — output-side parity: SKIPPED (no credential configured)",
+                "Probe A' — API-side control: SKIPPED (no credential configured)",
                 "Probe B — API usage field shape: SKIPPED (no credential configured)",
                 "",
                 "This is a PARTIAL run. Set ANTHROPIC_API_KEY or pass --credential-file",
