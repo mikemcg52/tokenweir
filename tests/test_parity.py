@@ -1218,9 +1218,10 @@ class TestAgreementWithTheHooksOwnScan:
 
 
 class TestProbeAPrimeIsOptIn:
-    """Review 2's M1. Probe A′ is the only probe that spends generation tokens, and
-    the routine reason to re-run this command is to check nothing has drifted — which
-    Probe A and Probe C answer for the price of a few `count_tokens` calls.
+    """Review 2's M1. Probe A′ is the only *expensive* probe — four generations against
+    `count_tokens` everywhere else — and the routine reason to re-run this command is to
+    check nothing has drifted, which Probe A and Probe C answer cheaply. (Probe B still
+    generates once, 16 tokens, on any credentialed run.)
 
     So it is off by default, and the verdict has to degrade honestly rather than let
     a constant transcript offset read as the full parity result.
@@ -1232,7 +1233,7 @@ class TestProbeAPrimeIsOptIn:
             [_turn_with_bare_tokens(f"msg_{i}", 600 + i * 200) for i in range(3)],
         )
 
-    def test_default_run_spends_no_generation_tokens(self, tmp_path, capsys, monkeypatch):
+    def test_default_run_generates_only_probe_bs_single_call(self, tmp_path, capsys, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
         opener = ScriptedOpener()
         main(
@@ -1241,8 +1242,13 @@ class TestProbeAPrimeIsOptIn:
         )
         out = capsys.readouterr().out
 
-        # Probe B's single call is the only /v1/messages request on the default path.
+        # Probe B's single 16-token call is the only generation on the default path.
+        # It is *not* zero: review 3 of TOKWEIR-9 found this test named
+        # "spends_no_generation_tokens" while asserting exactly this, and the harness
+        # telling an operator a default run generates nothing in a story premised on
+        # authorizing metered spend was the wrong error to make.
         assert len(opener.message_bodies) == 1, "a default re-run generated more than Probe B"
+        assert opener.message_bodies[0]["max_tokens"] == 16
         assert "Probe A' " in out and "SKIPPED" in out
         assert "--control" in out, "the report must say how to run the control"
 

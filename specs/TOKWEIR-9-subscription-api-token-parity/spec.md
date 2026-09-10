@@ -113,7 +113,8 @@ That is testable against an authority both sides share: the provider's tokenizer
 API key via `POST /v1/messages/count_tokens`, plus a control `POST /v1/messages` call whose usage is
 by definition the API's own reporting.
 
-Three probes, each answering one part of the question:
+Three probes to begin with, each answering one part of the question — a fourth, Probe A′,
+was added during the review loop and is described after them:
 
 **Probe A — Output-side parity (the direct test).**
 A Max transcript records both the assistant's output text and the `output_tokens` it attributes to
@@ -130,7 +131,7 @@ apples-to-oranges session diff.
 Issue one controlled API-key `messages` call and inventory its `usage` object. Compare, field by
 field, against the `usage` objects a Max transcript carries: which of the four billing fields are
 present, under what names, and what extra fields each side adds. This establishes that the hook's
-four fields (`_TOKEN_FIELDS` in `tokenweir/claude_code.py`) mean the same thing on both sides, and
+four fields (`_COUNT_FIELDS` in `tokenweir/claude_code.py`) mean the same thing on both sides, and
 surfaces any Max-only field that changes their interpretation.
 
 **Probe C — Internal consistency of the Max record.**
@@ -140,8 +141,28 @@ sub-fields sum to `cache_creation_input_tokens`; that a turn's `iterations[]` en
 top-level billing fields; and that cumulative cache reads advance monotonically with context
 growth. A violation is evidence against pass-through even if Probe A were to look clean.
 
+**Probe A′ — the API-side control.** Added during the review loop, and recorded here so this
+spec describes what was built. Probe A establishes that a transcript's `output_tokens` is a real
+token count differing from the tokenizer's measurement of the same text by a constant. It cannot,
+alone, establish that the API would report *the same* constant for the same response — and
+without that, a constant is only internal consistency, not parity. So the identical arithmetic is
+run against responses the API generates itself and the two constants are compared. This is what
+makes FR-030's single explicit verdict reachable.
+
+It is the harness's only **expensive** probe (four generations), so it is gated behind an opt-in
+`--control` flag, default off: a routine re-run is a drift check, which Probes A and C answer for
+the price of `count_tokens` calls plus Probe B's one 16-token generation. Without the flag the
+report states what the transcript side established and explicitly declines the parity verdict.
+
+**The envelope derivation.** `count_tokens` prices a whole request, so it returns
+`tokens(T) + E`. `E` is derived rather than assumed — by doubling a text, since
+`E = 2·count_tokens(T) − count_tokens(T+T)` needs no knowledge of how many tokens `T` is — and
+the assumption it does carry (that tokenization is additive across the join) is named in the
+finding, along with why the verdict does not depend on it.
+
 Together these answer the story's question without pretending to an identity that the two request
-shapes cannot have. **Probe A is decisive; B and C corroborate and bound it.**
+shapes cannot have. **Probe A is decisive on the transcript side, A′ closes it to a parity claim,
+and B and C corroborate and bound both.**
 
 ### What this design cannot establish, stated plainly
 

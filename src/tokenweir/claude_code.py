@@ -113,12 +113,12 @@ item for exactly that reason.
 
 TOKWEIR-9 measured it. **Parity holds and no correction factor is needed**, so
 nothing here adjusts, scales or annotates the counts it reads — which is why this
-note is documentation rather than code. Against the provider's own tokenizer, a
-transcript's ``output_tokens`` satisfies ``tokens(text) + 2`` exactly, on 12
-responses spanning 181–1206 tokens with zero variance; the API's own reporting
-satisfies the same rule with its thinking term added. A *constant* difference with
-slope 1 is request framing, not a scale factor — a scaled count would hold the
-ratio constant and grow the difference instead.
+note is documentation rather than code. A transcript's ``output_tokens`` was measured
+directly against the provider's own tokenizer and satisfies the same arithmetic rule
+the API's own reporting satisfies; the input-side fields rest on corroboration rather
+than direct measurement. The numbers, the method and the limits are deliberately not
+repeated here — see the finding, so that a result which lapses is corrected in one
+place.
 
 Three things about that result bear on this module directly:
 
@@ -129,9 +129,9 @@ Three things about that result bear on this module directly:
   ``standard`` on a Max subscription, the same as on an API key. So
   ``pricing_mode`` must come from the environment the orchestrator injected — as it
   does — and could never have been inferred from the transcript.
-- **The result is point-in-time.** ADR-0001 notes the Max landscape is volatile; the
-  measurement holds for ``claude-opus-5`` on Claude Code 2.1.263 as of 2026-09-10.
-  It is not a permanent property of the format, and re-running
+- **The result is point-in-time.** ADR-0001 notes the Max landscape is volatile, and
+  the measurement was made against one model on one Claude Code version — the finding
+  records which. It is not a permanent property of the format, and re-running
   ``python -m tokenweir.parity`` after a Claude Code, model or tier change is the
   intended way to renew it. :mod:`tokenweir.parity`'s offline checks need no
   credential and are the cheap early warning.

@@ -805,7 +805,9 @@ transcript's counts are denominated in the same token units the API reports and 
 The Stop hook above reports the transcript faithfully, which is a different claim.
 
 **Measured on 2026-09-10 against `claude-opus-5` on Claude Code 2.1.263: parity holds,
-and no correction factor is needed.** The measurement is not a literal Max-vs-API session
+and no correction factor is needed** — `output_tokens` by direct measurement, the
+input-side fields by corroboration only. That split travels with the verdict wherever it
+is quoted. The measurement is not a literal Max-vs-API session
 diff — two such requests differ by their prompts, so their counts differ *correctly* — but
 a comparison against the provider's own tokenizer on the same text, corroborated by the
 same arithmetic run against the API's own generations.
@@ -830,8 +832,10 @@ python -m tokenweir.parity \
 
 Never pass the key as an argument — it is visible in `ps` and lands in shell history.
 
-`--control` is off by default: it is the only part of the harness that spends *generation*
-tokens, and the routine reason to re-run is drift, which the cheaper probes answer. Without
+`--control` is off by default: it is the harness's only *expensive* probe (four generations
+of up to 300 `max_tokens`), and the routine reason to re-run is drift, which the cheaper
+probes answer. A credentialed run without it is not generation-free — Probe B spends one
+16-token generation on its field inventory — but everything else is `count_tokens`. Without
 a credential at all it still runs its offline consistency checks and reports the run as
 partial — that half needs no key and is the cheap early warning that something has moved.
 

@@ -991,12 +991,15 @@ def main(
     nothing would report success for the exact outcome someone re-running it needs
     to hear about.
 
-    ``--control`` gates Probe A′, the API-side control, **off by default**. Everything
-    else the command does costs ``count_tokens`` calls; A′ costs four generations. The
-    routine reason to re-run this is to check nothing has drifted, which Probe A and
-    Probe C answer on their own, so the expensive probe is the one you ask for rather
-    than the one you pay for by default. Without it the report says what was
-    established on the transcript side and declines to claim the parity verdict.
+    ``--control`` gates Probe A′, the API-side control, **off by default**. It is the
+    harness's only *expensive* probe: four generations of up to 300 ``max_tokens``. A
+    credentialed run without it is not generation-free — Probe B spends one 16-token
+    generation on its field inventory, unconditionally — but everything else is
+    ``count_tokens``. The routine reason to re-run this is to check nothing has
+    drifted, which Probe A and Probe C answer on their own, so the expensive probe is
+    the one you ask for rather than the one you pay for by default. Without it the
+    report says what was established on the transcript side and declines to claim the
+    parity verdict.
 
     ``opener`` is injected by the tests so the rendering path — the headline filter,
     the report text, and the guarantee that the credential never reaches it — can be
@@ -1027,8 +1030,9 @@ def main(
         action="store_true",
         help=(
             "also run Probe A' — the same arithmetic against the API's own generations. "
-            "Off by default: it is the only part of the harness that spends generation "
-            "tokens (4 calls, up to 300 max_tokens each), where everything else is "
+            "Off by default: it is the harness's only *expensive* probe (4 generations "
+            "of up to 300 max_tokens). A credentialed run without it still generates "
+            "once, for Probe B's 16-token field inventory; everything else is "
             "count_tokens. Turn it on when re-establishing the parity verdict itself."
         ),
     )
@@ -1163,14 +1167,22 @@ def main(
     # `--sample 3` on a 144-turn transcript, "3 measured" and "137 excluded" leave
     # four eligible turns unaccounted for and invisible (FR-041).
     unrecoverable = sum(1 for t in excluded if t.has_unaccounted_blocks or t.thinking_tokens)
-    no_text = len(excluded) - unrecoverable
+    separately_counted = sum(
+        1
+        for t in excluded
+        if not (t.has_unaccounted_blocks or t.thinking_tokens) and t.thinking_text
+    )
+    no_text = len(excluded) - unrecoverable - separately_counted
     out.append(
         f"  {measured} of {len(text_only)} eligible turn(s) measured; "
         f"{len(excluded)} excluded ({unrecoverable} unmeasurable — tool_use or "
-        f"unrecoverable thinking; {no_text} with no comparable text); "
+        f"unrecoverable thinking; {separately_counted} with thinking counted "
+        f"separately; {no_text} with no text at all); "
         f"{len(text_only) + len(excluded)} accounted for of {len(turns)} total"
     )
-    if text_only and measured < len(text_only):
+    if text_only and measured < len(text_only) and not failures:
+        # Guarded on `failures`: the Probe A loop breaks out on a ProbeError, and
+        # without this the shortfall it leaves would be blamed on the sample cap.
         out.append(
             f"  NOTE: {len(text_only) - measured} eligible turn(s) were not measured "
             f"(--sample {args.sample})"
@@ -1183,19 +1195,21 @@ def main(
     # agrees on the constant. So the identical arithmetic is run against responses
     # the API generates itself, and the two constants are compared.
     #
-    # **Opt-in, and off by default.** It is the only part of this harness that spends
-    # generation tokens, and the routine reason to re-run the command is to check
-    # that nothing has drifted — which Probe A and Probe C answer on their own, for
-    # the price of a few count_tokens calls. Review 2 of TOKWEIR-9 made the case:
-    # every re-run paying for four generations to re-derive a constant that is
-    # already recorded is a standing cost for an occasional need. The verdict below
-    # degrades honestly rather than silently when it is off.
+    # **Opt-in, and off by default.** It is this harness's only *expensive* probe —
+    # four generations of up to 300 max_tokens, against count_tokens everywhere else.
+    # (Probe B still generates once, 16 tokens, on any credentialed run; review 3 of
+    # TOKWEIR-9 caught this comment claiming otherwise directly above the code that
+    # does it.) The routine reason to re-run the command is to check that nothing has
+    # drifted, which Probe A and Probe C answer on their own. Review 2 made the case:
+    # every re-run paying for four generations to re-derive a constant that is already
+    # recorded is a standing cost for an occasional need. The verdict below degrades
+    # honestly rather than silently when it is off.
     out.append("Probe A' — the same arithmetic on the API's own generations")
     api_offsets: list[int] = []
     if not args.control:
         out.append(
-            "  SKIPPED (pass --control to run it; it is the only probe that spends "
-            "generation tokens)"
+            "  SKIPPED (pass --control to run it; it is the only expensive probe — "
+            "4 generations. Probe B below still generates once, 16 tokens.)"
         )
     elif envelope is None:
         out.append("  SKIPPED (no envelope, so a bare count cannot be recovered)")

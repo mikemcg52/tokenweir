@@ -137,8 +137,9 @@ The first attempt appeared to disagree by +27 and +21 — because the responses 
 `thinking` blocks whose tokens count toward `output_tokens`. Accounting for
 `output_tokens_details.thinking_tokens`:
 
-As printed by the committed harness (`python -m tokenweir.parity`), so these numbers are
-reproducible rather than transcribed from a scratch script:
+As printed by the committed harness (`python -m tokenweir.parity … --control`; without
+that flag this block reads `SKIPPED`), so these numbers are reproducible rather than
+transcribed from a scratch script:
 
 ```
 api 128, bare text 101, thinking 25, api-(text+thinking) +2
@@ -288,11 +289,13 @@ python -m tokenweir.parity \
   --control        # add this to re-establish the verdict itself
 ```
 
-`--control` is off by default and is the only part of the harness that spends
-*generation* tokens (four calls); everything else is `count_tokens`. Without it the
-command still measures the transcript side and reports whether its offset is constant —
-which is the cheap drift check — but it declines to print the parity verdict, because
-that verdict rests on the API-side comparison it did not make.
+`--control` is off by default and is the harness's only *expensive* probe: four
+generations of up to 300 `max_tokens`. A credentialed run without it is **not**
+generation-free — Probe B spends one 16-token generation on its field inventory,
+unconditionally — but everything else is `count_tokens`. Without `--control` the command
+still measures the transcript side and reports whether its offset is constant, which is
+the cheap drift check, but it declines to print the parity verdict, because that verdict
+rests on the API-side comparison it did not make.
 
 The harness computes and prints the verdict itself, so a re-run does not require this
 document to interpret. It derives `E` on the spot, prints each turn's
