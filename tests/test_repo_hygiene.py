@@ -19,6 +19,7 @@ checkout would otherwise be measured against that repository's index and rules. 
 hygiene check that cannot be evaluated must not turn an ordinary install red.
 """
 
+import re
 import shutil
 import subprocess
 import sys
@@ -386,3 +387,114 @@ def test_the_readme_names_the_ways_a_reconciled_database_differs():
     # review 4 counted them.
     for anchor in ("BIGSERIAL", "populate", "order", "matched by what they"):
         assert anchor in section, f"README no longer names {anchor!r}"
+
+
+# --- No credential is ever committed (TOKWEIR-9, FR-024) ----------------------
+#
+# TOKWEIR-9 is the one story in this project that handles a live API credential:
+# the parity spike measures a Max transcript against the provider's own tokenizer,
+# which needs a key. The key is delivered into the pod out-of-band and read from
+# the environment or a file outside the tree — but "outside the tree" is a
+# convention, and a convention is one `git add -A` away from being untrue.
+#
+# So the same shape of guard TOKWEIR-12 established for coverage artifacts applies
+# here, for a mistake that is very much worse than a 53 KB binary: `tokenweir` is
+# intended for open-source release (ADR-0001 Pillar 1), and a key committed to a
+# public history is a key that must be rotated, not deleted.
+
+#: An Anthropic API key's published shape: the `sk-ant-` prefix and a long opaque
+#: tail. The length floor is what keeps the pattern off ordinary prose — it is
+#: matching a secret, not the word "sk-ant-" in a sentence about one.
+_API_KEY_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}")
+
+#: Files whose contents are not text worth scanning. A key is an ASCII string; a
+#: PNG that happens to contain those bytes is not a leaked credential, and reading
+#: large binaries to find out is wasted work.
+_UNSCANNED_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".pdf", ".ico", ".whl", ".gz"})
+
+
+def _looks_like_an_api_key(text: str) -> bool:
+    return _API_KEY_PATTERN.search(text) is not None
+
+
+#: The detector's positive cases, **assembled at import time rather than written
+#: out**. A literal key-shaped string here would be found by the sweep below and
+#: reported as a leak in this very file — and the tempting fix, excluding this file
+#: from the sweep, would punch a hole exactly where someone debugging a credential
+#: is most likely to paste a real one. Splitting the prefix keeps the tree free of
+#: the shape while still exercising the predicate on it.
+_KEY_SHAPED = "sk-" + "ant-" + "api03-" + "AbCdEfGhIjKlMnOpQr0123456789"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _KEY_SHAPED,
+        f'ANTHROPIC_API_KEY="{_KEY_SHAPED}"',
+        f"  {_KEY_SHAPED}  ",
+        f"export ANTHROPIC_API_KEY={_KEY_SHAPED}",
+    ],
+)
+def test_key_detector_recognizes_a_credential(text):
+    """Without these, stubbing the predicate to `return False` leaves the sweep
+    below green forever: a clean repository never gives it a positive case. The
+    same reasoning as the coverage detector's own tests, above."""
+    assert _looks_like_an_api_key(text)
+
+
+def test_the_key_sweep_would_catch_a_planted_credential(tmp_path):
+    """The sweep's own wiring, not just its predicate.
+
+    `test_no_api_credential_is_tracked` passes on a clean repository whether or not
+    it actually reads anything, so this plants a key-shaped file, runs the same
+    read-and-match step over it, and asserts it is caught. Without this, deleting
+    the body of the loop would leave the suite green.
+    """
+    planted = tmp_path / "leaked.env"
+    planted.write_text(f"ANTHROPIC_API_KEY={_KEY_SHAPED}\n", encoding="utf-8")
+    assert _looks_like_an_api_key(planted.read_text(encoding="utf-8", errors="replace"))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ANTHROPIC_API_KEY is read from the environment",
+        "pass --credential-file rather than the key itself",
+        "sk-ant-",
+        "sk-ant-short",
+        "unit-test-credential-value",
+    ],
+)
+def test_key_detector_leaves_prose_alone(text):
+    """The docs, the spec and the tests all *discuss* credentials at length. A
+    guard that fired on the discussion would be deleted within a week."""
+    assert not _looks_like_an_api_key(text)
+
+
+def test_no_api_credential_is_tracked():
+    """FR-024: no committed file in this repository contains an API key.
+
+    The sweep is over `git ls-files`, so it is asking about the *repository*, not
+    about whatever else is lying around the working directory — an untracked
+    scratch file holding a key is careless but not published, and this test is
+    about what a clone would hand a stranger.
+    """
+    _require_git_repo()
+
+    offenders = []
+    for path in _tracked_files():
+        if Path(path).suffix.lower() in _UNSCANNED_SUFFIXES:
+            continue
+        full = REPO_ROOT / path
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _looks_like_an_api_key(content):
+            offenders.append(path)
+
+    assert not offenders, (
+        "An API-key-shaped string is committed in: "
+        + ", ".join(offenders)
+        + ". Rotate the key — a secret in git history is not fixed by deleting the file."
+    )
