@@ -533,12 +533,20 @@ class CheckResult:
     check whose inputs were absent did not pass; it did not run. Collapsing the
     two would let a transcript that carries none of the fields an identity is
     about report a clean sweep of passes, which is precisely backwards as evidence.
+
+    ``checked`` and ``total_turns`` are reported separately (TOKWEIR-61, Med-1)
+    because ``checked`` is its own denominator: a field only some turns carry
+    means ``checked`` can be a small fraction of ``total_turns``, and ``PASS —
+    2/2`` reads exactly as confident as ``PASS — 283/283`` unless the turn count
+    it was drawn from is visible beside it. Rendered together in ``detail``
+    rather than left for a reader to compute from two separate numbers.
     """
 
     name: str
     status: str
     detail: str
     checked: int = 0
+    total_turns: int = 0
     failures: Tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -567,12 +575,17 @@ def _cache_creation_sums(turns: Sequence[Turn]) -> CheckResult:
             name="cache_creation_sums",
             status=NOT_APPLICABLE,
             detail="no turn carried both a cache_creation breakdown and a total",
+            total_turns=len(turns),
         )
     return CheckResult(
         name="cache_creation_sums",
         status=FAIL if failures else PASS,
-        detail=f"{checked - len(failures)}/{checked} turns consistent",
+        detail=(
+            f"{checked - len(failures)}/{checked} turns consistent "
+            f"({checked} of {len(turns)} turns carried this field)"
+        ),
         checked=checked,
+        total_turns=len(turns),
         failures=tuple(failures),
     )
 
@@ -610,12 +623,17 @@ def _iterations_sum(turns: Sequence[Turn]) -> CheckResult:
             name="iterations_sum",
             status=NOT_APPLICABLE,
             detail="no turn carried an iterations breakdown",
+            total_turns=len(turns),
         )
     return CheckResult(
         name="iterations_sum",
         status=FAIL if failures else PASS,
-        detail=f"{checked - len(failures)}/{checked} turns consistent",
+        detail=(
+            f"{checked - len(failures)}/{checked} turns consistent "
+            f"({checked} of {len(turns)} turns carried this field)"
+        ),
         checked=checked,
+        total_turns=len(turns),
         failures=tuple(failures),
     )
 
@@ -641,6 +659,7 @@ def _cache_read_monotonic(turns: Sequence[Turn]) -> CheckResult:
             name="cache_read_monotonic",
             status=NOT_APPLICABLE,
             detail="fewer than two turns carried cache_read_input_tokens",
+            total_turns=len(turns),
         )
 
     failures = [
@@ -652,8 +671,12 @@ def _cache_read_monotonic(turns: Sequence[Turn]) -> CheckResult:
     return CheckResult(
         name="cache_read_monotonic",
         status=FAIL if failures else PASS,
-        detail=f"{steps - len(failures)}/{steps} transitions non-decreasing",
+        detail=(
+            f"{steps - len(failures)}/{steps} transitions non-decreasing "
+            f"({len(values)} of {len(turns)} turns carried this field)"
+        ),
         checked=steps,
+        total_turns=len(turns),
         failures=tuple(failures),
     )
 
@@ -1122,6 +1145,7 @@ def main(
     measured = 0
     offsets: list[int] = []
     ratios: list[float] = []
+    probe_a_broke = False
     for turn in text_only[: args.sample]:
         reported = _numeric(turn.usage.get("output_tokens"))
         try:
@@ -1129,6 +1153,7 @@ def main(
         except ProbeError as exc:
             out.append(f"  {turn.message_id}: FAILED — {exc}")
             failures += 1
+            probe_a_broke = True
             break
         tokenizer = _numeric(counted.usage.get("input_tokens"))
         if reported is None or tokenizer is None:
@@ -1150,6 +1175,18 @@ def main(
             f"  {turn.message_id}: transcript {reported}, count_tokens {tokenizer}, "
             f"bare text {bare}, transcript-bare {offset:+d}"
         )
+
+    # TOKWEIR-61, Med-1. Every eligible turn coming back "incomparable" is not a
+    # `ProbeError` — no exception fires, so nothing upstream had flagged it — and
+    # yet it means the decisive probe established nothing. Without this, a caller
+    # gating on exit code cannot tell "measured and confirmed parity" from
+    # "asked to measure, measured nothing", which defeats the point of gating on it.
+    if text_only and measured == 0 and not probe_a_broke:
+        out.append(
+            "  Probe A measured 0 of the eligible turn(s) sampled (every count was "
+            "absent) — headline NOT MEASURED"
+        )
+        failures += 1
 
     # The verdict, computed rather than left to the reader. A *constant* difference
     # with slope 1 is framing; a constant *ratio* with a growing difference is a
@@ -1222,12 +1259,14 @@ def main(
     elif envelope is None:
         out.append("  SKIPPED (no envelope, so a bare count cannot be recovered)")
     else:
+        control_broke = False
         for prompt, budget in _CONTROL_PROMPTS:
             try:
                 control = probe.messages(args.model, prompt, max_tokens=budget)
             except ProbeError as exc:
                 out.append(f"  FAILED — {exc}")
                 failures += 1
+                control_broke = True
                 break
             reported = _numeric(control.usage.get("output_tokens"))
             if reported is None or not control.text.strip():
@@ -1238,6 +1277,7 @@ def main(
             except ProbeError as exc:
                 out.append(f"  FAILED — {exc}")
                 failures += 1
+                control_broke = True
                 break
             tokenizer = _numeric(counted.usage.get("input_tokens"))
             if tokenizer is None:
@@ -1254,6 +1294,18 @@ def main(
                 f"  api {reported}, bare text {bare}, thinking {thinking}, "
                 f"api-(text+thinking) {offset:+d}"
             )
+
+        # TOKWEIR-61, Med-1. Same hole as Probe A's, one probe over: every control
+        # response coming back "incomparable" raises nothing, so a run that was
+        # explicitly asked for the corroborating control (`--control`) could measure
+        # zero of it and still exit 0, silently falling back to the transcript-only
+        # verdict below as though nothing had been requested.
+        if not api_offsets and not control_broke:
+            out.append(
+                "  Probe A' measured 0 of the control prompt(s) (every response was "
+                "incomparable) — control NOT MEASURED"
+            )
+            failures += 1
 
     if api_offsets:
         api_distinct = sorted(set(api_offsets))

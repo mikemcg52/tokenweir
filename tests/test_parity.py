@@ -566,6 +566,38 @@ class TestConsistencyChecks:
         for result in consistency_checks([]):
             assert result.status == NOT_APPLICABLE
 
+    def test_a_pass_names_the_denominator_it_was_drawn_from(self, tmp_path):
+        """TOKWEIR-61, Med-1. `PASS -- 1/1` and `PASS -- 283/283` must not render
+        identically confident: `checked` is its own denominator, and can be a
+        sliver of the transcript's actual turn count. `total_turns` and the
+        coverage note in `detail` are what make that visible rather than
+        computable only by a reader who goes looking for it."""
+        turns = self._turns(
+            tmp_path,
+            [
+                assistant(
+                    "m1",
+                    usage=usage(
+                        cache_creation=100,
+                        breakdown={
+                            "ephemeral_5m_input_tokens": 40,
+                            "ephemeral_1h_input_tokens": 60,
+                        },
+                    ),
+                ),
+                assistant("m2", usage=usage()),
+                assistant("m3", usage=usage()),
+                assistant("m4", usage=usage()),
+                assistant("m5", usage=usage()),
+            ],
+        )
+        result = self._by_name(turns)["cache_creation_sums"]
+
+        assert result.status == PASS
+        assert result.checked == 1
+        assert result.total_turns == 5
+        assert "1 of 5 turns carried this field" in result.detail
+
     def test_each_identity_is_reported_independently(self, tmp_path):
         """One failing identity must not mask or imply the others (FR-006)."""
         turns = self._turns(
@@ -1125,6 +1157,52 @@ class TestMainCredentialedPath:
         )
         assert code == 3
         assert "FAILED" in capsys.readouterr().out
+
+    def test_probe_a_measuring_nothing_does_not_exit_success(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """TOKWEIR-61, Med-1. `L3`'s guard above only covers a `ProbeError` — an
+        eligible turn coming back "incomparable" (a missing `output_tokens`, not an
+        exception) established nothing just as surely, and nothing upstream of the
+        exit code used to notice."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        transcript = write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                assistant(
+                    "msg_a",
+                    usage={"cache_read_input_tokens": 5},  # no output_tokens at all
+                    content=[{"type": "text", "text": "x" * 1200}],
+                ),
+            ],
+        )
+        code = main(
+            ["--transcript", str(transcript), "--model", "claude-opus-5"],
+            opener=ScriptedOpener(),
+        )
+        out = capsys.readouterr().out
+        assert "Probe A measured 0" in out
+        assert code == 3
+
+    def test_probe_a_prime_measuring_nothing_does_not_exit_success(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """TOKWEIR-61, Med-1, one probe over. `--control` asks explicitly for the
+        corroborating control; every response coming back incomparable (empty text,
+        no exception) must not silently fall back to the transcript-only verdict as
+        though nothing had been requested."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+        transcript = write_transcript(
+            tmp_path / "t.jsonl",
+            [_turn_with_bare_tokens("msg_a", 1200)],
+        )
+        code = main(
+            ["--transcript", str(transcript), "--model", "claude-opus-5", "--control"],
+            opener=ScriptedOpener(generated=""),
+        )
+        out = capsys.readouterr().out
+        assert "Probe A' measured 0" in out
+        assert code == 3
 
     def test_sample_cap_is_reported_so_a_capped_run_is_not_read_as_complete(
         self, tmp_path, capsys, monkeypatch
