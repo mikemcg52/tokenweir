@@ -317,6 +317,14 @@ def test_the_block_passes_an_unrecognized_phase_through():
         ("phase", "_"),
         ("phase", "#"),
         ("phase", "__ ##"),
+        # TOKWEIR-57. `issue_key`/`stream_id` judged blankness with `str.strip()`,
+        # which does not strip U+FEFF (the BOM) -- `contract._NON_BLANK_RE` does,
+        # since it is blank under the published schema's ECMA-262 whitespace set.
+        # A value made only of it passed this check and would have been exported,
+        # attributing a record to a byte-order mark rather than to nothing. Written
+        # as an escape, not the literal character, so it stays visible in a diff.
+        ("issue_key", "\ufeff"),
+        ("stream_id", "\ufeff"),
     ],
 )
 def test_the_block_rejects_a_value_that_is_present_but_blank(field, value):
